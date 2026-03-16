@@ -60,7 +60,7 @@ pub mod prewarm;
 pub mod receipt_root_task;
 pub mod sparse_trie;
 
-pub use preserved_sparse_trie::PayloadSparseTrieCache;
+pub use preserved_sparse_trie::SharedPreservedSparseTrie;
 use preserved_sparse_trie::PreservedSparseTrie;
 
 /// Default parallelism thresholds to use with the [`ParallelSparseTrie`].
@@ -132,7 +132,7 @@ where
     /// A pruned `SparseStateTrie`, kept around as a cache of already revealed trie nodes and to
     /// re-use allocated memory. Stored with the block hash it was computed for to enable trie
     /// preservation across sequential payload validations.
-    sparse_state_trie: PayloadSparseTrieCache,
+    sparse_state_trie: SharedPreservedSparseTrie,
     /// LFU hot-slot capacity: max storage slots retained across prune cycles.
     sparse_trie_max_hot_slots: usize,
     /// LFU hot-account capacity: max account addresses retained across prune cycles.
@@ -756,7 +756,7 @@ pub struct EngineSharedCaches<Evm: ConfigureEvm> {
     /// Execution cache handle.
     pub execution_cache: PayloadExecutionCache,
     /// Sparse trie cache handle.
-    pub sparse_trie_cache: PayloadSparseTrieCache,
+    pub sparse_trie_cache: SharedPreservedSparseTrie,
     /// Precompile cache map.
     pub precompile_cache_map: PrecompileCacheMap<SpecFor<Evm>>,
 }
@@ -765,7 +765,7 @@ impl<Evm: ConfigureEvm> Default for EngineSharedCaches<Evm> {
     fn default() -> Self {
         Self {
             execution_cache: PayloadExecutionCache::default(),
-            sparse_trie_cache: PayloadSparseTrieCache::default(),
+            sparse_trie_cache: SharedPreservedSparseTrie::default(),
             precompile_cache_map: PrecompileCacheMap::default(),
         }
     }

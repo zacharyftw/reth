@@ -18,9 +18,9 @@ pub(super) type SparseTrie = SparseStateTrie<ConfigurableSparseTrie, Configurabl
 /// All mutating methods are crate-internal; external consumers only hold the handle
 /// for threading it through the builder path.
 #[derive(Debug, Default, Clone)]
-pub struct PayloadSparseTrieCache(Arc<Mutex<Option<PreservedSparseTrie>>>);
+pub struct SharedPreservedSparseTrie(Arc<Mutex<Option<PreservedSparseTrie>>>);
 
-impl PayloadSparseTrieCache {
+impl SharedPreservedSparseTrie {
     /// Takes the preserved trie if present, leaving `None` in its place.
     pub(super) fn take(&self) -> Option<PreservedSparseTrie> {
         self.0.lock().take()
