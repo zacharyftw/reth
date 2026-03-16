@@ -2,7 +2,7 @@
 
 pub use jsonrpsee::server::middleware::rpc::{RpcService, RpcServiceBuilder};
 pub use reth_engine_tree::tree::{BasicEngineValidator, EngineValidator};
-use reth_engine_tree::tree::{EngineSharedCaches, WaitForCaches};
+use reth_engine_tree::tree::{EngineSharedCaches, PayloadSparseTrieKind, WaitForCaches};
 pub use reth_rpc_builder::{middleware::RethRpcMiddleware, Identity, Stack};
 pub use reth_trie_db::ChangesetCache;
 
@@ -1362,22 +1362,11 @@ where
         tree_config: TreeConfig,
         changeset_cache: ChangesetCache,
     ) -> eyre::Result<Self::EngineValidator> {
-        let shared_caches = EngineSharedCaches::default();
-        let validator = self.payload_validator_builder.build(ctx).await?;
-        let data_dir = ctx.config.datadir.clone().resolve_datadir(ctx.config.chain.chain());
-        let invalid_block_hook = ctx.create_invalid_block_hook(&data_dir).await?;
-
-        Ok(BasicEngineValidator::new(
-            ctx.node.provider().clone(),
-            std::sync::Arc::new(ctx.node.consensus().clone()),
-            ctx.node.evm_config().clone(),
-            validator,
-            tree_config,
-            invalid_block_hook,
-            shared_caches,
-            changeset_cache,
-            ctx.node.task_executor().clone(),
-        ))
+        let shared_caches = EngineSharedCaches::with_sparse_trie_kind(PayloadSparseTrieKind::from(
+            tree_config.enable_arena_sparse_trie(),
+        ));
+        self.build_tree_validator_with_caches(ctx, tree_config, changeset_cache, shared_caches)
+            .await
     }
 
     async fn build_tree_validator_with_caches(

@@ -15,7 +15,7 @@ use reth_engine_tree::{
     chain::{ChainEvent, FromOrchestrator},
     engine::{EngineApiKind, EngineApiRequest, EngineRequestHandler},
     launch::build_engine_orchestrator,
-    tree::{EngineSharedCaches, TreeConfig},
+    tree::{EngineSharedCaches, PayloadSparseTrieKind, TreeConfig},
 };
 use reth_engine_util::EngineMessageStreamExt;
 use reth_exex::ExExManagerHandle;
@@ -91,7 +91,9 @@ impl EngineNodeLauncher {
         // Create changeset cache that will be shared across the engine
         let changeset_cache = ChangesetCache::new();
         let main_shared_caches =
-            EngineSharedCaches::<<CB::Components as NodeComponents<T>>::Evm>::default();
+            EngineSharedCaches::<<CB::Components as NodeComponents<T>>::Evm>::with_sparse_trie_kind(
+                PayloadSparseTrieKind::from(engine_tree_config.enable_arena_sparse_trie()),
+            );
 
         // setup the launch context
         let ctx = ctx
@@ -215,8 +217,11 @@ impl EngineNodeLauncher {
                 || async {
                     // Create a separate cache for reorg validator (not shared with main engine)
                     let reorg_cache = ChangesetCache::new();
-                    let reorg_shared_caches =
-                        EngineSharedCaches::<<CB::Components as NodeComponents<T>>::Evm>::default();
+                    let reorg_shared_caches = EngineSharedCaches::<
+                        <CB::Components as NodeComponents<T>>::Evm,
+                    >::with_sparse_trie_kind(
+                        PayloadSparseTrieKind::from(engine_tree_config.enable_arena_sparse_trie()),
+                    );
                     validator_builder
                         .build_tree_validator_with_caches(
                             &add_ons_ctx,
