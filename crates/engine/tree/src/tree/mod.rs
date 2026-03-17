@@ -22,7 +22,7 @@ use reth_engine_primitives::{
     ForkchoiceStateTracker, NewPayloadTimings, OnForkChoiceUpdated, SlowBlockInfo,
 };
 use reth_errors::{ConsensusError, ProviderResult};
-use reth_evm::ConfigureEvm;
+use reth_evm::{execute::InternalBlockExecutionError, ConfigureEvm};
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{
     BuiltPayload, EngineApiMessageVersion, NewPayloadError, PayloadBuilderAttributes, PayloadTypes,
@@ -2700,15 +2700,25 @@ where
             Ok(InsertPayloadOk::AlreadySeen(_)) => {
                 trace!(target: "engine::tree", "downloaded block already executed");
             }
-            Err(err) => {
-                if let InsertPayloadError::Block(err) = err {
+            Err(err) => match err {
+                InsertPayloadError::Block(err) => {
                     debug!(target: "engine::tree", err=%err.kind(), "failed to insert downloaded block");
                     if let Err(fatal) = self.on_insert_block_error(err) {
                         warn!(target: "engine::tree", %fatal, "fatal error occurred while inserting downloaded block");
                         return Err(fatal)
                     }
                 }
-            }
+                InsertPayloadError::Payload(err) => match err {
+                    NewPayloadError::Eth(ref payload_err) => {
+                        debug!(target: "engine::tree", %payload_err, "failed to validate downloaded block payload");
+                    }
+                    NewPayloadError::Other(err) => {
+                        return Err(InsertBlockFatalError::BlockExecutionError(
+                            InternalBlockExecutionError::Other(err),
+                        ))
+                    }
+                },
+            },
         }
         Ok(None)
     }
