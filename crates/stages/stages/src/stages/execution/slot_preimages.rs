@@ -169,20 +169,53 @@ pub(super) fn inject_plain_wipe_slots<P: DBProvider, R>(
 
     for block_reverts in state.bundle.reverts.iter_mut() {
         for (address, revert) in block_reverts.iter_mut() {
-            if !revert.wipe_storage {
-                continue;
+            let addr = *address;
+
+            if revert.wipe_storage {
+                // Walk all hashed storage slots for this account in the DB and look up
+                // their plain-key preimages.
+                let hashed_address = keccak256(addr);
+                let mut cursor =
+                    provider.tx_ref().cursor_dup_read::<tables::HashedStorages>()?;
+
+                if let Some((_, entry)) = cursor.seek_exact(hashed_address)? {
+                    inject_preimage_entry(&reader, revert, addr, entry.key, entry.value)?;
+                    while let Some(entry) = cursor.next_dup_val()? {
+                        inject_preimage_entry(&reader, revert, addr, entry.key, entry.value)?;
+                    }
+                }
             }
 
-            // Walk all hashed storage slots for this account in the DB and look up
-            // their plain-key preimages.
-            let addr = *address;
-            let hashed_address = keccak256(addr);
-            let mut cursor = provider.tx_ref().cursor_dup_read::<tables::HashedStorages>()?;
+            // Resolve any `RevertToSlot::Destroyed` entries in the revert's storage map.
+            // These appear in `DestroyedChanged → DestroyedAgain` transitions where
+            // `new_selfdestructed_again` emits `Destroyed` markers with no prior value.
+            // In v2 there is no `PlainStorageState` to fall back on, so we must read the
+            // actual pre-existing value from `HashedStorages` here.
+            let destroyed_keys: Vec<_> = revert
+                .storage
+                .iter()
+                .filter_map(|(&key, slot)| {
+                    matches!(slot, RevertToSlot::Destroyed).then_some(key)
+                })
+                .collect();
 
-            if let Some((_, entry)) = cursor.seek_exact(hashed_address)? {
-                inject_preimage_entry(&reader, revert, addr, entry.key, entry.value)?;
-                while let Some(entry) = cursor.next_dup_val()? {
-                    inject_preimage_entry(&reader, revert, addr, entry.key, entry.value)?;
+            if !destroyed_keys.is_empty() {
+                let hashed_address = keccak256(addr);
+                let mut cursor =
+                    provider.tx_ref().cursor_dup_read::<tables::HashedStorages>()?;
+
+                for plain_key in destroyed_keys {
+                    let plain_slot = B256::from(plain_key.to_be_bytes());
+                    let hashed_slot = keccak256(plain_slot);
+
+                    // Look up the slot's value from HashedStorages.
+                    let value = cursor
+                        .seek_by_key_subkey(hashed_address, hashed_slot)?
+                        .filter(|entry| entry.key == hashed_slot)
+                        .map(|entry| entry.value)
+                        .unwrap_or(alloy_primitives::U256::ZERO);
+
+                    revert.storage.insert(plain_key, RevertToSlot::Some(value));
                 }
             }
         }
