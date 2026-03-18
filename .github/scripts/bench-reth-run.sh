@@ -110,7 +110,6 @@ RETH_ARGS=(
   node
   --datadir "$DATADIR"
   --log.file.directory "$OUTPUT_DIR/reth-logs"
-  --debug.startup-sync-state-idle
   --engine.accept-execution-requests-hash
   --http
   --http.port 8545
