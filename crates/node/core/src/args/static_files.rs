@@ -3,10 +3,10 @@
 use clap::Args;
 use reth_config::config::{BlocksPerFileConfig, StaticFilesConfig};
 
-/// Blocks per static file when running in `--minimal` node.
+/// Default blocks per static file when running in `--minimal` node.
 ///
-/// 10000 blocks per static file allows us to prune all history every 10k blocks.
-pub const MINIMAL_BLOCKS_PER_FILE: u64 = 10000;
+/// 20000 blocks per static file allows us to prune all history every 20k blocks.
+pub const MINIMAL_BLOCKS_PER_FILE: u64 = 20_000;
 
 /// Parameters for static files configuration
 #[derive(Debug, Args, PartialEq, Eq, Clone, Copy, Default)]
@@ -42,9 +42,16 @@ impl StaticFilesArgs {
     /// args.
     ///
     /// If `minimal` is true, uses [`MINIMAL_BLOCKS_PER_FILE`] blocks per file as the default for
-    /// all segments.
-    pub fn merge_with_config(&self, config: StaticFilesConfig, minimal: bool) -> StaticFilesConfig {
-        let minimal_blocks_per_file = minimal.then_some(MINIMAL_BLOCKS_PER_FILE);
+    /// all segments. The default can be overridden by passing a custom value via
+    /// `minimal_blocks_per_file_override`.
+    pub fn merge_with_config(
+        &self,
+        config: StaticFilesConfig,
+        minimal: bool,
+        minimal_blocks_per_file_override: Option<u64>,
+    ) -> StaticFilesConfig {
+        let minimal_blocks_per_file =
+            minimal.then_some(minimal_blocks_per_file_override.unwrap_or(MINIMAL_BLOCKS_PER_FILE));
         StaticFilesConfig {
             blocks_per_file: BlocksPerFileConfig {
                 headers: self

@@ -171,8 +171,11 @@ impl LaunchContext {
         toml_config.peers.trusted_nodes_only = config.network.trusted_only;
 
         // Merge static file CLI arguments with config file, giving priority to CLI
-        toml_config.static_files =
-            config.static_files.merge_with_config(toml_config.static_files, config.pruning.minimal);
+        toml_config.static_files = config.static_files.merge_with_config(
+            toml_config.static_files,
+            config.pruning.minimal,
+            None,
+        );
 
         Ok(toml_config)
     }
