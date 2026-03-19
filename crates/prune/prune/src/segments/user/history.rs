@@ -2,6 +2,7 @@ use crate::PruneLimiter;
 use alloy_primitives::BlockNumber;
 use itertools::Itertools;
 use reth_db_api::{
+    cursor::{DbCursorRO, DbCursorRW},
     history::{plan_shard_prune, PrunedShardStats as PrunedIndices, ShardOp},
     models::ShardedKey,
     table::Table,
@@ -105,8 +106,11 @@ where
         let mut shard = cursor.seek(RawKey::new(sharded_key.clone()))?;
 
         loop {
-            let Some((key, raw_value)) =
-                shard.map(|(k, v)| Result::<_, DatabaseError>::Ok((k.key()?, v))).transpose()?
+            let Some((key, raw_value)) = shard
+                .map(|(k, v): (RawKey<T::Key>, RawValue<T::Value>)| -> Result<_, DatabaseError> {
+                    Ok((k.key()?, v))
+                })
+                .transpose()?
             else {
                 break;
             };
@@ -115,7 +119,8 @@ where
                 break;
             }
 
-            shards.push((key, raw_value.value()?));
+            let block_list: BlockNumberList = raw_value.value()?;
+            shards.push((key, block_list));
             shard = cursor.next()?;
         }
 
