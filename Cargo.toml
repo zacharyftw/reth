@@ -779,15 +779,15 @@ ipnet = "2.11"
 # jsonrpsee-http-client = { git = "https://github.com/paradigmxyz/jsonrpsee", branch = "matt/make-rpc-service-pub" }
 # jsonrpsee-types = { git = "https://github.com/paradigmxyz/jsonrpsee", branch = "matt/make-rpc-service-pub" }
 
-alloy-evm = { git = "https://github.com/alloy-rs/evm", rev = "d4bf26d" }
+alloy-evm = { git = "https://github.com/alloy-rs/evm", rev = "a8da352" }
 
-revm-inspectors = { git = "https://github.com/paradigmxyz/revm-inspectors", rev = "31f6afa" }
+revm-inspectors = { git = "https://github.com/paradigmxyz/revm-inspectors", rev = "50676ae" }
 
 # revm from rakita/state-gas branch
-revm = { git = "https://github.com/bluealloy/revm", rev = "3a29466d" }
-revm-bytecode = { git = "https://github.com/bluealloy/revm", rev = "3a29466d" }
-revm-database = { git = "https://github.com/bluealloy/revm", rev = "3a29466d" }
-revm-state = { git = "https://github.com/bluealloy/revm", rev = "3a29466d" }
-revm-primitives = { git = "https://github.com/bluealloy/revm", rev = "3a29466d" }
-revm-interpreter = { git = "https://github.com/bluealloy/revm", rev = "3a29466d" }
-revm-database-interface = { git = "https://github.com/bluealloy/revm", rev = "3a29466d" }
+revm = { git = "https://github.com/bluealloy/revm", rev = "eef4f2af" }
+revm-bytecode = { git = "https://github.com/bluealloy/revm", rev = "eef4f2af" }
+revm-database = { git = "https://github.com/bluealloy/revm", rev = "eef4f2af" }
+revm-state = { git = "https://github.com/bluealloy/revm", rev = "eef4f2af" }
+revm-primitives = { git = "https://github.com/bluealloy/revm", rev = "eef4f2af" }
+revm-interpreter = { git = "https://github.com/bluealloy/revm", rev = "eef4f2af" }
+revm-database-interface = { git = "https://github.com/bluealloy/revm", rev = "eef4f2af" }
