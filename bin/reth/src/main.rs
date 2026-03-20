@@ -10,8 +10,6 @@ static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 use clap::Parser;
 use reth::cli::Cli;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
-#[cfg(feature = "revmc")]
-use reth_node_ethereum::EthereumAddOns;
 use reth_node_ethereum::EthereumNode;
 use tracing::info;
 
@@ -25,20 +23,7 @@ fn main() {
 
     if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
         info!(target: "reth::cli", "Launching node");
-
-        #[cfg(not(feature = "revmc"))]
         let handle = builder.node(EthereumNode::default()).launch_with_debug_capabilities().await?;
-
-        #[cfg(feature = "revmc")]
-        let handle = builder
-            .with_types::<EthereumNode>()
-            .with_components(
-                EthereumNode::components()
-                    .executor(reth_node_ethereum::RevmcExecutorBuilder::default()),
-            )
-            .with_add_ons(EthereumAddOns::default())
-            .launch_with_debug_capabilities()
-            .await?;
 
         handle.wait_for_node_exit().await
     }) {

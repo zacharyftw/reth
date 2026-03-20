@@ -28,9 +28,8 @@ alloy-evm.workspace = true
 alloy-consensus.workspace = true
 alloy-rpc-types-engine.workspace = true
 
-# Optional
-revmc = { git = "https://github.com/paradigmxyz/revmc", rev = "522ee6ea", default-features = false, features = ["llvm"], optional = true }
-eyre = { version = "0.6", optional = true }
+revmc = { git = "https://github.com/paradigmxyz/revmc", rev = "522ee6ea", default-features = false, features = ["llvm"] }
+eyre = "0.6"
 
 [dev-dependencies]
 reth-testing-utils.workspace = true
@@ -40,7 +39,6 @@ alloy-genesis.workspace = true
 
 [features]
 default = ["std"]
-revmc = ["std", "dep:revmc", "dep:eyre"]
 std = [
     "alloy-consensus/std",
     "alloy-eips/std",

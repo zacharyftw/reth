@@ -76,7 +76,6 @@ mod test_utils;
 #[cfg(feature = "test-utils")]
 pub use test_utils::*;
 
-#[cfg(feature = "revmc")]
 pub mod revmc;
 
 /// Ethereum-related EVM configuration.

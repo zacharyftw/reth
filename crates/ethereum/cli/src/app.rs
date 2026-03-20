@@ -70,7 +70,11 @@ where
         C: ChainSpecParser<ChainSpec = ChainSpec>,
     {
         let components = |spec: Arc<ChainSpec>| {
-            (EthEvmConfig::ethereum(spec.clone()), Arc::new(EthBeaconConsensus::new(spec)))
+            let evm_config = EthEvmConfig::new_with_evm_factory(
+                spec.clone(),
+                reth_node_ethereum::evm::revmc::RevmcEvmFactory::disabled(),
+            );
+            (evm_config, Arc::new(EthBeaconConsensus::new(spec)))
         };
 
         self.run_with_components::<EthereumNode>(components, async move |builder, ext| {

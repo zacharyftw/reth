@@ -9403,6 +9403,7 @@ dependencies = [
  "reth-tracing",
  "reth-transaction-pool",
  "revm",
+ "revmc",
  "serde",
  "serde_json",
  "similar-asserts",

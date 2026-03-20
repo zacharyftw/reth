@@ -43,11 +43,6 @@ impl RevmcRuntime {
         Ok(Self { coordinator })
     }
 
-    /// Starts with default configuration (JIT enabled).
-    pub fn start_default() -> eyre::Result<Self> {
-        Self::start(RuntimeConfig { enabled: true, ..Default::default() })
-    }
-
     /// Returns a clonable handle for performing lookups.
     pub fn handle(&self) -> JitCoordinatorHandle {
         self.coordinator.handle()
@@ -84,6 +79,15 @@ impl RevmcEvmFactory {
     /// Creates a new factory from a coordinator handle.
     pub const fn new(handle: JitCoordinatorHandle) -> Self {
         Self { handle }
+    }
+
+    /// Creates a factory with JIT disabled (no coordinator running).
+    ///
+    /// Starts a coordinator with `enabled: false` so lookups always return `Interpret`.
+    pub fn disabled() -> Self {
+        let runtime = RevmcRuntime::start(RuntimeConfig::default())
+            .expect("failed to start disabled revmc runtime");
+        runtime.factory()
     }
 }
 

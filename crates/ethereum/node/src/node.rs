@@ -420,6 +420,12 @@ impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for EthereumNode {
 }
 
 /// A regular ethereum evm and executor builder.
+///
+/// When `--jit` is passed, starts the revmc JIT coordinator and uses [`RevmcEvmFactory`] to
+/// serve compiled bytecode. Otherwise uses the default [`EthEvmFactory`].
+///
+/// [`RevmcEvmFactory`]: reth_evm_ethereum::revmc::RevmcEvmFactory
+/// [`EthEvmFactory`]: alloy_evm::EthEvmFactory
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
 pub struct EthereumExecutorBuilder;
@@ -432,41 +438,31 @@ where
     >,
     Node: FullNodeTypes<Types = Types>,
 {
-    type EVM = EthEvmConfig<Types::ChainSpec>;
-
-    async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        Ok(EthEvmConfig::new(ctx.chain_spec()))
-    }
-}
-
-/// Ethereum executor builder with revmc JIT compilation.
-///
-/// Starts a [`RevmcRuntime`] that background-compiles hot bytecodes and serves compiled functions
-/// via the [`RevmcEvmFactory`]. Falls back to the interpreter for cold or inspected execution.
-///
-/// [`RevmcRuntime`]: reth_evm_ethereum::revmc::RevmcRuntime
-/// [`RevmcEvmFactory`]: reth_evm_ethereum::revmc::RevmcEvmFactory
-#[cfg(feature = "revmc")]
-#[derive(Debug, Default, Clone, Copy)]
-#[non_exhaustive]
-pub struct RevmcExecutorBuilder;
-
-#[cfg(feature = "revmc")]
-impl<Types, Node> ExecutorBuilder<Node> for RevmcExecutorBuilder
-where
-    Types: NodeTypes<
-        ChainSpec: Hardforks + EthExecutorSpec + EthereumHardforks,
-        Primitives = EthPrimitives,
-    >,
-    Node: FullNodeTypes<Types = Types>,
-{
     type EVM = EthEvmConfig<Types::ChainSpec, reth_evm_ethereum::revmc::RevmcEvmFactory>;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
         use reth_evm_ethereum::revmc::RevmcRuntime;
+        use revmc::runtime::{RuntimeConfig, RuntimeTuning};
 
-        let runtime = RevmcRuntime::start_default()?;
-        info!(target: "reth::cli", "Started revmc JIT coordinator");
+        let jit = &ctx.config().jit;
+        let default_tuning = RuntimeTuning::default();
+        let tuning = RuntimeTuning {
+            jit_hot_threshold: jit.hot_threshold,
+            lookup_event_channel_capacity: jit.channel_capacity,
+            max_pending_jit_jobs: jit.max_pending_jobs,
+            jit_worker_count: jit.worker_count.unwrap_or(default_tuning.jit_worker_count),
+            ..default_tuning
+        };
+
+        let config = RuntimeConfig { enabled: jit.enabled, tuning, ..Default::default() };
+        let runtime = RevmcRuntime::start(config)?;
+        if jit.enabled {
+            info!(target: "reth::cli",
+                hot_threshold = tuning.jit_hot_threshold,
+                workers = tuning.jit_worker_count,
+                "Started revmc JIT coordinator",
+            );
+        }
         Ok(EthEvmConfig::new_with_evm_factory(ctx.chain_spec(), runtime.factory()))
     }
 }

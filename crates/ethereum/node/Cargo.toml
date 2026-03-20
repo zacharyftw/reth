@@ -54,6 +54,8 @@ revm = { workspace = true, features = ["secp256k1", "blst", "c-kzg", "memory_lim
 # misc
 eyre.workspace = true
 
+revmc = { git = "https://github.com/paradigmxyz/revmc", rev = "522ee6ea", default-features = false, features = ["llvm"] }
+
 [dev-dependencies]
 reth-db.workspace = true
 reth-exex.workspace = true
@@ -84,7 +86,6 @@ similar-asserts.workspace = true
 
 [features]
 default = []
-revmc = ["reth-evm-ethereum/revmc"]
 asm-keccak = [
     "alloy-primitives/asm-keccak",
     "reth-node-core/asm-keccak",
