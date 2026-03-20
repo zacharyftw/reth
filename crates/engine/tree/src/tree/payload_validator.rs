@@ -1026,6 +1026,10 @@ where
 
             // Apply pre-execution changes for the new segment
             executor.apply_pre_execution_changes()?;
+
+            // Reset last_sent_len so receipts from the new executor are sent to
+            // the receipt root task (the new executor's receipt count starts at 0)
+            last_sent_len = 0;
         }
 
         // Execute remaining transactions after the last switch (or all txs if no switches)
@@ -1143,8 +1147,10 @@ where
             if current_len > *last_sent_len {
                 *last_sent_len = current_len;
                 // Send the latest receipt to the background task for incremental root computation.
+                // Use senders.len() - 1 as the global tx index (senders accumulates across
+                // env_switch segments, unlike executor.receipts() which resets per segment).
                 if let Some(receipt) = executor.receipts().last() {
-                    let tx_index = current_len - 1;
+                    let tx_index = senders.len() - 1;
                     let _ = receipt_tx.send(IndexedReceipt::new(tx_index, receipt.clone()));
                 }
             }
