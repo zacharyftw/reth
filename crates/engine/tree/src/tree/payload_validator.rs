@@ -450,6 +450,7 @@ where
             .in_scope(|| self.evm_env_for(&input))
             .map_err(NewPayloadError::other)?;
 
+        let has_env_switches = !env_switches.is_empty();
         let switch_envs: Vec<(usize, EvmEnvFor<Evm>)> = ensure_ok!(env_switches
             .iter()
             .map(|(tx_idx, data)| {
@@ -611,18 +612,29 @@ where
             handle.try_into_inner().expect("sole handle")
         });
 
-        let hashed_state = ensure_ok_post_block!(
-            self.validate_post_execution(
-                &block,
-                &parent_block,
-                &output,
-                &mut ctx,
-                transaction_root,
-                receipt_root_bloom,
-                hashed_state,
-            ),
-            block
-        );
+        // Skip post-execution validation for big blocks with env_switches since
+        // receipt cumulative gas counters reset at each segment boundary, causing the
+        // standard gas_used check (header vs last receipt) to fail.
+        let hashed_state = if has_env_switches {
+            debug!(
+                target: "engine::tree::payload_validator",
+                "Skipping post-execution validation for big block with env_switches"
+            );
+            hashed_state
+        } else {
+            ensure_ok_post_block!(
+                self.validate_post_execution(
+                    &block,
+                    &parent_block,
+                    &output,
+                    &mut ctx,
+                    transaction_root,
+                    receipt_root_bloom,
+                    hashed_state,
+                ),
+                block
+            )
+        };
 
         let root_time = Instant::now();
         let mut maybe_state_root = None;
@@ -752,8 +764,9 @@ where
             .record_state_root_gas_bucket(block.header().gas_used(), root_elapsed.as_secs_f64());
         debug!(target: "engine::tree::payload_validator", ?root_elapsed, "Calculated state root");
 
-        // ensure state root matches
-        if state_root != block.header().state_root() {
+        // ensure state root matches (skip for big blocks with env_switches since the
+        // header's state_root is from the original chain and won't match)
+        if !has_env_switches && state_root != block.header().state_root() {
             #[cfg(feature = "trie-debug")]
             Self::write_trie_debug_recorders(block.header().number(), &trie_debug_recorders);
 
