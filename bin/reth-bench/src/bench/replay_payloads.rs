@@ -3,6 +3,7 @@
 use crate::{
     authenticated_transport::AuthenticatedTransportConnect,
     bench::{
+        generate_big_block::BigBlockPayload,
         helpers::parse_duration,
         metrics_scraper::MetricsScraper,
         output::{
@@ -108,10 +109,12 @@ pub struct Command {
 struct LoadedPayload {
     /// The index (from filename).
     index: u64,
-    /// The payload envelope.
-    envelope: ExecutionPayloadEnvelopeV4,
+    /// The execution data for the block.
+    execution_data: ExecutionData,
     /// The block hash.
     block_hash: B256,
+    /// Environment switches to apply at specific transaction indices.
+    env_switches: Vec<(usize, ExecutionData)>,
 }
 
 impl Command {
@@ -172,22 +175,32 @@ impl Command {
         }
         info!(target: "reth-bench", count = payloads.len(), "Loaded main payloads from disk");
 
+        // If any payload has env_switches but we're not using reth_newPayload, warn the user
+        if !self.reth_new_payload {
+            let has_env_switches = payloads.iter().any(|p| !p.env_switches.is_empty());
+            if has_env_switches {
+                warn!(
+                    target: "reth-bench",
+                    "Payloads contain env_switches but --reth-new-payload is not set. \
+                     env_switches are only supported with reth_newPayload and will be ignored."
+                );
+            }
+        }
+
         let mut parent_hash = initial_parent_hash;
 
         let mut results = Vec::new();
         let total_benchmark_duration = Instant::now();
 
         for (i, payload) in payloads.iter().enumerate() {
-            let envelope = &payload.envelope;
+            let execution_data = &payload.execution_data;
             let block_hash = payload.block_hash;
-            let execution_payload = &envelope.envelope_inner.execution_payload;
-            let inner_payload = &execution_payload.payload_inner.payload_inner;
+            let v1 = execution_data.payload.as_v1();
 
-            let gas_used = inner_payload.gas_used;
-            let gas_limit = inner_payload.gas_limit;
-            let block_number = inner_payload.block_number;
-            let transaction_count =
-                execution_payload.payload_inner.payload_inner.transactions.len() as u64;
+            let gas_used = v1.gas_used;
+            let gas_limit = v1.gas_limit;
+            let block_number = v1.block_number;
+            let transaction_count = v1.transactions.len() as u64;
 
             debug!(
                 target: "reth-bench",
@@ -208,34 +221,30 @@ impl Command {
             );
 
             let (version, params) = if self.reth_new_payload {
-                let reth_data = ExecutionData {
-                    payload: execution_payload.clone().into(),
-                    sidecar: ExecutionPayloadSidecar::v4(
-                        CancunPayloadFields {
-                            versioned_hashes: Vec::new(),
-                            parent_beacon_block_root: B256::ZERO,
-                        },
-                        PraguePayloadFields {
-                            requests: envelope.execution_requests.clone().into(),
-                        },
-                    ),
+                let env_switches_param = if payload.env_switches.is_empty() {
+                    None
+                } else {
+                    Some(payload.env_switches.clone())
                 };
                 (
                     None,
                     serde_json::to_value((
-                        RethNewPayloadInput::ExecutionData(reth_data),
+                        RethNewPayloadInput::ExecutionData(execution_data.clone()),
                         self.no_wait_for_persistence.then_some(false),
                         self.no_wait_for_caches.then_some(false),
+                        env_switches_param,
                     ))?,
                 )
             } else {
+                let requests =
+                    execution_data.sidecar.requests().cloned().unwrap_or_default().to_vec();
                 (
                     Some(EngineApiMessageVersion::V4),
                     serde_json::to_value((
-                        execution_payload.clone(),
+                        execution_data.payload.clone(),
                         Vec::<B256>::new(),
                         B256::ZERO,
-                        envelope.execution_requests.to_vec(),
+                        requests,
                     ))?,
                 )
             };
@@ -326,28 +335,42 @@ impl Command {
     }
 
     /// Load and parse all payload files from the directory.
+    ///
+    /// Tries to load each file as a [`BigBlockPayload`] first (which includes `env_switches`),
+    /// falling back to [`ExecutionPayloadEnvelopeV4`] for backwards compatibility.
     fn load_payloads(&self) -> eyre::Result<Vec<LoadedPayload>> {
         let mut payloads = Vec::new();
 
-        // Read directory entries
+        // Read directory entries — match both legacy "payload_block_*.json" and new
+        // "big_block_*.json" formats
         let entries: Vec<_> = std::fs::read_dir(&self.payload_dir)
             .wrap_err_with(|| format!("Failed to read directory {:?}", self.payload_dir))?
             .filter_map(|e| e.ok())
             .filter(|e| {
+                let name = e.file_name();
+                let name_str = name.to_string_lossy();
                 e.path().extension().and_then(|s| s.to_str()) == Some("json") &&
-                    e.file_name().to_string_lossy().starts_with("payload_block_")
+                    (name_str.starts_with("payload_block_") ||
+                        name_str.starts_with("big_block_"))
             })
             .collect();
 
-        // Parse filenames to get indices and sort
+        // Parse filenames to get indices and sort.
+        // Supports "payload_block_N.json" and "big_block_FROM_to_TO.json" naming.
         let mut indexed_paths: Vec<(u64, PathBuf)> = entries
             .into_iter()
             .filter_map(|e| {
                 let name = e.file_name();
                 let name_str = name.to_string_lossy();
-                // Extract index from "payload_NNN.json"
-                let index_str = name_str.strip_prefix("payload_block_")?.strip_suffix(".json")?;
-                let index: u64 = index_str.parse().ok()?;
+                let index = if let Some(rest) = name_str.strip_prefix("payload_block_") {
+                    rest.strip_suffix(".json")?.parse::<u64>().ok()?
+                } else if let Some(rest) = name_str.strip_prefix("big_block_") {
+                    // "big_block_FROM_to_TO.json" — use FROM as the index
+                    let rest = rest.strip_suffix(".json")?;
+                    rest.split("_to_").next()?.parse::<u64>().ok()?
+                } else {
+                    return None;
+                };
                 Some((index, e.path()))
             })
             .collect();
@@ -365,21 +388,41 @@ impl Command {
         for (index, path) in indexed_paths {
             let content = std::fs::read_to_string(&path)
                 .wrap_err_with(|| format!("Failed to read {:?}", path))?;
-            let envelope: ExecutionPayloadEnvelopeV4 = serde_json::from_str(&content)
-                .wrap_err_with(|| format!("Failed to parse {:?}", path))?;
 
-            let block_hash =
-                envelope.envelope_inner.execution_payload.payload_inner.payload_inner.block_hash;
+            // Try BigBlockPayload first, then fall back to legacy ExecutionPayloadEnvelopeV4
+            let (execution_data, env_switches) =
+                if let Ok(big_block) = serde_json::from_str::<BigBlockPayload>(&content) {
+                    (big_block.execution_data, big_block.env_switches)
+                } else {
+                    let envelope: ExecutionPayloadEnvelopeV4 = serde_json::from_str(&content)
+                        .wrap_err_with(|| format!("Failed to parse {:?}", path))?;
+                    let execution_data = ExecutionData {
+                        payload: envelope.envelope_inner.execution_payload.clone().into(),
+                        sidecar: ExecutionPayloadSidecar::v4(
+                            CancunPayloadFields {
+                                versioned_hashes: Vec::new(),
+                                parent_beacon_block_root: B256::ZERO,
+                            },
+                            PraguePayloadFields {
+                                requests: envelope.execution_requests.clone().into(),
+                            },
+                        ),
+                    };
+                    (execution_data, Vec::new())
+                };
+
+            let block_hash = execution_data.payload.as_v1().block_hash;
 
             debug!(
                 target: "reth-bench",
                 index = index,
                 block_hash = %block_hash,
+                env_switches = env_switches.len(),
                 path = %path.display(),
                 "Loaded payload"
             );
 
-            payloads.push(LoadedPayload { index, envelope, block_hash });
+            payloads.push(LoadedPayload { index, execution_data, block_hash, env_switches });
         }
 
         Ok(payloads)

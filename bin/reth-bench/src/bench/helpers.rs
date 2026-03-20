@@ -34,6 +34,7 @@ pub(crate) fn load_jwt_secret(jwt_secret: Option<&str>) -> Result<Option<String>
 /// Parses a gas limit value with optional suffix: K for thousand, M for million, G for billion.
 ///
 /// Examples: "30000000", "30M", "1G", "2G"
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_gas_limit(s: &str) -> eyre::Result<u64> {
     let s = s.trim();
     if s.is_empty() {
