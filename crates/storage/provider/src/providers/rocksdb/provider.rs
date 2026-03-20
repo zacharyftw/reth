@@ -121,12 +121,11 @@ const DEFAULT_MAX_BACKGROUND_JOBS: i32 = 6;
 
 /// Default max open file descriptors for `RocksDB`.
 ///
-/// Caps the number of SST file handles `RocksDB` keeps open simultaneously.
-/// Set to 512 to stay within the common default OS `ulimit -n` of 1024,
-/// leaving headroom for MDBX, static files, and other I/O.
-/// `RocksDB` uses an internal table cache and re-opens files on demand,
-/// so this has negligible performance impact on read-heavy workloads.
-const DEFAULT_MAX_OPEN_FILES: i32 = 512;
+/// Set to -1 (unlimited) to keep all SST file handles open permanently.
+/// This avoids table-cache lookup and file-reopen overhead on every seek,
+/// which matters when 64 proof workers issue millions of seeks per block.
+/// Requires sufficient OS file descriptor limit (`ulimit -n`).
+const DEFAULT_MAX_OPEN_FILES: i32 = -1;
 
 /// Default bytes per sync for `RocksDB` WAL writes (1 MB).
 const DEFAULT_BYTES_PER_SYNC: u64 = 1_048_576;
@@ -264,6 +263,7 @@ impl RocksDBBuilder {
         table_options.set_block_size(4 * 1024);
         table_options.set_cache_index_and_filter_blocks(true);
         table_options.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        table_options.set_pin_top_level_index_and_filter(true);
         table_options.set_block_cache(cache);
         // Disable block checksums: trie data integrity is verified by state root
         // computation, making per-block CRC32 redundant CPU work.
@@ -291,10 +291,13 @@ impl RocksDBBuilder {
         table_options.set_block_size(4 * 1024);
         table_options.set_cache_index_and_filter_blocks(true);
         table_options.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        table_options.set_pin_top_level_index_and_filter(true);
         table_options.set_block_cache(cache);
         // Disable block checksums: trie data integrity is verified by state root
         // computation, making per-block CRC32 redundant CPU work.
         table_options.set_checksum_type(ChecksumType::NoChecksum);
+        // No bloom filter: benchmarking showed bloom adds ~2.5 extra block
+        // reads per seek (filter probes) that cost more than the SST skips save.
 
         let mut cf_options = Options::default();
         cf_options.set_block_based_table_factory(&table_options);
@@ -303,8 +306,10 @@ impl RocksDBBuilder {
         cf_options.set_bottommost_compression_type(DBCompressionType::None);
         // Small write buffer: trie CFs receive small incremental writes per block.
         cf_options.set_write_buffer_size(16 << 20);
-        // No prefix extractor: bounded iterators already scope reads to the
-        // hashed_address range, making prefix bloom filters redundant overhead.
+        // Fixed 32-byte prefix extractor: compound keys are `B256 || subkey`.
+        // Enables prefix-bounded iteration so RocksDB can prune internal
+        // seek work when iterate_upper_bound constrains the prefix range.
+        cf_options.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
 
         cf_options
     }
@@ -842,6 +847,45 @@ impl RocksDBProvider {
         }
     }
 
+    /// Triggers a full compaction on trie column families if they have pending
+    /// compaction bytes. Blocks until compaction finishes.
+    pub fn compact_trie_cfs(&self) {
+        let trie_cfs = [tables::AccountsTrie::NAME, tables::StoragesTrie::NAME];
+        for cf_name in trie_cfs {
+            let pending = match &*self.0 {
+                RocksDBProviderInner::ReadWrite { db, .. } => {
+                    let Some(cf) = db.cf_handle(cf_name) else { continue };
+                    let pending = db
+                        .property_int_value_cf(
+                            cf,
+                            rocksdb::properties::ESTIMATE_PENDING_COMPACTION_BYTES,
+                        )
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
+                    if pending > 0 {
+                        tracing::info!(
+                            target: "providers::rocksdb",
+                            cf = cf_name,
+                            pending_bytes = pending,
+                            "Compacting trie CF"
+                        );
+                        db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+                    }
+                    pending
+                }
+                RocksDBProviderInner::ReadOnly { .. } => continue,
+            };
+            if pending > 0 {
+                tracing::info!(
+                    target: "providers::rocksdb",
+                    cf = cf_name,
+                    "Trie CF compaction complete"
+                );
+            }
+        }
+    }
+
     /// Returns a read-only, point-in-time snapshot of the database.
     ///
     /// Lighter weight than [`RocksTx`] — no write-conflict tracking, and `Send + Sync`.
@@ -1222,6 +1266,30 @@ impl RocksDBProvider {
         let mut readopts = ReadOptions::default();
         // Skip checksum verification: trie integrity is guaranteed by state root.
         readopts.set_verify_checksums(false);
+        Ok(self.0.raw_iterator_cf_opt(cf, readopts))
+    }
+
+    /// Creates a raw iterator with `prefix_same_as_start` enabled.
+    ///
+    /// For CFs with a prefix extractor, this tells RocksDB that iteration
+    /// stays within the prefix of the seek target. Each `seek()` begins a
+    /// new prefix-scoped iteration. RocksDB can prune internal merge work
+    /// for levels/files outside the target prefix.
+    pub(super) fn raw_iterator_for_cf_prefix_same_as_start(
+        &self,
+        name: &str,
+    ) -> Result<RocksDBRawIterEnum<'_>, DatabaseError> {
+        let cf = match &*self.0 {
+            RocksDBProviderInner::ReadWrite { db, .. } => db
+                .cf_handle(name)
+                .ok_or_else(|| DatabaseError::Other(format!("CF '{}' not found", name)))?,
+            RocksDBProviderInner::ReadOnly { db, .. } => db
+                .cf_handle(name)
+                .ok_or_else(|| DatabaseError::Other(format!("CF '{}' not found", name)))?,
+        };
+        let mut readopts = ReadOptions::default();
+        readopts.set_verify_checksums(false);
+        readopts.set_prefix_same_as_start(true);
         Ok(self.0.raw_iterator_cf_opt(cf, readopts))
     }
 
