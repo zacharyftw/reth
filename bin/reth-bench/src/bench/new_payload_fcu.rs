@@ -65,8 +65,10 @@ pub struct Command {
     )]
     persistence_timeout: Duration,
 
-    /// The size of the block buffer (channel capacity) for prefetching blocks from the RPC
-    /// endpoint.
+    /// The number of blocks to fetch concurrently from the RPC endpoint.
+    ///
+    /// Up to this many block fetches will be in-flight at once, and results are
+    /// yielded in order.
     #[arg(
         long = "rpc-block-buffer-size",
         value_name = "RPC_BLOCK_BUFFER_SIZE",

@@ -15,6 +15,7 @@ use alloy_provider::{ext::DebugApi, Provider};
 use clap::Parser;
 use csv::Writer;
 use eyre::{Context, OptionExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use reth_cli_runner::CliContext;
 use reth_node_core::args::BenchmarkArgs;
 use std::time::{Duration, Instant};
@@ -27,8 +28,10 @@ pub struct Command {
     #[arg(long, value_name = "RPC_URL", verbatim_doc_comment)]
     rpc_url: String,
 
-    /// The size of the block buffer (channel capacity) for prefetching blocks from the RPC
-    /// endpoint.
+    /// The number of blocks to fetch concurrently from the RPC endpoint.
+    ///
+    /// Up to this many block fetches will be in-flight at once, and results are
+    /// yielded in order.
     #[arg(
         long = "rpc-block-buffer-size",
         value_name = "RPC_BLOCK_BUFFER_SIZE",
@@ -48,7 +51,7 @@ impl Command {
             benchmark_mode,
             block_provider,
             auth_provider,
-            mut next_block,
+            next_block,
             is_optimism,
             use_reth_namespace,
             rlp_blocks,
@@ -66,46 +69,50 @@ impl Command {
 
         let buffer_size = self.rpc_block_buffer_size;
 
-        // Use a oneshot channel to propagate errors from the spawned task
-        let (error_sender, mut error_receiver) = tokio::sync::oneshot::channel();
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(buffer_size);
+        let mut blocks = Box::pin(
+            stream::iter(
+                (next_block..).take_while(|next_block| benchmark_mode.contains(*next_block)),
+            )
+            .map(|next_block| {
+                let block_provider = block_provider.clone();
+                async move {
+                    let block_res = block_provider
+                        .get_block_by_number(next_block.into())
+                        .full()
+                        .await
+                        .wrap_err_with(|| {
+                            format!("Failed to fetch block by number {next_block}")
+                        });
+                    let block =
+                        match block_res.and_then(|opt| opt.ok_or_eyre("Block not found")) {
+                            Ok(block) => block,
+                            Err(e) => {
+                                tracing::error!(target: "reth-bench", "Failed to fetch block {next_block}: {e}");
+                                return Err(e)
+                            }
+                        };
 
-        tokio::task::spawn(async move {
-            while benchmark_mode.contains(next_block) {
-                let block_res = block_provider
-                    .get_block_by_number(next_block.into())
-                    .full()
-                    .await
-                    .wrap_err_with(|| format!("Failed to fetch block by number {next_block}"));
-                let block = match block_res.and_then(|opt| opt.ok_or_eyre("Block not found")) {
-                    Ok(block) => block,
-                    Err(e) => {
-                        tracing::error!(target: "reth-bench", "Failed to fetch block {next_block}: {e}");
-                        let _ = error_sender.send(e);
-                        break;
-                    }
-                };
-
-                let rlp = if rlp_blocks {
-                    let Ok(rlp) = block_provider.debug_get_raw_block(next_block.into()).await
-                    else {
-                        tracing::error!(target: "reth-bench", "Failed to fetch raw block {next_block}");
-                        let _ = error_sender
-                            .send(eyre::eyre!("Failed to fetch raw block {next_block}"));
-                        break;
+                    let rlp = if rlp_blocks {
+                        let rlp = match block_provider
+                            .debug_get_raw_block(next_block.into())
+                            .await
+                        {
+                            Ok(rlp) => rlp,
+                            Err(e) => {
+                                tracing::error!(target: "reth-bench", "Failed to fetch raw block {next_block}: {e}");
+                                return Err(e.into())
+                            }
+                        };
+                        Some(rlp)
+                    } else {
+                        None
                     };
-                    Some(rlp)
-                } else {
-                    None
-                };
 
-                next_block += 1;
-                if let Err(e) = sender.send((block, rlp)).await {
-                    tracing::error!(target: "reth-bench", "Failed to send block data: {e}");
-                    break;
+                    Ok((block, rlp))
                 }
-            }
-        });
+            })
+            .buffered(buffer_size),
+        );
 
         let mut results = Vec::new();
         let mut blocks_processed = 0u64;
@@ -114,7 +121,7 @@ impl Command {
 
         while let Some((block, rlp)) = {
             let wait_start = Instant::now();
-            let result = receiver.recv().await;
+            let result = blocks.try_next().await?;
             total_wait_time += wait_start.elapsed();
             result
         } {
@@ -173,11 +180,6 @@ impl Command {
             {
                 tracing::warn!(target: "reth-bench", %err, block_number, "Failed to scrape metrics");
             }
-        }
-
-        // Check if the spawned task encountered an error
-        if let Ok(error) = error_receiver.try_recv() {
-            return Err(error);
         }
 
         let (gas_output_results, new_payload_results): (_, Vec<NewPayloadResult>) =
