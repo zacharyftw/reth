@@ -18,7 +18,7 @@
 #   --rpc-url URL        Source RPC for fetching blocks
 #                        (default: https://rpc.hoodi.ethpandaops.io)
 #   --from-block N       First block number to merge (required)
-#   --count N            Real blocks per big block (default: 3)
+#   --target-gas N       Target gas per big block (default: 100000000)
 #   --num-big-blocks N   Number of sequential big blocks (default: 10)
 #   --profile PROFILE    Cargo build profile (default: profiling)
 #   --keep-temp          Don't delete temp dir on exit
@@ -26,9 +26,9 @@
 # Example:
 #   ./scripts/e2e-big-blocks.sh \
 #       --datadir /data/reth/hoodi \
-#       --from-block 910030 \
-#       --count 3 \
-#       --num-big-blocks 10
+#       --from-block 910020 \
+#       --target-gas 200000000 \
+#       --num-big-blocks 3
 
 set -euo pipefail
 
@@ -38,7 +38,7 @@ DATADIR=""
 CHAIN="hoodi"
 RPC_URL="https://rpc.hoodi.ethpandaops.io"
 FROM_BLOCK=""
-COUNT=3
+TARGET_GAS=100000000
 NUM_BIG_BLOCKS=10
 PROFILE="profiling"
 KEEP_TEMP=false
@@ -51,7 +51,7 @@ while [[ $# -gt 0 ]]; do
         --chain)         CHAIN="$2";          shift 2 ;;
         --rpc-url)       RPC_URL="$2";        shift 2 ;;
         --from-block)    FROM_BLOCK="$2";     shift 2 ;;
-        --count)         COUNT="$2";          shift 2 ;;
+        --target-gas)    TARGET_GAS="$2";     shift 2 ;;
         --num-big-blocks) NUM_BIG_BLOCKS="$2"; shift 2 ;;
         --profile)       PROFILE="$2";        shift 2 ;;
         --keep-temp)     KEEP_TEMP=true;      shift ;;
@@ -161,12 +161,12 @@ UNWIND_TO=$((FROM_BLOCK - 1))
 
 # ── Step 1: Generate big blocks ──────────────────────────────────────────────
 
-log "Generating $NUM_BIG_BLOCKS big blocks (count=$COUNT each) from block $FROM_BLOCK..."
+log "Generating $NUM_BIG_BLOCKS big blocks (target_gas=$TARGET_GAS each) from block $FROM_BLOCK..."
 "$BENCH_BIN" generate-big-block \
     --rpc-url "$RPC_URL" \
     --chain "$CHAIN" \
     --from-block "$FROM_BLOCK" \
-    --count "$COUNT" \
+    --target-gas "$TARGET_GAS" \
     --num-big-blocks "$NUM_BIG_BLOCKS" \
     --output-dir "$PAYLOAD_DIR"
 

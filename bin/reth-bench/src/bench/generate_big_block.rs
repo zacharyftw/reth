@@ -1,9 +1,9 @@
 //! Command for generating large blocks by merging transactions from consecutive real blocks.
 //!
-//! This command fetches N consecutive blocks from an RPC, takes block 0 as the "base" payload,
-//! concatenates transactions from blocks 1..N-1, and saves the result to disk as a
-//! [`BigBlockPayload`] JSON file containing the merged [`ExecutionData`] and environment switches
-//! at each block boundary.
+//! This command fetches consecutive blocks from an RPC until a target gas usage is reached,
+//! takes block 0 as the "base" payload, concatenates transactions from subsequent blocks,
+//! and saves the result to disk as a [`BigBlockPayload`] JSON file containing the merged
+//! [`ExecutionData`] and environment switches at each block boundary.
 
 use alloy_consensus::TxReceipt;
 use alloy_eips::{eip1559::BaseFeeParams, eip7840::BlobParams, Typed2718};
@@ -12,6 +12,7 @@ use alloy_provider::{network::AnyNetwork, Provider, RootProvider};
 use alloy_rpc_client::ClientBuilder;
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar,
+    PraguePayloadFields,
 };
 use clap::Parser;
 use eyre::Context;
@@ -234,14 +235,16 @@ pub struct Command {
     #[arg(long, value_name = "FROM_BLOCK")]
     from_block: u64,
 
-    /// Number of blocks to merge into a single big block.
-    #[arg(long, value_name = "COUNT", default_value = "1")]
-    count: u64,
+    /// Target gas usage per big block. Consecutive real blocks are merged until
+    /// this gas target is reached (or exceeded by the last included block).
+    #[arg(long, value_name = "TARGET_GAS")]
+    target_gas: u64,
 
     /// Number of sequential big blocks to generate.
     ///
-    /// Each big block merges `--count` real blocks. Sequential big blocks are chained:
-    /// block N+1's `parent_hash` is set to block N's computed hash.
+    /// Each big block merges real blocks until `--target-gas` is reached.
+    /// Sequential big blocks are chained: block N+1's `parent_hash` is set to
+    /// block N's computed hash.
     #[arg(long, value_name = "NUM_BIG_BLOCKS", default_value = "1")]
     num_big_blocks: u64,
 
@@ -253,8 +256,8 @@ pub struct Command {
 impl Command {
     /// Execute the `generate-big-block` command.
     pub async fn execute(self, _ctx: CliContext) -> eyre::Result<()> {
-        if self.count == 0 {
-            return Err(eyre::eyre!("--count must be at least 1"));
+        if self.target_gas == 0 {
+            return Err(eyre::eyre!("--target-gas must be greater than 0"));
         }
         if self.num_big_blocks == 0 {
             return Err(eyre::eyre!("--num-big-blocks must be at least 1"));
@@ -267,7 +270,7 @@ impl Command {
         info!(
             target: "reth-bench",
             from_block = self.from_block,
-            count = self.count,
+            target_gas = self.target_gas,
             num_big_blocks = self.num_big_blocks,
             chain = %chain_spec.chain(),
             output_dir = %self.output_dir.display(),
@@ -299,14 +302,19 @@ impl Command {
         }
         let mut prev_big_block_header: Option<PrevBigBlockHeader> = None;
 
-        for big_block_idx in 0..self.num_big_blocks {
-            let range_start = self.from_block + big_block_idx * self.count;
+        // Track the next block to fetch across big blocks so they don't overlap.
+        let mut next_block = self.from_block;
 
-            // Fetch all blocks with full transactions and their receipts
-            let mut blocks = Vec::with_capacity(self.count as usize);
-            let mut block_receipts: Vec<Vec<Receipt>> = Vec::with_capacity(self.count as usize);
-            for i in 0..self.count {
-                let block_number = range_start + i;
+        for big_block_idx in 0..self.num_big_blocks {
+            let range_start = next_block;
+
+            // Fetch consecutive blocks until the gas target is reached.
+            let mut blocks = Vec::new();
+            let mut block_receipts: Vec<Vec<Receipt>> = Vec::new();
+            let mut accumulated_block_gas: u64 = 0;
+
+            while accumulated_block_gas < self.target_gas {
+                let block_number = next_block;
                 info!(target: "reth-bench", block_number, big_block = big_block_idx, "Fetching block");
 
                 let (rpc_block, receipts) = tokio::try_join!(
@@ -364,17 +372,20 @@ impl Command {
                 let (payload, sidecar) = ExecutionPayload::from_block_slow(&block);
                 let execution_data = ExecutionData { payload, sidecar };
 
+                let block_gas = execution_data.payload.as_v1().gas_used;
                 info!(
                     target: "reth-bench",
                     block_number,
-                    gas_used = execution_data.payload.as_v1().gas_used,
+                    gas_used = block_gas,
                     tx_count = execution_data.payload.transactions().len(),
                     receipts = consensus_receipts.len(),
                     "Fetched block"
                 );
 
+                accumulated_block_gas += block_gas;
                 blocks.push(execution_data);
                 block_receipts.push(consensus_receipts);
+                next_block += 1;
             }
 
             // Block 0 is the base
@@ -460,7 +471,7 @@ impl Command {
             // derivable from the previous big block's merged header.
             if let Some(prev_hash) = prev_big_block_hash {
                 base.payload.as_v1_mut().parent_hash = prev_hash;
-                // First big block keeps its original block number (range_start).
+                // First big block keeps its original block number (from_block).
                 // Subsequent big blocks increment from there.
                 base.payload.as_v1_mut().block_number = self.from_block + big_block_idx;
             }
@@ -516,7 +527,14 @@ impl Command {
                     versioned_hashes: all_versioned_hashes,
                     parent_beacon_block_root: c.parent_beacon_block_root,
                 });
-                let prague = base.sidecar.prague().cloned();
+                // For merged blocks, set an empty requests hash in the Prague sidecar.
+                // The correct requests_hash cannot be computed from RPC data alone
+                // (raw execution layer requests are not exposed via eth_getBlockByNumber).
+                // Use --testing.skip-requests-hash-check when validating big block payloads.
+                let prague = base
+                    .sidecar
+                    .prague()
+                    .map(|_| PraguePayloadFields::new(alloy_eips::eip7685::Requests::default()));
                 base.sidecar = match (cancun, prague) {
                     (Some(c), Some(p)) => ExecutionPayloadSidecar::v4(c, p),
                     (Some(c), None) => ExecutionPayloadSidecar::v3(c),
@@ -559,7 +577,7 @@ impl Command {
             }
 
             // Save to disk
-            let range_end = range_start + self.count - 1;
+            let range_end = next_block - 1;
             let filename = format!("big_block_{range_start}_to_{range_end}.json");
             let filepath = self.output_dir.join(&filename);
             let json = serde_json::to_string_pretty(&big_block)?;
