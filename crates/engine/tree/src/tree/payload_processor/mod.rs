@@ -50,7 +50,7 @@ use std::{
     },
     time::Duration,
 };
-use tracing::{debug, debug_span, instrument, warn, Span};
+use tracing::{debug, debug_span, instrument, trace, warn, Span};
 
 pub mod bal;
 pub mod multiproof;
@@ -449,9 +449,9 @@ where
                             tx
                         });
                         let _ = execute_tx.send(tx);
-                        debug!(target: "engine::tree::payload_processor", idx, "yielded transaction");
-                    });
-            });
+                        trace!(target: "engine::tree::payload_processor", idx, "yielded transaction");
+                        });
+                        });
         }
 
         (prewarm_rx, execute_rx)
@@ -742,7 +742,7 @@ fn convert_serial<RawTx, Tx, TxEnv, InnerTx, Recovered, Err, C>(
             let _ = prewarm_tx.send((idx, tx.clone()));
         }
         let _ = execute_tx.send(tx);
-        debug!(target: "engine::tree::payload_processor", idx, "yielded transaction");
+        trace!(target: "engine::tree::payload_processor", idx, "yielded transaction");
     }
 }
 

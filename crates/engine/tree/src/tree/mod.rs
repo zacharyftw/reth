@@ -2688,10 +2688,7 @@ where
 
         // try to append the block
         match self.insert_block(block) {
-            Ok(
-                InsertPayloadOk::Inserted(BlockStatus::Valid) |
-                InsertPayloadOk::AlreadySeen(BlockStatus::Valid),
-            ) => {
+            Ok(InsertPayloadOk::Inserted(BlockStatus::Valid)) => {
                 return self.on_valid_downloaded_block(block_num_hash);
             }
             Ok(InsertPayloadOk::Inserted(BlockStatus::Disconnected { head, missing_ancestor })) => {
@@ -3051,6 +3048,16 @@ where
     }
 
     /// Validates the payload attributes with respect to the header and fork choice state.
+    ///
+    /// This is called during `engine_forkchoiceUpdated` when the CL provides payload attributes,
+    /// indicating it wants the EL to start building a new block.
+    ///
+    /// Runs [`PayloadValidator::validate_payload_attributes_against_header`](reth_engine_primitives::PayloadValidator::validate_payload_attributes_against_header) to ensure
+    /// `payloadAttributes.timestamp > headBlock.timestamp` per the Engine API spec.
+    ///
+    /// If validation passes, sends the attributes to the payload builder to start a new
+    /// payload job. If it fails, returns `INVALID_PAYLOAD_ATTRIBUTES` without rolling back
+    /// the forkchoice update.
     ///
     /// Note: At this point, the fork choice update is considered to be VALID, however, we can still
     /// return an error if the payload attributes are invalid.
