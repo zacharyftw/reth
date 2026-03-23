@@ -24,7 +24,8 @@ use reth_chain_state::{
 };
 use reth_consensus::{ConsensusError, FullConsensus, ReceiptRootBloom};
 use reth_engine_primitives::{
-    ConfigureEngineEvm, ExecutableTxIterator, ExecutionPayload, InvalidBlockHook, PayloadValidator,
+    BigBlockData, ConfigureEngineEvm, ExecutableTxIterator, ExecutionPayload, InvalidBlockHook,
+    PayloadValidator,
 };
 use reth_errors::{BlockExecutionError, ProviderResult};
 use reth_evm::{
@@ -347,14 +348,16 @@ where
     pub fn validate_block_with_state<T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>>(
         &mut self,
         input: BlockOrPayload<T>,
-        mut env_switches: Vec<(usize, T::ExecutionData)>,
-        prior_block_hashes: Vec<(u64, B256)>,
+        big_block_data: Option<BigBlockData<T::ExecutionData>>,
         mut ctx: TreeCtx<'_, N>,
     ) -> InsertPayloadResult<N>
     where
         V: PayloadValidator<T, Block = N::Block> + Clone,
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
     {
+        let (mut env_switches, prior_block_hashes) =
+            big_block_data.map(|d| (d.env_switches, d.prior_block_hashes)).unwrap_or_default();
+
         // Spawn payload conversion on a background thread so it runs concurrently with the
         // rest of the function (setup + execution). For payloads this overlaps the cost of
         // RLP decoding + header hashing.
@@ -2232,8 +2235,7 @@ pub trait EngineValidator<
     fn validate_payload(
         &mut self,
         payload: Types::ExecutionData,
-        env_switches: Vec<(usize, Types::ExecutionData)>,
-        prior_block_hashes: Vec<(u64, B256)>,
+        big_block_data: Option<BigBlockData<Types::ExecutionData>>,
         ctx: TreeCtx<'_, N>,
     ) -> ValidationOutcome<N>;
 
@@ -2293,16 +2295,10 @@ where
     fn validate_payload(
         &mut self,
         payload: Types::ExecutionData,
-        env_switches: Vec<(usize, Types::ExecutionData)>,
-        prior_block_hashes: Vec<(u64, B256)>,
+        big_block_data: Option<BigBlockData<Types::ExecutionData>>,
         ctx: TreeCtx<'_, N>,
     ) -> ValidationOutcome<N> {
-        self.validate_block_with_state(
-            BlockOrPayload::Payload(payload),
-            env_switches,
-            prior_block_hashes,
-            ctx,
-        )
+        self.validate_block_with_state(BlockOrPayload::Payload(payload), big_block_data, ctx)
     }
 
     fn validate_block(
@@ -2310,7 +2306,7 @@ where
         block: SealedBlock<N::Block>,
         ctx: TreeCtx<'_, N>,
     ) -> ValidationOutcome<N> {
-        self.validate_block_with_state(BlockOrPayload::Block(block), Vec::new(), Vec::new(), ctx)
+        self.validate_block_with_state(BlockOrPayload::Block(block), None, ctx)
     }
 
     fn on_inserted_executed_block(&self, block: ExecutedBlock<N>) {

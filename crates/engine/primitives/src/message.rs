@@ -1,6 +1,7 @@
 use crate::{
     error::BeaconForkChoiceUpdateError, BeaconOnNewPayloadError, ExecutionPayload, ForkchoiceStatus,
 };
+use alloy_primitives::B256;
 use alloy_rpc_types_engine::{
     ForkChoiceUpdateResult, ForkchoiceState, ForkchoiceUpdateError, ForkchoiceUpdated, PayloadId,
     PayloadStatus, PayloadStatusEnum,
@@ -15,6 +16,7 @@ use futures::{future::Either, FutureExt, TryFutureExt};
 use reth_errors::RethResult;
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::{EngineApiMessageVersion, PayloadTypes};
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
@@ -162,6 +164,30 @@ pub struct NewPayloadTimings {
     pub sparse_trie_wait: Option<Duration>,
 }
 
+/// Additional data for big block payloads that merge multiple real blocks.
+///
+/// This is used by the `reth_newPayload` endpoint to pass environment switches
+/// and prior block hashes needed for correct multi-segment execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BigBlockData<ExecutionData> {
+    /// Environment switches at block boundaries.
+    /// Each entry is `(cumulative_tx_count, execution_data_of_next_block)`.
+    ///
+    /// The first entry at index 0 represents the **original unmutated** base block's
+    /// `ExecutionData`, which must be used to derive the initial EVM environment.
+    pub env_switches: Vec<(usize, ExecutionData)>,
+    /// Block number → real block hash for blocks covered by previous big blocks in a sequence.
+    /// When replaying chained big blocks, the BLOCKHASH opcode needs real hashes for blocks
+    /// that were merged into earlier big blocks (and thus not individually persisted).
+    pub prior_block_hashes: Vec<(u64, B256)>,
+}
+
+impl<T> Default for BigBlockData<T> {
+    fn default() -> Self {
+        Self { env_switches: Vec::new(), prior_block_hashes: Vec::new() }
+    }
+}
+
 /// A message for the beacon engine from other components of the node (engine RPC API invoked by the
 /// consensus layer).
 #[derive(Debug)]
@@ -182,11 +208,8 @@ pub enum BeaconEngineMessage<Payload: PayloadTypes> {
     RethNewPayload {
         /// The execution payload received by Engine API.
         payload: Payload::ExecutionData,
-        /// Environment switches: at each `(tx_index, execution_data)`, the executor will
-        /// swap the EVM environment to match the given execution data.
-        env_switches: Vec<(usize, Payload::ExecutionData)>,
-        /// Real block hashes for blocks covered by previous big blocks in a sequence.
-        prior_block_hashes: Vec<(u64, alloy_primitives::B256)>,
+        /// Optional big block data containing environment switches and prior block hashes.
+        big_block_data: Option<BigBlockData<Payload::ExecutionData>>,
         /// Whether to wait for in-flight persistence to complete before processing.
         wait_for_persistence: bool,
         /// Whether to wait for execution cache and sparse trie locks before processing.
@@ -282,16 +305,14 @@ where
     pub async fn reth_new_payload(
         &self,
         payload: Payload::ExecutionData,
-        env_switches: Vec<(usize, Payload::ExecutionData)>,
-        prior_block_hashes: Vec<(u64, alloy_primitives::B256)>,
+        big_block_data: Option<BigBlockData<Payload::ExecutionData>>,
         wait_for_persistence: bool,
         wait_for_caches: bool,
     ) -> Result<(PayloadStatus, NewPayloadTimings), BeaconOnNewPayloadError> {
         let (tx, rx) = oneshot::channel();
         let _ = self.to_engine.send(BeaconEngineMessage::RethNewPayload {
             payload,
-            env_switches,
-            prior_block_hashes,
+            big_block_data,
             wait_for_persistence,
             wait_for_caches,
             tx,

@@ -15,6 +15,7 @@ use alloy_rpc_types_engine::{
 use clap::Parser;
 use eyre::Context;
 use reth_cli_runner::CliContext;
+use reth_engine_primitives::BigBlockData;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use tracing::info;
@@ -204,19 +205,9 @@ pub struct CollectionResult {
 pub struct BigBlockPayload {
     /// The primary execution data with all concatenated transactions.
     pub execution_data: ExecutionData,
-    /// Environment switches at block boundaries.
-    /// Each entry is `(cumulative_tx_count, execution_data_of_next_block)`.
-    ///
-    /// The first entry at index 0 represents the **original unmutated** base block's
-    /// `ExecutionData`, which must be used to derive the initial EVM environment
-    /// (basefee, gas_limit, etc.) for segment 0. Without this, segment 0 would
-    /// execute with the synthetic merged header's inflated gas_limit.
-    pub env_switches: Vec<(usize, ExecutionData)>,
-    /// Block number → real block hash for blocks covered by previous big blocks in a sequence.
-    /// When replaying chained big blocks, the BLOCKHASH opcode needs real hashes for blocks
-    /// that were merged into earlier big blocks (and thus not individually persisted).
+    /// Big block data containing environment switches and prior block hashes.
     #[serde(default)]
-    pub prior_block_hashes: Vec<(u64, B256)>,
+    pub big_block_data: BigBlockData<ExecutionData>,
 }
 
 /// `reth bench generate-big-block` command
@@ -418,13 +409,15 @@ impl Command {
 
             let big_block = BigBlockPayload {
                 execution_data: base,
-                env_switches,
-                prior_block_hashes: accumulated_block_hashes.clone(),
+                big_block_data: BigBlockData {
+                    env_switches,
+                    prior_block_hashes: accumulated_block_hashes.clone(),
+                },
             };
 
             // Accumulate real block hashes from this big block's env_switches for
             // subsequent big blocks' BLOCKHASH lookups.
-            for (_, switch_data) in &big_block.env_switches {
+            for (_, switch_data) in &big_block.big_block_data.env_switches {
                 let block_number = switch_data.payload.as_v1().block_number;
                 let block_hash = switch_data.payload.as_v1().block_hash;
                 accumulated_block_hashes.push((block_number, block_hash));
@@ -444,8 +437,8 @@ impl Command {
                 block_hash = %block_hash,
                 total_txs = big_block.execution_data.payload.transactions().len(),
                 total_gas_used = big_block.execution_data.payload.as_v1().gas_used,
-                env_switches = big_block.env_switches.len(),
-                prior_block_hashes = big_block.prior_block_hashes.len(),
+                env_switches = big_block.big_block_data.env_switches.len(),
+                prior_block_hashes = big_block.big_block_data.prior_block_hashes.len(),
                 "Big block payload saved"
             );
         }

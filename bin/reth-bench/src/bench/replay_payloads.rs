@@ -22,6 +22,7 @@ use alloy_rpc_types_engine::{
 use clap::Parser;
 use eyre::Context;
 use reth_cli_runner::CliContext;
+use reth_engine_primitives::BigBlockData;
 use reth_node_api::EngineApiMessageVersion;
 use reth_rpc_api::RethNewPayloadInput;
 use std::{
@@ -113,10 +114,8 @@ struct LoadedPayload {
     execution_data: ExecutionData,
     /// The block hash.
     block_hash: B256,
-    /// Environment switches to apply at specific transaction indices.
-    env_switches: Vec<(usize, ExecutionData)>,
-    /// Real block hashes for blocks covered by previous big blocks.
-    prior_block_hashes: Vec<(u64, B256)>,
+    /// Big block data containing environment switches and prior block hashes.
+    big_block_data: BigBlockData<ExecutionData>,
 }
 
 impl Command {
@@ -179,7 +178,8 @@ impl Command {
 
         // If any payload has env_switches but we're not using reth_newPayload, warn the user
         if !self.reth_new_payload {
-            let has_env_switches = payloads.iter().any(|p| !p.env_switches.is_empty());
+            let has_env_switches =
+                payloads.iter().any(|p| !p.big_block_data.env_switches.is_empty());
             if has_env_switches {
                 warn!(
                     target: "reth-bench",
@@ -223,15 +223,12 @@ impl Command {
             );
 
             let (version, params) = if self.reth_new_payload {
-                let env_switches_param = if payload.env_switches.is_empty() {
+                let big_block_data_param = if payload.big_block_data.env_switches.is_empty() &&
+                    payload.big_block_data.prior_block_hashes.is_empty()
+                {
                     None
                 } else {
-                    Some(payload.env_switches.clone())
-                };
-                let prior_block_hashes_param = if payload.prior_block_hashes.is_empty() {
-                    None
-                } else {
-                    Some(payload.prior_block_hashes.clone())
+                    Some(payload.big_block_data.clone())
                 };
                 (
                     None,
@@ -239,8 +236,7 @@ impl Command {
                         RethNewPayloadInput::ExecutionData(execution_data.clone()),
                         self.no_wait_for_persistence.then_some(false),
                         self.no_wait_for_caches.then_some(false),
-                        env_switches_param,
-                        prior_block_hashes_param,
+                        big_block_data_param,
                     ))?,
                 )
             } else {
@@ -398,9 +394,9 @@ impl Command {
                 .wrap_err_with(|| format!("Failed to read {:?}", path))?;
 
             // Try BigBlockPayload first, then fall back to legacy ExecutionPayloadEnvelopeV4
-            let (execution_data, env_switches, prior_block_hashes) =
+            let (execution_data, big_block_data) =
                 if let Ok(big_block) = serde_json::from_str::<BigBlockPayload>(&content) {
-                    (big_block.execution_data, big_block.env_switches, big_block.prior_block_hashes)
+                    (big_block.execution_data, big_block.big_block_data)
                 } else {
                     let envelope: ExecutionPayloadEnvelopeV4 = serde_json::from_str(&content)
                         .wrap_err_with(|| format!("Failed to parse {:?}", path))?;
@@ -416,7 +412,7 @@ impl Command {
                             },
                         ),
                     };
-                    (execution_data, Vec::new(), Vec::new())
+                    (execution_data, BigBlockData::default())
                 };
 
             let block_hash = execution_data.payload.as_v1().block_hash;
@@ -425,19 +421,13 @@ impl Command {
                 target: "reth-bench",
                 index = index,
                 block_hash = %block_hash,
-                env_switches = env_switches.len(),
-                prior_block_hashes = prior_block_hashes.len(),
+                env_switches = big_block_data.env_switches.len(),
+                prior_block_hashes = big_block_data.prior_block_hashes.len(),
                 path = %path.display(),
                 "Loaded payload"
             );
 
-            payloads.push(LoadedPayload {
-                index,
-                execution_data,
-                block_hash,
-                env_switches,
-                prior_block_hashes,
-            });
+            payloads.push(LoadedPayload { index, execution_data, block_hash, big_block_data });
         }
 
         Ok(payloads)
