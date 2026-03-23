@@ -1672,19 +1672,13 @@ where
         let start = Instant::now();
 
         trace!(target: "engine::tree::payload_validator", block=?block.num_hash(), "Validating block consensus (env_switches mode)");
-        // For env_switches blocks, only validate the transaction root. Skip
-        // validate_block_pre_execution_with_tx_root entirely because it also runs
-        // validate_cancun_gas which checks blob_gas_used — the merged header's
-        // blob_gas_used is the total across all constituent blocks and exceeds
-        // per-block limits.
-        if let Some(tx_root) = transaction_root {
-            let expected = block.header().transactions_root();
-            if tx_root != expected {
-                return Err(ConsensusError::BodyTransactionRootDiff(
-                    GotExpected { got: tx_root, expected }.into(),
-                )
-                .into());
-            }
+
+        if let Err(e) = self.consensus.validate_block_pre_execution_with_tx_root(
+            &block.clone_sealed_block(),
+            transaction_root,
+        ) {
+            error!(target: "engine::tree::payload_validator", ?block, "Failed to validate block {}: {e}", block.hash());
+            return Err(e.into())
         }
 
         // Validate against the parent — the big block generator sets parent_hash,
