@@ -75,6 +75,25 @@ type InsertPayloadResult<N> = Result<
     InsertPayloadError<<N as NodePrimitives>::Block>,
 >;
 
+/// Trait for receipts whose cumulative gas can be adjusted.
+///
+/// Required for big block validation where receipt cumulative gas counters reset at segment
+/// boundaries and need to be offset to produce globally-correct values.
+pub trait AdjustCumulativeGas: Clone {
+    /// Returns a clone of this receipt with `cumulative_gas_used` increased by `gas_offset`.
+    fn with_gas_offset(&self, gas_offset: u64) -> Self;
+}
+
+impl<T: alloy_eips::eip2718::Typed2718 + Clone> AdjustCumulativeGas
+    for alloy_consensus::EthereumReceipt<T>
+{
+    fn with_gas_offset(&self, gas_offset: u64) -> Self {
+        let mut receipt = self.clone();
+        receipt.cumulative_gas_used += gas_offset;
+        receipt
+    }
+}
+
 /// Context providing access to tree state during validation.
 ///
 /// This context is provided to the [`EngineValidator`] and includes the state of the tree's
@@ -354,6 +373,7 @@ where
     where
         V: PayloadValidator<T, Block = N::Block> + Clone,
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
+        N::Receipt: AdjustCumulativeGas,
     {
         let (mut env_switches, prior_block_hashes) =
             big_block_data.map(|d| (d.env_switches, d.prior_block_hashes)).unwrap_or_default();
@@ -627,7 +647,14 @@ where
         let block = block.with_senders(senders);
 
         // Wait for the receipt root computation to complete.
-        let receipt_root_bloom = {
+        // For env_switches blocks, the streamed receipts have per-segment cumulative gas
+        // (the background task received them before correction), so we skip the pre-computed
+        // receipt root and let validation recompute it from the corrected receipts.
+        let receipt_root_bloom = if has_env_switches {
+            // Still receive to avoid a leaked task, but discard the result.
+            let _ = receipt_root_rx.blocking_recv();
+            None
+        } else {
             let _enter = debug_span!(
                 target: "engine::tree::payload_validator",
                 "wait_receipt_root",
@@ -651,40 +678,18 @@ where
             handle.try_into_inner().expect("sole handle")
         });
 
-        let hashed_state = if has_env_switches {
-            // For big blocks with env_switches, skip only the receipt-based post-execution
-            // checks (gas_used, receipts_root, logs_bloom) since receipt cumulative gas
-            // counters reset at each segment boundary. Keep all other validation
-            // (header, parent, tx root, hashed state) and always check state root.
-            debug!(
-                target: "engine::tree::payload_validator",
-                "Running selective post-execution validation for big block with env_switches"
-            );
-            ensure_ok_post_block!(
-                self.validate_post_execution_env_switches(
-                    &block,
-                    &parent_block,
-                    &output,
-                    &mut ctx,
-                    transaction_root,
-                    hashed_state,
-                ),
-                block
-            )
-        } else {
-            ensure_ok_post_block!(
-                self.validate_post_execution(
-                    &block,
-                    &parent_block,
-                    &output,
-                    &mut ctx,
-                    transaction_root,
-                    receipt_root_bloom,
-                    hashed_state,
-                ),
-                block
-            )
-        };
+        let hashed_state = ensure_ok_post_block!(
+            self.validate_post_execution(
+                &block,
+                &parent_block,
+                &output,
+                &mut ctx,
+                transaction_root,
+                receipt_root_bloom,
+                hashed_state,
+            ),
+            block
+        );
 
         let root_time = Instant::now();
         let mut maybe_state_root = None;
@@ -942,6 +947,7 @@ where
         V: PayloadValidator<T, Block = N::Block>,
         T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
+        N::Receipt: AdjustCumulativeGas,
     {
         debug!(target: "engine::tree::payload_validator", "Executing block");
 
@@ -1101,7 +1107,18 @@ where
             let (evm, segment_result) = executor.finish()?;
             let segment_receipt_count = segment_result.receipts.len();
             let segment_gas = segment_result.gas_used;
-            accumulated_receipts.extend(segment_result.receipts);
+            // Apply gas offset to this segment's receipts so their cumulative_gas_used
+            // values are globally correct (not relative to this segment only).
+            if accumulated_gas_used > 0 {
+                accumulated_receipts.extend(
+                    segment_result
+                        .receipts
+                        .into_iter()
+                        .map(|r| r.with_gas_offset(accumulated_gas_used)),
+                );
+            } else {
+                accumulated_receipts.extend(segment_result.receipts);
+            }
             accumulated_gas_used += segment_gas;
             accumulated_blob_gas_used += segment_result.blob_gas_used;
             accumulated_requests.extend(segment_result.requests);
@@ -1194,7 +1211,14 @@ where
             total_accumulated_receipts = accumulated_receipts.len() + final_result.receipts.len(),
             "Final segment completed"
         );
-        accumulated_receipts.extend(final_result.receipts);
+        // Apply gas offset to the final segment's receipts (same as intermediate segments).
+        if accumulated_gas_used > 0 {
+            accumulated_receipts.extend(
+                final_result.receipts.into_iter().map(|r| r.with_gas_offset(accumulated_gas_used)),
+            );
+        } else {
+            accumulated_receipts.extend(final_result.receipts);
+        }
         accumulated_gas_used += final_result.gas_used;
         accumulated_blob_gas_used += final_result.blob_gas_used;
         accumulated_requests.extend(final_result.requests);
@@ -1635,100 +1659,6 @@ where
             self.validator.validate_block_post_execution_with_hashed_state(hashed_state_ref, block)
         {
             // call post-block hook
-            self.on_invalid_block(parent_block, block, output, None, ctx.state_mut());
-            return Err(err.into())
-        }
-
-        // record post-execution validation duration
-        self.metrics
-            .block_validation
-            .post_execution_validation_duration
-            .record(start.elapsed().as_secs_f64());
-
-        Ok(hashed_state)
-    }
-
-    /// Validates post-execution state for big blocks with env_switches.
-    ///
-    /// This performs a subset of [`validate_post_execution`] checks, skipping receipt-based
-    /// validation (gas_used, receipts_root, logs_bloom) since receipt cumulative gas counters
-    /// reset at each segment boundary in env_switch blocks. Header validation, parent
-    /// validation, and hashed state validation are still performed.
-    #[instrument(level = "debug", target = "engine::tree::payload_validator", skip_all)]
-    fn validate_post_execution_env_switches<
-        T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
-    >(
-        &self,
-        block: &RecoveredBlock<N::Block>,
-        parent_block: &SealedHeader<N::BlockHeader>,
-        output: &BlockExecutionOutput<N::Receipt>,
-        ctx: &mut TreeCtx<'_, N>,
-        transaction_root: Option<B256>,
-        hashed_state: LazyHashedPostState,
-    ) -> Result<LazyHashedPostState, InsertBlockErrorKind>
-    where
-        V: PayloadValidator<T, Block = N::Block>,
-    {
-        let start = Instant::now();
-
-        trace!(target: "engine::tree::payload_validator", block=?block.num_hash(), "Validating block consensus (env_switches mode)");
-
-        if let Err(e) = self.consensus.validate_block_pre_execution_with_tx_root(
-            &block.clone_sealed_block(),
-            transaction_root,
-        ) {
-            error!(target: "engine::tree::payload_validator", ?block, "Failed to validate block {}: {e}", block.hash());
-            return Err(e.into())
-        }
-
-        // Validate against the parent — the big block generator sets parent_hash,
-        // block_number, basefee, and excess_blob_gas on the outer block correctly
-        // so these checks pass. The gas limit ramp check is skipped via
-        // --testing.skip-gas-limit-ramp-check.
-        {
-            let _enter = debug_span!(target: "engine::tree::payload_validator", "validate_header_against_parent").entered();
-            if let Err(e) =
-                self.consensus.validate_header_against_parent(block.sealed_header(), parent_block)
-            {
-                warn!(target: "engine::tree::payload_validator", ?block, "Failed to validate header {} against parent: {e}", block.hash());
-                return Err(e.into())
-            }
-        }
-
-        // Validate gas_used: the accumulated gas from all segments must match the
-        // merged header's gas_used. We check output.result.gas_used directly rather
-        // than receipts.last().cumulative_gas_used() because receipt cumulative gas
-        // counters reset at each segment boundary.
-        {
-            let header_gas_used = block.header().gas_used();
-            let executed_gas_used = output.result.gas_used;
-            if header_gas_used != executed_gas_used {
-                return Err(ConsensusError::BlockGasUsed {
-                    gas: GotExpected { got: executed_gas_used, expected: header_gas_used },
-                    gas_spent_by_tx: Default::default(),
-                }
-                .into())
-            }
-        }
-
-        // Skip receipts_root and logs_bloom validation: the merged header carries
-        // values that cannot be derived without executing all segments, and receipt
-        // cumulative gas counters reset at each segment boundary making the receipt
-        // root differ from the header's value.
-        debug!(
-            target: "engine::tree::payload_validator",
-            "Skipping receipts_root and logs_bloom validation for env_switches block"
-        );
-
-        // Wait for the background keccak256 hashing task to complete
-        let hashed_state_ref =
-            debug_span!(target: "engine::tree::payload_validator", "wait_hashed_post_state")
-                .in_scope(|| hashed_state.get());
-
-        let _enter = debug_span!(target: "engine::tree::payload_validator", "validate_block_post_execution_with_hashed_state").entered();
-        if let Err(err) =
-            self.validator.validate_block_post_execution_with_hashed_state(hashed_state_ref, block)
-        {
             self.on_invalid_block(parent_block, block, output, None, ctx.state_mut());
             return Err(err.into())
         }
@@ -2293,7 +2223,7 @@ where
         + HashedPostStateProvider
         + Clone
         + 'static,
-    N: NodePrimitives,
+    N: NodePrimitives<Receipt: AdjustCumulativeGas>,
     V: PayloadValidator<Types, Block = N::Block> + Clone,
     Evm: ConfigureEngineEvm<Types::ExecutionData, Primitives = N> + 'static,
     Types: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
