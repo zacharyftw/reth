@@ -491,9 +491,6 @@ where
         // Write output. When `use_hashed_state` is enabled, `write_state` skips writing to
         // plain account/storage tables and only writes bytecodes and changesets. The hashed
         // state is then written separately below.
-        //
-        // `hash_state_slow` is CPU-bound and independent of `write_state` (IO-bound), so we
-        // run them in parallel when hashed state is enabled.
         if provider.cached_storage_settings().use_hashed_state() {
             let (hashed_state, write_result) = rayon::join(
                 || state.hash_state_slow::<KeccakKeyHasher>().into_sorted(),
