@@ -166,8 +166,13 @@ impl<'a, N: NodePrimitives> TreeCtx<'a, N> {
 /// This type contains common validation, execution, and state root computation logic that can be
 /// used by network-specific payload validators (e.g., Ethereum, Optimism). It is not meant to be
 /// used as a standalone component, but rather as a building block for concrete implementations.
+///
+/// The `X` parameter controls the block execution strategy. The default
+/// ([`DefaultBlockExecutor`]) handles standard single-segment execution; custom strategies
+/// (e.g., multi-segment big-block execution) can be plugged in via
+/// [`BasicEngineValidator::new_with_executor`].
 #[derive(derive_more::Debug)]
-pub struct BasicEngineValidator<P, Evm, V>
+pub struct BasicEngineValidator<P, Evm, V, X = DefaultBlockExecutor>
 where
     Evm: ConfigureEvm,
 {
@@ -196,9 +201,11 @@ where
     pub changeset_cache: ChangesetCache,
     /// Task runtime for spawning parallel work.
     pub runtime: reth_tasks::Runtime,
+    /// Block executor strategy.
+    pub block_executor: X,
 }
 
-impl<N, P, Evm, V> BasicEngineValidator<P, Evm, V>
+impl<N, P, Evm, V> BasicEngineValidator<P, Evm, V, DefaultBlockExecutor>
 where
     N: NodePrimitives,
     P: DatabaseProviderFactory<
@@ -219,7 +226,7 @@ where
         + 'static,
     Evm: ConfigureEvm<Primitives = N> + 'static,
 {
-    /// Creates a new `TreePayloadValidator`.
+    /// Creates a new `BasicEngineValidator` with the [`DefaultBlockExecutor`] strategy.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: P,
@@ -230,6 +237,54 @@ where
         invalid_block_hook: Box<dyn InvalidBlockHook<N>>,
         changeset_cache: ChangesetCache,
         runtime: reth_tasks::Runtime,
+    ) -> Self {
+        Self::new_with_executor(
+            provider,
+            consensus,
+            evm_config,
+            validator,
+            config,
+            invalid_block_hook,
+            changeset_cache,
+            runtime,
+            DefaultBlockExecutor,
+        )
+    }
+}
+
+impl<N, P, Evm, V, X> BasicEngineValidator<P, Evm, V, X>
+where
+    N: NodePrimitives,
+    P: DatabaseProviderFactory<
+            Provider: BlockReader
+                          + StageCheckpointReader
+                          + PruneCheckpointReader
+                          + ChangeSetReader
+                          + StorageChangeSetReader
+                          + BlockNumReader
+                          + StorageSettingsCache,
+        > + BlockReader<Header = N::BlockHeader>
+        + ChangeSetReader
+        + BlockNumReader
+        + StateProviderFactory
+        + StateReader
+        + HashedPostStateProvider
+        + Clone
+        + 'static,
+    Evm: ConfigureEvm<Primitives = N> + 'static,
+{
+    /// Creates a new `BasicEngineValidator` with a custom block executor strategy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_executor(
+        provider: P,
+        consensus: Arc<dyn FullConsensus<N>>,
+        evm_config: Evm,
+        validator: V,
+        config: TreeConfig,
+        invalid_block_hook: Box<dyn InvalidBlockHook<N>>,
+        changeset_cache: ChangesetCache,
+        runtime: reth_tasks::Runtime,
+        block_executor: X,
     ) -> Self {
         let precompile_cache_map = PrecompileCacheMap::default();
         let payload_processor = PayloadProcessor::new(
@@ -251,6 +306,7 @@ where
             validator,
             changeset_cache,
             runtime,
+            block_executor,
         }
     }
 
@@ -390,6 +446,7 @@ where
     where
         V: PayloadValidator<T, Block = N::Block> + Clone,
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
+        X: BlockExecutorStrategy<N, Evm>,
     {
         // Spawn payload conversion on a background thread so it runs concurrently with the
         // rest of the function (setup + execution). For payloads this overlaps the cost of
@@ -565,11 +622,32 @@ where
         // The receipt root task is spawned before execution and receives receipts incrementally
         // as transactions complete, allowing parallel computation during execution.
         let execute_block_start = Instant::now();
-        let (output, senders, receipt_root_rx) =
-            match self.execute_block(state_provider, env, &input, &mut handle) {
-                Ok(output) => output,
-                Err(err) => return self.handle_execution_error(input, err, &parent_block),
+        let execute_result = {
+            let BasicEngineValidator {
+                ref evm_config,
+                ref config,
+                ref payload_processor,
+                ref precompile_cache_map,
+                ref mut precompile_cache_metrics,
+                ref metrics,
+                ref mut block_executor,
+                ..
+            } = *self;
+
+            let mut exec_ctx = ExecuteBlockCtx {
+                evm_config,
+                config,
+                payload_processor,
+                precompile_cache_map,
+                precompile_cache_metrics,
+                metrics,
             };
+            block_executor.execute_block(&mut exec_ctx, state_provider, env, &input, &mut handle)
+        };
+        let (output, senders, receipt_root_rx) = match execute_result {
+            Ok(output) => output,
+            Err(err) => return self.handle_execution_error(input, err, &parent_block),
+        };
         let execution_duration = execute_block_start.elapsed();
 
         // After executing the block we can stop prewarming transactions
@@ -873,206 +951,6 @@ where
         }
 
         Ok(())
-    }
-
-    /// Executes a block with the given state provider.
-    ///
-    /// This method orchestrates block execution:
-    /// 1. Sets up the EVM with state database and precompile caching
-    /// 2. Spawns a background task for incremental receipt root computation
-    /// 3. Executes transactions with metrics collection via state hooks
-    /// 4. Merges state transitions and records execution metrics
-    #[instrument(level = "debug", target = "engine::tree::payload_validator", skip_all)]
-    #[expect(clippy::type_complexity)]
-    pub fn execute_block<S, Err, T>(
-        &mut self,
-        state_provider: S,
-        env: ExecutionEnv<Evm>,
-        input: &BlockOrPayload<T>,
-        handle: &mut PayloadHandle<impl ExecutableTxFor<Evm>, Err, N::Receipt>,
-    ) -> Result<
-        (
-            BlockExecutionOutput<N::Receipt>,
-            Vec<Address>,
-            tokio::sync::oneshot::Receiver<(B256, alloy_primitives::Bloom)>,
-        ),
-        InsertBlockErrorKind,
-    >
-    where
-        S: StateProvider + Send,
-        Err: core::error::Error + Send + Sync + 'static,
-        V: PayloadValidator<T, Block = N::Block>,
-        T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
-        Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
-    {
-        debug!(target: "engine::tree::payload_validator", "Executing block");
-
-        let mut db = debug_span!(target: "engine::tree", "build_state_db").in_scope(|| {
-            State::builder()
-                .with_database(StateProviderDatabase::new(state_provider))
-                .with_bundle_update()
-                .build()
-        });
-
-        let (spec_id, mut executor) = {
-            let _span = debug_span!(target: "engine::tree", "create_evm").entered();
-            let spec_id = *env.evm_env.spec_id();
-            let evm = self.evm_config.evm_with_env(&mut db, env.evm_env);
-            let ctx = self
-                .execution_ctx_for(input)
-                .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
-            let executor = self.evm_config.create_executor(evm, ctx);
-            (spec_id, executor)
-        };
-
-        if !self.config.precompile_cache_disabled() {
-            let _span = debug_span!(target: "engine::tree", "setup_precompile_cache").entered();
-            executor.evm_mut().precompiles_mut().map_cacheable_precompiles(
-                |address, precompile| {
-                    let metrics = self
-                        .precompile_cache_metrics
-                        .entry(*address)
-                        .or_insert_with(|| CachedPrecompileMetrics::new_with_address(*address))
-                        .clone();
-                    CachedPrecompile::wrap(
-                        precompile,
-                        self.precompile_cache_map.cache_for_address(*address),
-                        spec_id,
-                        Some(metrics),
-                    )
-                },
-            );
-        }
-
-        // Spawn background task to compute receipt root and logs bloom incrementally.
-        // Unbounded channel is used since tx count bounds capacity anyway (max ~30k txs per block).
-        let receipts_len = input.transaction_count();
-        let (receipt_tx, receipt_rx) = crossbeam_channel::unbounded();
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let task_handle = ReceiptRootTaskHandle::new(receipt_rx, result_tx);
-        self.payload_processor
-            .executor()
-            .spawn_blocking_named("receipt-root", move || task_handle.run(receipts_len));
-
-        let transaction_count = input.transaction_count();
-        let executed_tx_index = Arc::clone(handle.executed_tx_index());
-        let executor = executor.with_state_hook(
-            handle.state_hook().map(|hook| Box::new(hook) as Box<dyn OnStateHook>),
-        );
-
-        let execution_start = Instant::now();
-
-        // Execute all transactions and finalize
-        let (executor, senders) = self.execute_transactions(
-            executor,
-            transaction_count,
-            handle.iter_transactions(),
-            &receipt_tx,
-            &executed_tx_index,
-        )?;
-        drop(receipt_tx);
-
-        // Finish execution and get the result
-        let post_exec_start = Instant::now();
-        let (_evm, result) = debug_span!(target: "engine::tree", "BlockExecutor::finish")
-            .in_scope(|| executor.finish())
-            .map(|(evm, result)| (evm.into_db(), result))?;
-        self.metrics.record_post_execution(post_exec_start.elapsed());
-        handle.finish_state_updates();
-
-        // Merge transitions into bundle state
-        debug_span!(target: "engine::tree", "merge_transitions")
-            .in_scope(|| db.merge_transitions(BundleRetention::Reverts));
-
-        let output = BlockExecutionOutput { result, state: db.take_bundle() };
-
-        let execution_duration = execution_start.elapsed();
-        self.metrics.record_block_execution(&output, execution_duration);
-        self.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
-        debug!(target: "engine::tree::payload_validator", elapsed = ?execution_duration, "Executed block");
-
-        Ok((output, senders, result_rx))
-    }
-
-    /// Executes transactions and collects senders, streaming receipts to a background task.
-    ///
-    /// This method handles:
-    /// - Applying pre-execution changes (e.g., beacon root updates)
-    /// - Executing each transaction with timing metrics
-    /// - Streaming receipts to the receipt root computation task
-    /// - Collecting transaction senders for later use
-    ///
-    /// Returns the executor (for finalization) and the collected senders.
-    pub fn execute_transactions<E, Tx, InnerTx, Err>(
-        &self,
-        mut executor: E,
-        transaction_count: usize,
-        transactions: impl Iterator<Item = Result<Tx, Err>>,
-        receipt_tx: &crossbeam_channel::Sender<IndexedReceipt<N::Receipt>>,
-        executed_tx_index: &AtomicUsize,
-    ) -> Result<(E, Vec<Address>), BlockExecutionError>
-    where
-        E: BlockExecutor<Receipt = N::Receipt>,
-        Tx: alloy_evm::block::ExecutableTx<E> + alloy_evm::RecoveredTx<InnerTx>,
-        InnerTx: TxHashRef,
-        Err: core::error::Error + Send + Sync + 'static,
-    {
-        let mut senders = Vec::with_capacity(transaction_count);
-
-        // Apply pre-execution changes (e.g., beacon root update)
-        let pre_exec_start = Instant::now();
-        debug_span!(target: "engine::tree", "pre_execution")
-            .in_scope(|| executor.apply_pre_execution_changes())?;
-        self.metrics.record_pre_execution(pre_exec_start.elapsed());
-
-        // Execute transactions
-        let exec_span = debug_span!(target: "engine::tree", "execution").entered();
-        let mut transactions = transactions.into_iter();
-        // Some executors may execute transactions that do not append receipts during the
-        // main loop (e.g., system transactions whose receipts are added during finalization).
-        // In that case, invoking the callback on every transaction would resend the previous
-        // receipt with the same index and can panic the ordered root builder.
-        let mut last_sent_len = 0usize;
-        loop {
-            // Measure time spent waiting for next transaction from iterator
-            // (e.g., parallel signature recovery)
-            let wait_start = Instant::now();
-            let Some(tx_result) = transactions.next() else { break };
-            self.metrics.record_transaction_wait(wait_start.elapsed());
-
-            let tx = tx_result.map_err(BlockExecutionError::other)?;
-            let tx_signer = *<Tx as alloy_evm::RecoveredTx<InnerTx>>::signer(&tx);
-
-            senders.push(tx_signer);
-
-            let _enter = debug_span!(
-                target: "engine::tree",
-                "execute tx",
-                tx_index = senders.len() - 1,
-            )
-            .entered();
-            trace!(target: "engine::tree", "Executing transaction");
-
-            let tx_start = Instant::now();
-            executor.execute_transaction(tx)?;
-            self.metrics.record_transaction_execution(tx_start.elapsed());
-
-            // advance the shared counter so prewarm workers skip already-executed txs
-            executed_tx_index.store(senders.len(), Ordering::Relaxed);
-
-            let current_len = executor.receipts().len();
-            if current_len > last_sent_len {
-                last_sent_len = current_len;
-                // Send the latest receipt to the background task for incremental root computation.
-                if let Some(receipt) = executor.receipts().last() {
-                    let tx_index = current_len - 1;
-                    let _ = receipt_tx.send(IndexedReceipt::new(tx_index, receipt.clone()));
-                }
-            }
-        }
-        drop(exec_span);
-
-        Ok((executor, senders))
     }
 
     /// Compute state root for the given hashed post state in parallel.
@@ -1444,8 +1322,8 @@ where
         block_access_list: Option<Arc<BlockAccessList>>,
     ) -> Result<
         PayloadHandle<
-            impl ExecutableTxFor<Evm> + use<N, P, Evm, V, T>,
-            impl core::error::Error + Send + Sync + 'static + use<N, P, Evm, V, T>,
+            impl ExecutableTxFor<Evm> + use<N, P, Evm, V, X, T>,
+            impl core::error::Error + Send + Sync + 'static + use<N, P, Evm, V, X, T>,
             N::Receipt,
         >,
         InsertBlockErrorKind,
@@ -1887,6 +1765,274 @@ pub enum StateRootStrategy {
     Synchronous,
 }
 
+/// Context provided to [`BlockExecutorStrategy`] implementations.
+///
+/// Exposes execution-related state from [`BasicEngineValidator`] without
+/// requiring direct access to the full validator.
+#[derive(Debug)]
+pub struct ExecuteBlockCtx<'a, Evm: ConfigureEvm> {
+    /// EVM configuration.
+    pub evm_config: &'a Evm,
+    /// Tree configuration.
+    pub config: &'a TreeConfig,
+    /// Payload processor for spawning tasks.
+    pub payload_processor: &'a PayloadProcessor<Evm>,
+    /// Precompile cache map.
+    pub precompile_cache_map: &'a PrecompileCacheMap<SpecFor<Evm>>,
+    /// Precompile cache metrics (mutable for lazy entry insertion).
+    pub precompile_cache_metrics: &'a mut HashMap<Address, CachedPrecompileMetrics>,
+    /// Engine API metrics.
+    pub metrics: &'a EngineApiMetrics,
+}
+
+impl<'a, N, Evm> ExecuteBlockCtx<'a, Evm>
+where
+    N: NodePrimitives,
+    Evm: ConfigureEvm<Primitives = N> + 'static,
+{
+    /// Executes transactions and collects senders, streaming receipts to a background task.
+    ///
+    /// This method handles:
+    /// - Applying pre-execution changes (e.g., beacon root updates)
+    /// - Executing each transaction with timing metrics
+    /// - Streaming receipts to the receipt root computation task
+    /// - Collecting transaction senders for later use
+    ///
+    /// Returns the executor (for finalization) and the collected senders.
+    pub fn execute_transactions<E, Tx, InnerTx, Err>(
+        &self,
+        mut executor: E,
+        transaction_count: usize,
+        transactions: impl Iterator<Item = Result<Tx, Err>>,
+        receipt_tx: &crossbeam_channel::Sender<IndexedReceipt<N::Receipt>>,
+        executed_tx_index: &AtomicUsize,
+    ) -> Result<(E, Vec<Address>), BlockExecutionError>
+    where
+        E: BlockExecutor<Receipt = N::Receipt>,
+        Tx: alloy_evm::block::ExecutableTx<E> + alloy_evm::RecoveredTx<InnerTx>,
+        InnerTx: TxHashRef,
+        Err: core::error::Error + Send + Sync + 'static,
+    {
+        let mut senders = Vec::with_capacity(transaction_count);
+
+        // Apply pre-execution changes (e.g., beacon root update)
+        let pre_exec_start = Instant::now();
+        debug_span!(target: "engine::tree", "pre_execution")
+            .in_scope(|| executor.apply_pre_execution_changes())?;
+        self.metrics.record_pre_execution(pre_exec_start.elapsed());
+
+        // Execute transactions
+        let exec_span = debug_span!(target: "engine::tree", "execution").entered();
+        let mut transactions = transactions.into_iter();
+        // Some executors may execute transactions that do not append receipts during the
+        // main loop (e.g., system transactions whose receipts are added during finalization).
+        // In that case, invoking the callback on every transaction would resend the previous
+        // receipt with the same index and can panic the ordered root builder.
+        let mut last_sent_len = 0usize;
+        loop {
+            // Measure time spent waiting for next transaction from iterator
+            // (e.g., parallel signature recovery)
+            let wait_start = Instant::now();
+            let Some(tx_result) = transactions.next() else { break };
+            self.metrics.record_transaction_wait(wait_start.elapsed());
+
+            let tx = tx_result.map_err(BlockExecutionError::other)?;
+            let tx_signer = *<Tx as alloy_evm::RecoveredTx<InnerTx>>::signer(&tx);
+
+            senders.push(tx_signer);
+
+            let _enter = debug_span!(
+                target: "engine::tree",
+                "execute tx",
+                tx_index = senders.len() - 1,
+            )
+            .entered();
+            trace!(target: "engine::tree", "Executing transaction");
+
+            let tx_start = Instant::now();
+            executor.execute_transaction(tx)?;
+            self.metrics.record_transaction_execution(tx_start.elapsed());
+
+            // advance the shared counter so prewarm workers skip already-executed txs
+            executed_tx_index.store(senders.len(), Ordering::Relaxed);
+
+            let current_len = executor.receipts().len();
+            if current_len > last_sent_len {
+                last_sent_len = current_len;
+                // Send the latest receipt to the background task for incremental root computation.
+                if let Some(receipt) = executor.receipts().last() {
+                    let tx_index = current_len - 1;
+                    let _ = receipt_tx.send(IndexedReceipt::new(tx_index, receipt.clone()));
+                }
+            }
+        }
+        drop(exec_span);
+
+        Ok((executor, senders))
+    }
+}
+
+/// Strategy for executing a block within [`BasicEngineValidator`].
+///
+/// The default implementation ([`DefaultBlockExecutor`]) handles standard
+/// single-segment execution. Custom implementations (e.g., multi-segment
+/// big-block execution) can override block execution while reusing the rest
+/// of the validation pipeline.
+pub trait BlockExecutorStrategy<N: NodePrimitives, Evm: ConfigureEvm<Primitives = N>>:
+    Send + Sync + 'static
+{
+    /// Executes a block with the given state provider, environment, and payload handle.
+    fn execute_block<S, Tx, Err, T>(
+        &mut self,
+        ctx: &mut ExecuteBlockCtx<'_, Evm>,
+        state_provider: S,
+        env: ExecutionEnv<Evm>,
+        input: &BlockOrPayload<T>,
+        handle: &mut PayloadHandle<Tx, Err, N::Receipt>,
+    ) -> Result<
+        (
+            BlockExecutionOutput<N::Receipt>,
+            Vec<Address>,
+            tokio::sync::oneshot::Receiver<(B256, alloy_primitives::Bloom)>,
+        ),
+        InsertBlockErrorKind,
+    >
+    where
+        S: StateProvider + Send,
+        Tx: ExecutableTxFor<Evm>,
+        Err: core::error::Error + Send + Sync + 'static,
+        T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
+        Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>;
+}
+
+/// Default block executor that handles standard single-segment execution.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultBlockExecutor;
+
+impl<N, Evm> BlockExecutorStrategy<N, Evm> for DefaultBlockExecutor
+where
+    N: NodePrimitives,
+    Evm: ConfigureEvm<Primitives = N> + 'static,
+{
+    fn execute_block<S, Tx, Err, T>(
+        &mut self,
+        ctx: &mut ExecuteBlockCtx<'_, Evm>,
+        state_provider: S,
+        env: ExecutionEnv<Evm>,
+        input: &BlockOrPayload<T>,
+        handle: &mut PayloadHandle<Tx, Err, N::Receipt>,
+    ) -> Result<
+        (
+            BlockExecutionOutput<N::Receipt>,
+            Vec<Address>,
+            tokio::sync::oneshot::Receiver<(B256, alloy_primitives::Bloom)>,
+        ),
+        InsertBlockErrorKind,
+    >
+    where
+        S: StateProvider + Send,
+        Tx: ExecutableTxFor<Evm>,
+        Err: core::error::Error + Send + Sync + 'static,
+        T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
+        Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
+    {
+        debug!(target: "engine::tree::payload_validator", "Executing block");
+
+        let mut db = debug_span!(target: "engine::tree", "build_state_db").in_scope(|| {
+            State::builder()
+                .with_database(StateProviderDatabase::new(state_provider))
+                .with_bundle_update()
+                .build()
+        });
+
+        let (spec_id, mut executor) = {
+            let _span = debug_span!(target: "engine::tree", "create_evm").entered();
+            let spec_id = *env.evm_env.spec_id();
+            let evm = ctx.evm_config.evm_with_env(&mut db, env.evm_env);
+            let execution_ctx = match input {
+                BlockOrPayload::Payload(payload) => ctx
+                    .evm_config
+                    .context_for_payload(payload)
+                    .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?,
+                BlockOrPayload::Block(block) => ctx
+                    .evm_config
+                    .context_for_block(block)
+                    .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?,
+            };
+            let executor = ctx.evm_config.create_executor(evm, execution_ctx);
+            (spec_id, executor)
+        };
+
+        if !ctx.config.precompile_cache_disabled() {
+            let _span = debug_span!(target: "engine::tree", "setup_precompile_cache").entered();
+            executor.evm_mut().precompiles_mut().map_cacheable_precompiles(
+                |address, precompile| {
+                    let metrics = ctx
+                        .precompile_cache_metrics
+                        .entry(*address)
+                        .or_insert_with(|| CachedPrecompileMetrics::new_with_address(*address))
+                        .clone();
+                    CachedPrecompile::wrap(
+                        precompile,
+                        ctx.precompile_cache_map.cache_for_address(*address),
+                        spec_id,
+                        Some(metrics),
+                    )
+                },
+            );
+        }
+
+        // Spawn background task to compute receipt root and logs bloom incrementally.
+        // Unbounded channel is used since tx count bounds capacity anyway (max ~30k txs per block).
+        let receipts_len = input.transaction_count();
+        let (receipt_tx, receipt_rx) = crossbeam_channel::unbounded();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let task_handle = ReceiptRootTaskHandle::new(receipt_rx, result_tx);
+        ctx.payload_processor
+            .executor()
+            .spawn_blocking_named("receipt-root", move || task_handle.run(receipts_len));
+
+        let transaction_count = input.transaction_count();
+        let executed_tx_index = Arc::clone(handle.executed_tx_index());
+        let executor = executor.with_state_hook(
+            handle.state_hook().map(|hook| Box::new(hook) as Box<dyn OnStateHook>),
+        );
+
+        let execution_start = Instant::now();
+
+        // Execute all transactions and finalize
+        let (executor, senders) = ctx.execute_transactions(
+            executor,
+            transaction_count,
+            handle.iter_transactions(),
+            &receipt_tx,
+            &executed_tx_index,
+        )?;
+        drop(receipt_tx);
+
+        // Finish execution and get the result
+        let post_exec_start = Instant::now();
+        let (_evm, result) = debug_span!(target: "engine::tree", "BlockExecutor::finish")
+            .in_scope(|| executor.finish())
+            .map(|(evm, result)| (evm.into_db(), result))?;
+        ctx.metrics.record_post_execution(post_exec_start.elapsed());
+        handle.finish_state_updates();
+
+        // Merge transitions into bundle state
+        debug_span!(target: "engine::tree", "merge_transitions")
+            .in_scope(|| db.merge_transitions(BundleRetention::Reverts));
+
+        let output = BlockExecutionOutput { result, state: db.take_bundle() };
+
+        let execution_duration = execution_start.elapsed();
+        ctx.metrics.record_block_execution(&output, execution_duration);
+        ctx.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
+        debug!(target: "engine::tree::payload_validator", elapsed = ?execution_duration, "Executed block");
+
+        Ok((output, senders, result_rx))
+    }
+}
+
 /// Type that validates the payloads processed by the engine.
 ///
 /// This provides the necessary functions for validating/executing payloads/blocks.
@@ -1944,7 +2090,7 @@ pub trait EngineValidator<
     fn on_inserted_executed_block(&self, block: ExecutedBlock<N>);
 }
 
-impl<N, Types, P, Evm, V> EngineValidator<Types> for BasicEngineValidator<P, Evm, V>
+impl<N, Types, P, Evm, V, X> EngineValidator<Types> for BasicEngineValidator<P, Evm, V, X>
 where
     P: DatabaseProviderFactory<
             Provider: BlockReader
@@ -1966,6 +2112,7 @@ where
     V: PayloadValidator<Types, Block = N::Block> + Clone,
     Evm: ConfigureEngineEvm<Types::ExecutionData, Primitives = N> + 'static,
     Types: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
+    X: BlockExecutorStrategy<N, Evm>,
 {
     fn validate_payload_attributes_against_header(
         &self,
@@ -2007,9 +2154,10 @@ where
     }
 }
 
-impl<P, Evm, V> WaitForCaches for BasicEngineValidator<P, Evm, V>
+impl<P, Evm, V, X> WaitForCaches for BasicEngineValidator<P, Evm, V, X>
 where
     Evm: ConfigureEvm,
+    X: Send + Sync + 'static,
 {
     fn wait_for_caches(&self) -> CacheWaitDurations {
         self.payload_processor.wait_for_caches()
