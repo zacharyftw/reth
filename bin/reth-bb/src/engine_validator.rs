@@ -165,29 +165,51 @@ where
         + 'static,
     V: PayloadValidator<EthEngineTypes, Block = reth_ethereum_primitives::Block> + Clone,
 {
-    /// Extracts and removes big-block metadata for the given payload hash.
+    /// Builds the execution plan for the given payload.
+    ///
+    /// If [`BigBlockData`] was stashed for this payload hash, it is consumed and
+    /// converted into a multi-segment plan. Otherwise a single-segment plan
+    /// covering all transactions is returned.
     ///
     /// # Panics
     ///
-    /// If the first `env_switch` does not start at transaction index 0.
-    fn take_execution_plan(&self, payload_hash: B256) -> Option<BlockExecutionPlan> {
-        let bb = self.pending.lock().unwrap().remove(&payload_hash)?;
+    /// If big-block data is present and the first `env_switch` does not start at
+    /// transaction index 0.
+    fn take_execution_plan(&self, payload: &ExecutionData) -> BlockExecutionPlan {
+        let payload_hash = ExecutionPayload::block_hash(payload);
 
-        assert!(
-            bb.env_switches.first().is_some_and(|(idx, _)| *idx == 0),
-            "first env_switch must be at transaction index 0"
-        );
+        if let Some(bb) = self.pending.lock().unwrap().remove(&payload_hash) {
+            assert!(
+                bb.env_switches.first().is_some_and(|(idx, _)| *idx == 0),
+                "first env_switch must be at transaction index 0"
+            );
 
-        let segments = bb
-            .env_switches
-            .into_iter()
-            .map(|(cumulative_tx_count, execution_data)| ExecutionSegment {
-                stop_before_tx: cumulative_tx_count,
-                execution_data,
-            })
-            .collect();
+            let segments: Vec<_> = bb
+                .env_switches
+                .into_iter()
+                .map(|(cumulative_tx_count, execution_data)| ExecutionSegment {
+                    stop_before_tx: cumulative_tx_count,
+                    execution_data,
+                })
+                .collect();
 
-        Some(BlockExecutionPlan { seed_block_hashes: bb.prior_block_hashes, segments })
+            info!(
+                target: "engine::bb",
+                ?payload_hash,
+                segments = segments.len(),
+                "Multi-segment payload detected"
+            );
+
+            BlockExecutionPlan { seed_block_hashes: bb.prior_block_hashes, segments }
+        } else {
+            BlockExecutionPlan {
+                seed_block_hashes: Vec::new(),
+                segments: vec![ExecutionSegment {
+                    stop_before_tx: 0,
+                    execution_data: payload.clone(),
+                }],
+            }
+        }
     }
 
     /// Multi-segment validation path.
@@ -268,12 +290,7 @@ where
             .into())
         };
 
-        // Build initial EVM env from the first segment's execution data
-        let evm_env = self
-            .inner
-            .evm_config
-            .evm_env_for_payload(&plan.segments[0].execution_data)
-            .map_err(NewPayloadError::other)?;
+        let evm_env = self.inner.evm_env_for(&input).map_err(NewPayloadError::other)?;
 
         let env = ExecutionEnv {
             evm_env,
@@ -606,7 +623,7 @@ where
         let execution_start = Instant::now();
 
         // Collect all transactions up front so the mutable borrow on `handle`
-        // is released before the segment loop calls state_hook/state_hook_no_finish.
+        // is released before the segment loop calls state_hook.
         let all_txs: Vec<Result<Tx, Err>> = handle.iter_transactions().collect();
         let mut tx_drain = all_txs.into_iter();
         let mut all_senders = Vec::with_capacity(transaction_count);
@@ -685,11 +702,7 @@ where
                     );
                 }
 
-                let state_hook: Option<Box<dyn OnStateHook>> = if is_final {
-                    handle.state_hook().map(|h| Box::new(h) as Box<dyn OnStateHook>)
-                } else {
-                    handle.state_hook_no_finish().map(|h| Box::new(h) as Box<dyn OnStateHook>)
-                };
+                let state_hook = handle.state_hook().map(|h| Box::new(h) as Box<dyn OnStateHook>);
                 let mut executor = executor.with_state_hook(state_hook);
 
                 executor.apply_pre_execution_changes()?;
@@ -769,6 +782,7 @@ where
         }
 
         drop(receipt_tx);
+        handle.finish_state_updates();
 
         // Merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
@@ -820,19 +834,8 @@ where
         payload: ExecutionData,
         ctx: TreeCtx<'_, EthPrimitives>,
     ) -> ValidationOutcome<EthPrimitives> {
-        let payload_hash = ExecutionPayload::block_hash(&payload);
-
-        if let Some(plan) = self.take_execution_plan(payload_hash) {
-            info!(
-                target: "engine::bb",
-                ?payload_hash,
-                segments = plan.segments.len(),
-                "Multi-segment payload detected"
-            );
-            self.validate_payload_multiseg(payload, ctx, plan)
-        } else {
-            self.inner.validate_block_with_state(BlockOrPayload::Payload(payload), ctx)
-        }
+        let plan = self.take_execution_plan(&payload);
+        self.validate_payload_multiseg(payload, ctx, plan)
     }
 
     fn validate_block(

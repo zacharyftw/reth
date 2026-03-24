@@ -978,6 +978,7 @@ where
             .in_scope(|| executor.finish())
             .map(|(evm, result)| (evm.into_db(), result))?;
         self.metrics.record_post_execution(post_exec_start.elapsed());
+        handle.finish_state_updates();
 
         // Merge transitions into bundle state
         debug_span!(target: "engine::tree", "merge_transitions")

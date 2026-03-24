@@ -2,8 +2,6 @@
 
 use alloy_evm::block::StateChangeSource;
 use alloy_primitives::{keccak256, B256};
-use crossbeam_channel::Sender as CrossbeamSender;
-use derive_more::derive::Deref;
 use metrics::{Gauge, Histogram};
 use reth_metrics::Metrics;
 use reth_revm::state::EvmState;
@@ -59,28 +57,6 @@ pub enum MultiProofMessage {
     /// This is triggered by block execution, indicating that no additional state updates are
     /// expected.
     FinishedStateUpdates,
-}
-
-/// A wrapper for the sender that signals completion when dropped.
-///
-/// This type is intended to be used in combination with the evm executor statehook.
-/// This should trigger once the block has been executed (after) the last state update has been
-/// sent. This triggers the exit condition of the multi proof task.
-#[derive(Deref, Debug)]
-pub struct StateHookSender(CrossbeamSender<MultiProofMessage>);
-
-impl StateHookSender {
-    /// Creates a new [`StateHookSender`] wrapping the given channel sender.
-    pub const fn new(inner: CrossbeamSender<MultiProofMessage>) -> Self {
-        Self(inner)
-    }
-}
-
-impl Drop for StateHookSender {
-    fn drop(&mut self) {
-        // Send completion signal when the sender is dropped
-        let _ = self.0.send(MultiProofMessage::FinishedStateUpdates);
-    }
 }
 
 pub(crate) fn evm_state_to_hashed_post_state(update: EvmState) -> HashedPostState {

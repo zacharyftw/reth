@@ -772,9 +772,10 @@ impl StateRootHandle {
 
     /// Returns a state hook that streams state updates to the background state root task.
     ///
-    /// The hook must be dropped after execution completes to signal the end of state updates.
+    /// Call [`finish_state_updates`](Self::finish_state_updates) after execution
+    /// completes to signal the end of state updates.
     pub fn state_hook(&self) -> impl OnStateHook {
-        let to_multi_proof = StateHookSender::new(self.to_multi_proof.clone());
+        let to_multi_proof = self.to_multi_proof.clone();
 
         move |source: StateChangeSource, state: &EvmState| {
             let _ =
@@ -782,17 +783,12 @@ impl StateRootHandle {
         }
     }
 
-    /// Returns a state hook that streams state updates without signaling completion on drop.
+    /// Signals that all state updates have been sent.
     ///
-    /// Use this for intermediate segments in multi-segment execution where
-    /// `FinishedStateUpdates` should only be sent after the final segment.
-    pub fn state_hook_no_finish(&self) -> impl OnStateHook {
-        let to_multi_proof = self.to_multi_proof.clone();
-
-        move |source: StateChangeSource, state: &EvmState| {
-            let _ =
-                to_multi_proof.send(MultiProofMessage::StateUpdate(source.into(), state.clone()));
-        }
+    /// Must be called after block execution completes so the state root task
+    /// knows it can finalize.
+    pub fn finish_state_updates(&self) {
+        let _ = self.to_multi_proof.send(MultiProofMessage::FinishedStateUpdates);
     }
 
     /// Awaits the state root computation result.
@@ -871,12 +867,14 @@ impl<Tx, Err, R: Send + Sync + 'static> PayloadHandle<Tx, Err, R> {
         self.state_root_handle.as_ref().map(|handle| handle.state_hook())
     }
 
-    /// Returns a state hook that does not signal completion on drop.
+    /// Signals that all state updates have been sent.
     ///
-    /// Use for intermediate segments in multi-segment execution so that only
-    /// the final segment's hook triggers `FinishedStateUpdates`.
-    pub fn state_hook_no_finish(&self) -> Option<impl OnStateHook> {
-        self.state_root_handle.as_ref().map(|handle| handle.state_hook_no_finish())
+    /// Must be called after block execution completes so the state root task
+    /// knows it can finalize.
+    pub fn finish_state_updates(&self) {
+        if let Some(handle) = self.state_root_handle.as_ref() {
+            handle.finish_state_updates();
+        }
     }
 
     /// Returns a clone of the caches used by prewarming
