@@ -1,6 +1,7 @@
 //! Builder support for rpc components.
 
 pub use jsonrpsee::server::middleware::rpc::{RpcService, RpcServiceBuilder};
+pub use reth_engine_primitives::ExecutionPlanExt;
 use reth_engine_tree::tree::WaitForCaches;
 pub use reth_engine_tree::tree::{AdjustCumulativeGas, BasicEngineValidator, EngineValidator};
 pub use reth_rpc_builder::{middleware::RethRpcMiddleware, Identity, Stack};
@@ -1333,7 +1334,8 @@ where
     EV::Validator: reth_engine_primitives::PayloadValidator<
             <Node::Types as NodeTypes>::Payload,
             Block = BlockTy<Node::Types>,
-        > + Clone,
+        > + ExecutionPlanExt<<<Node::Types as NodeTypes>::Payload as PayloadTypes>::ExecutionData>
+        + Clone,
     <<Node::Types as NodeTypes>::Primitives as NodePrimitives>::Receipt: AdjustCumulativeGas,
 {
     type EngineValidator = BasicEngineValidator<Node::Provider, Node::Evm, EV::Validator>;
@@ -1368,7 +1370,8 @@ where
 /// output.
 #[derive(Debug, Default)]
 pub struct BasicEngineApiBuilder<PVB> {
-    payload_validator_builder: PVB,
+    /// The payload validator builder.
+    pub payload_validator_builder: PVB,
 }
 
 impl<N, PVB> EngineApiBuilder<N> for BasicEngineApiBuilder<PVB>

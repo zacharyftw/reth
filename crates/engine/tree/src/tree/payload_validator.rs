@@ -62,7 +62,7 @@ use reth_chain_state::{
 };
 use reth_consensus::{ConsensusError, FullConsensus, ReceiptRootBloom};
 use reth_engine_primitives::{
-    BigBlockData, ConfigureEngineEvm, ExecutableTxIterator, ExecutionPayload, InvalidBlockHook,
+    ConfigureEngineEvm, ExecutableTxIterator, ExecutionPayload, ExecutionPlanExt, InvalidBlockHook,
     PayloadValidator,
 };
 use reth_errors::{BlockExecutionError, ProviderResult};
@@ -405,16 +405,14 @@ where
     pub fn validate_block_with_state<T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>>(
         &mut self,
         input: BlockOrPayload<T>,
-        big_block_data: Option<BigBlockData<T::ExecutionData>>,
         mut ctx: TreeCtx<'_, N>,
     ) -> InsertPayloadResult<N>
     where
-        V: PayloadValidator<T, Block = N::Block> + Clone,
+        V: PayloadValidator<T, Block = N::Block> + ExecutionPlanExt<T::ExecutionData> + Clone,
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
         N::Receipt: AdjustCumulativeGas,
     {
-        let (mut env_switches, prior_block_hashes) =
-            big_block_data.map(|d| (d.env_switches, d.prior_block_hashes)).unwrap_or_default();
+        let plan = self.validator.take_execution_plan(input.hash());
 
         // Spawn payload conversion on a background thread so it runs concurrently with the
         // rest of the function (setup + execution). For payloads this overlaps the cost of
@@ -508,16 +506,9 @@ where
             .into())
         };
 
-        let has_env_switches = !env_switches.is_empty();
-
-        // If the first env_switch is at tx index 0, it carries the original unmutated
-        // base block's ExecutionData. Use it to derive the initial EVM environment
-        // instead of the mutated merged payload (which has inflated gas_limit, etc.).
-        let initial_env_data = if env_switches.first().is_some_and(|(idx, _)| *idx == 0) {
-            Some(env_switches.remove(0).1)
-        } else {
-            None
-        };
+        let initial_env_data = plan.initial_execution_data;
+        let prior_block_hashes = plan.seed_block_hashes;
+        let has_env_switches = !plan.segments.is_empty();
 
         let evm_env = if let Some(ref data) = initial_env_data {
             let env = debug_span!(target: "engine::tree::payload_validator", "evm_env")
@@ -525,7 +516,7 @@ where
                 .map_err(NewPayloadError::other)?;
             debug!(
                 target: "engine::tree::payload_validator",
-                "Using initial env_switch data for segment 0 EVM env"
+                "Using initial execution plan data for segment 0 EVM env"
             );
             env
         } else {
@@ -536,17 +527,18 @@ where
 
         debug!(
             target: "engine::tree::payload_validator",
-            env_switches_remaining = env_switches.len(),
+            segments = plan.segments.len(),
             has_env_switches,
-            "env_switch state after initial extraction"
+            "execution plan state"
         );
 
-        let switch_envs: Vec<(usize, EvmEnvFor<Evm>, T::ExecutionData)> = ensure_ok!(env_switches
+        let switch_envs: Vec<(usize, EvmEnvFor<Evm>, T::ExecutionData)> = ensure_ok!(plan
+            .segments
             .into_iter()
-            .map(|(tx_idx, data)| {
+            .map(|seg| {
                 self.evm_config
-                    .evm_env_for_payload(&data)
-                    .map(|env| (tx_idx, env, data))
+                    .evm_env_for_payload(&seg.execution_data)
+                    .map(|env| (seg.stop_before_tx, env, seg.execution_data))
                     .map_err(|e| Box::new(e) as Box<dyn core::error::Error + Send + Sync>)
             })
             .collect::<Result<_, _>>());
@@ -2228,7 +2220,6 @@ pub trait EngineValidator<
     fn validate_payload(
         &mut self,
         payload: Types::ExecutionData,
-        big_block_data: Option<BigBlockData<Types::ExecutionData>>,
         ctx: TreeCtx<'_, N>,
     ) -> ValidationOutcome<N>;
 
@@ -2265,7 +2256,7 @@ where
         + Clone
         + 'static,
     N: NodePrimitives<Receipt: AdjustCumulativeGas>,
-    V: PayloadValidator<Types, Block = N::Block> + Clone,
+    V: PayloadValidator<Types, Block = N::Block> + ExecutionPlanExt<Types::ExecutionData> + Clone,
     Evm: ConfigureEngineEvm<Types::ExecutionData, Primitives = N> + 'static,
     Types: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
 {
@@ -2288,10 +2279,9 @@ where
     fn validate_payload(
         &mut self,
         payload: Types::ExecutionData,
-        big_block_data: Option<BigBlockData<Types::ExecutionData>>,
         ctx: TreeCtx<'_, N>,
     ) -> ValidationOutcome<N> {
-        self.validate_block_with_state(BlockOrPayload::Payload(payload), big_block_data, ctx)
+        self.validate_block_with_state(BlockOrPayload::Payload(payload), ctx)
     }
 
     fn validate_block(
@@ -2299,7 +2289,7 @@ where
         block: SealedBlock<N::Block>,
         ctx: TreeCtx<'_, N>,
     ) -> ValidationOutcome<N> {
-        self.validate_block_with_state(BlockOrPayload::Block(block), None, ctx)
+        self.validate_block_with_state(BlockOrPayload::Block(block), ctx)
     }
 
     fn on_inserted_executed_block(&self, block: ExecutedBlock<N>) {

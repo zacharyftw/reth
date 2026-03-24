@@ -18,9 +18,8 @@ use reth_chain_state::{
 };
 use reth_consensus::{Consensus, FullConsensus};
 use reth_engine_primitives::{
-    BeaconEngineMessage, BeaconOnNewPayloadError, BigBlockData, ConsensusEngineEvent,
-    ExecutionPayload, ForkchoiceStateTracker, NewPayloadTimings, OnForkChoiceUpdated,
-    SlowBlockInfo,
+    BeaconEngineMessage, BeaconOnNewPayloadError, ConsensusEngineEvent, ExecutionPayload,
+    ForkchoiceStateTracker, NewPayloadTimings, OnForkChoiceUpdated, SlowBlockInfo,
 };
 use reth_errors::{ConsensusError, ProviderResult};
 use reth_evm::ConfigureEvm;
@@ -74,7 +73,9 @@ pub use metrics::EngineApiMetrics;
 pub use payload_processor::*;
 pub use payload_validator::{AdjustCumulativeGas, BasicEngineValidator, EngineValidator};
 pub use persistence_state::PersistenceState;
-pub use reth_engine_primitives::TreeConfig;
+pub use reth_engine_primitives::{
+    BlockExecutionPlan, ExecutionPlanExt, ExecutionSegment, TreeConfig,
+};
 
 pub mod state;
 
@@ -585,7 +586,6 @@ where
     fn on_new_payload(
         &mut self,
         payload: T::ExecutionData,
-        big_block_data: Option<BigBlockData<T::ExecutionData>>,
     ) -> Result<TreeOutcome<PayloadStatus>, InsertBlockFatalError> {
         trace!(target: "engine::tree", "invoked new payload");
 
@@ -634,7 +634,7 @@ where
         self.metrics.block_validation.record_payload_validation(start.elapsed().as_secs_f64());
 
         let status = if self.backfill_sync_state.is_idle() {
-            self.try_insert_payload(payload, big_block_data)?
+            self.try_insert_payload(payload)?
         } else {
             self.try_buffer_payload(payload)?
         };
@@ -666,14 +666,13 @@ where
     fn try_insert_payload(
         &mut self,
         payload: T::ExecutionData,
-        big_block_data: Option<BigBlockData<T::ExecutionData>>,
     ) -> Result<PayloadStatus, InsertBlockFatalError> {
         let block_hash = payload.block_hash();
         let num_hash = payload.num_hash();
         let parent_hash = payload.parent_hash();
         let mut latest_valid_hash = None;
 
-        match self.insert_payload(payload, big_block_data) {
+        match self.insert_payload(payload) {
             Ok(status) => {
                 let status = match status {
                     InsertPayloadOk::Inserted(BlockStatus::Valid) => {
@@ -1512,7 +1511,7 @@ where
                                 let start = Instant::now();
                                 let gas_used = payload.gas_used();
                                 let num_hash = payload.num_hash();
-                                let mut output = self.on_new_payload(payload, None);
+                                let mut output = self.on_new_payload(payload);
                                 self.metrics.engine.new_payload.update_response_metrics(
                                     start,
                                     &mut self.metrics.engine.forkchoice_updated.latest_finish_at,
@@ -1541,7 +1540,6 @@ where
                             }
                             BeaconEngineMessage::RethNewPayload {
                                 payload,
-                                big_block_data,
                                 wait_for_persistence,
                                 wait_for_caches,
                                 tx,
@@ -1590,7 +1588,7 @@ where
                                 let start = Instant::now();
                                 let gas_used = payload.gas_used();
                                 let num_hash = payload.num_hash();
-                                let mut output = self.on_new_payload(payload, big_block_data);
+                                let mut output = self.on_new_payload(payload);
                                 let latency = start.elapsed();
                                 self.metrics.engine.new_payload.update_response_metrics(
                                     start,
@@ -2718,12 +2716,11 @@ where
     fn insert_payload(
         &mut self,
         payload: T::ExecutionData,
-        big_block_data: Option<BigBlockData<T::ExecutionData>>,
     ) -> Result<InsertPayloadOk, InsertPayloadError<N::Block>> {
         self.insert_block_or_payload(
             payload.block_with_parent(),
             payload,
-            |validator, payload, ctx| validator.validate_payload(payload, big_block_data, ctx),
+            |validator, payload, ctx| validator.validate_payload(payload, ctx),
             |this, payload| Ok(this.payload_validator.convert_payload_to_block(payload)?),
         )
     }

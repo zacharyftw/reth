@@ -3,7 +3,6 @@
 use alloy_primitives::Bytes;
 use alloy_rpc_types_engine::{ForkchoiceState, ForkchoiceUpdated, PayloadStatus};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-use reth_engine_primitives::BigBlockData;
 use serde::{Deserialize, Serialize};
 
 /// Reth-specific payload status that includes server-measured execution latency.
@@ -67,7 +66,6 @@ pub trait RethEngineApi<ExecutionData> {
         payload: RethNewPayloadInput<ExecutionData>,
         wait_for_persistence: Option<bool>,
         wait_for_caches: Option<bool>,
-        big_block_data: Option<BigBlockData<ExecutionData>>,
     ) -> RpcResult<RethPayloadStatus>;
 
     /// Reth-specific forkchoiceUpdated that sends a regular forkchoice update with no payload

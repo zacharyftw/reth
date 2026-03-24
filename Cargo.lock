@@ -3626,6 +3626,7 @@ dependencies = [
  "alloy-rpc-types",
  "eyre",
  "reth-basic-payload-builder",
+ "reth-engine-primitives",
  "reth-ethereum",
  "reth-ethereum-payload-builder",
  "reth-payload-builder",
@@ -7585,6 +7586,38 @@ dependencies = [
  "reth-storage-api",
  "reth-tasks",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "reth-bb"
+version = "1.11.3"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types",
+ "async-trait",
+ "clap",
+ "eyre",
+ "jsonrpsee",
+ "reth-chainspec",
+ "reth-cli-runner",
+ "reth-cli-util",
+ "reth-consensus",
+ "reth-engine-primitives",
+ "reth-ethereum-cli",
+ "reth-ethereum-consensus",
+ "reth-ethereum-primitives",
+ "reth-node-api",
+ "reth-node-builder",
+ "reth-node-core",
+ "reth-node-ethereum",
+ "reth-payload-primitives",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-rpc-api",
+ "reth-rpc-builder",
+ "reth-rpc-engine-api",
  "tracing",
 ]
 

@@ -123,36 +123,36 @@ log "Profile:  $PROFILE"
 
 # ── Step 0: Build ─────────────────────────────────────────────────────────────
 
-log "Building reth and reth-bench (--profile=$PROFILE)..."
-cargo build --profile="$PROFILE" -p reth -p reth-bench
+log "Building reth, reth-bb, and reth-bench (--profile=$PROFILE)..."
+cargo build --profile="$PROFILE" -p reth -p reth-bb -p reth-bench
 
-RETH_BIN="$(cargo metadata --format-version=1 --no-deps 2>/dev/null \
+TARGET_DIR="$(cargo metadata --format-version=1 --no-deps 2>/dev/null \
     | jq -r '.target_directory')/$(
     case "$PROFILE" in
         dev)     echo debug ;;
         release) echo release ;;
         *)       echo "$PROFILE" ;;
     esac
-)/reth"
+)"
 
-BENCH_BIN="$(cargo metadata --format-version=1 --no-deps 2>/dev/null \
-    | jq -r '.target_directory')/$(
-    case "$PROFILE" in
-        dev)     echo debug ;;
-        release) echo release ;;
-        *)       echo "$PROFILE" ;;
-    esac
-)/reth-bench"
+RETH_BIN="$TARGET_DIR/reth"
+BB_BIN="$TARGET_DIR/reth-bb"
+BENCH_BIN="$TARGET_DIR/reth-bench"
 
 if [[ ! -x "$RETH_BIN" ]]; then
     echo "Error: reth binary not found at $RETH_BIN" >&2
+    exit 1
+fi
+if [[ ! -x "$BB_BIN" ]]; then
+    echo "Error: reth-bb binary not found at $BB_BIN" >&2
     exit 1
 fi
 if [[ ! -x "$BENCH_BIN" ]]; then
     echo "Error: reth-bench binary not found at $BENCH_BIN" >&2
     exit 1
 fi
-log "reth:      $RETH_BIN"
+log "reth:       $RETH_BIN"
+log "reth-bb:    $BB_BIN"
 log "reth-bench: $BENCH_BIN"
 
 # The node needs to be unwound to from_block - 1 so the replay has a clean
@@ -191,25 +191,21 @@ rm -f "$DATADIR/db/mdbx.lck" "$DATADIR/db/lock" "$DATADIR/static_files/lock"
 
 log "Unwind complete"
 
-# ── Step 3: Start reth ───────────────────────────────────────────────────────
+# ── Step 3: Start reth-bb ─────────────────────────────────────────────────────
 
-log "Starting reth node..."
+log "Starting reth-bb node..."
 rm -f "$DATADIR/db/mdbx.lck" "$DATADIR/db/lock" "$DATADIR/static_files/lock"
 
-"$RETH_BIN" node \
+"$BB_BIN" node \
     --datadir "$DATADIR" \
     --chain "$CHAIN" \
-    --testing.skip-gas-limit-ramp-check \
-    --testing.skip-requests-hash-check \
-    --testing.gas-limit 300000000000 \
-    --testing.max-blob-count 10000 \
     --http --http.api debug,eth \
     --authrpc.jwtsecret "$JWT_FILE" \
     -d \
     > "$RETH_LOG" 2>&1 &
 
 RETH_PID=$!
-log "reth started (PID $RETH_PID), log: $RETH_LOG"
+log "reth-bb started (PID $RETH_PID), log: $RETH_LOG"
 
 # Wait for the HTTP RPC to become ready (port 8545). The engine RPC (8551)
 # requires JWT auth so we can't easily health-check it with curl.

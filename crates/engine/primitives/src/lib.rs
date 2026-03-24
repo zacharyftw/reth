@@ -12,6 +12,7 @@
 extern crate alloc;
 
 use alloy_consensus::BlockHeader;
+use alloy_primitives::B256;
 use reth_errors::ConsensusError;
 use reth_payload_primitives::{
     EngineApiMessageVersion, EngineObjectValidationError, InvalidPayloadAttributesError,
@@ -245,5 +246,63 @@ pub trait PayloadValidator<Types: PayloadTypes>: Send + Sync + Unpin + 'static {
             return Err(InvalidPayloadAttributesError::InvalidTimestamp);
         }
         Ok(())
+    }
+}
+
+/// Describes how a payload should be executed: as a single pass or as multiple segments
+/// with environment switches at transaction boundaries.
+///
+/// For normal blocks this is always [`BlockExecutionPlan::single`]. Big block payloads produce
+/// multi-segment plans via [`ExecutionPlanExt::take_execution_plan`].
+#[derive(Debug)]
+pub struct BlockExecutionPlan<ExecutionData> {
+    /// If set, overrides the merged payload's `ExecutionData` for the initial EVM environment
+    /// and execution context (parent hash, withdrawals, etc.).
+    pub initial_execution_data: Option<ExecutionData>,
+    /// Block hashes to seed into the state cache before execution starts, keyed by block number.
+    /// Needed for BLOCKHASH lookups referencing blocks merged into earlier big blocks.
+    pub seed_block_hashes: alloc::vec::Vec<(u64, B256)>,
+    /// Segment boundaries where the executor must be finished and recreated with a new
+    /// environment. Empty for single-pass execution.
+    pub segments: alloc::vec::Vec<ExecutionSegment<ExecutionData>>,
+}
+
+impl<T> BlockExecutionPlan<T> {
+    /// Returns a plan for normal single-pass execution (no segments).
+    pub fn single() -> Self {
+        Self {
+            initial_execution_data: None,
+            seed_block_hashes: alloc::vec::Vec::new(),
+            segments: alloc::vec::Vec::new(),
+        }
+    }
+
+    /// Returns `true` if this is a normal single-pass execution (no segments or overrides).
+    pub fn is_single(&self) -> bool {
+        self.segments.is_empty() && self.initial_execution_data.is_none()
+    }
+}
+
+/// A segment boundary within a [`BlockExecutionPlan`].
+#[derive(Debug)]
+pub struct ExecutionSegment<ExecutionData> {
+    /// Stop executing before this transaction index (exclusive boundary).
+    pub stop_before_tx: usize,
+    /// The `ExecutionData` for the next segment's EVM environment and context.
+    pub execution_data: ExecutionData,
+}
+
+/// Extension trait for payload validators that can provide a [`BlockExecutionPlan`].
+///
+/// The default implementation returns [`BlockExecutionPlan::single`] for all payloads,
+/// preserving standard single-pass execution. Implementations like `reth-bb` override
+/// this to inject multi-segment execution plans for big block payloads.
+pub trait ExecutionPlanExt<ExecutionData> {
+    /// Returns the execution plan for the given payload.
+    ///
+    /// Called once per payload before execution begins. Implementations that store
+    /// big-block data should remove it from their internal map here.
+    fn take_execution_plan(&mut self, _payload_hash: B256) -> BlockExecutionPlan<ExecutionData> {
+        BlockExecutionPlan::single()
     }
 }

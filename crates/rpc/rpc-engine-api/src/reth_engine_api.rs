@@ -3,7 +3,7 @@ use alloy_rlp::Decodable;
 use alloy_rpc_types_engine::{ForkchoiceState, ForkchoiceUpdated};
 use async_trait::async_trait;
 use jsonrpsee_core::RpcResult;
-use reth_engine_primitives::{BigBlockData, ConsensusEngineHandle};
+use reth_engine_primitives::ConsensusEngineHandle;
 use reth_payload_primitives::{EngineApiMessageVersion, PayloadTypes};
 use reth_primitives_traits::SealedBlock;
 use reth_rpc_api::{RethEngineApiServer, RethNewPayloadInput, RethPayloadStatus};
@@ -33,14 +33,10 @@ impl<Payload: PayloadTypes> RethEngineApiServer<Payload::ExecutionData> for Reth
         input: RethNewPayloadInput<Payload::ExecutionData>,
         wait_for_persistence: Option<bool>,
         wait_for_caches: Option<bool>,
-        big_block_data: Option<BigBlockData<Payload::ExecutionData>>,
     ) -> RpcResult<RethPayloadStatus> {
         let wait_for_persistence = wait_for_persistence.unwrap_or(true);
         let wait_for_caches = wait_for_caches.unwrap_or(true);
-        let env_switches_len = big_block_data.as_ref().map_or(0, |d| d.env_switches.len());
-        let prior_block_hashes_len =
-            big_block_data.as_ref().map_or(0, |d| d.prior_block_hashes.len());
-        tracing::info!(target: "rpc::engine", wait_for_persistence, wait_for_caches, env_switches = env_switches_len, prior_block_hashes = prior_block_hashes_len, "Serving reth_newPayload");
+        trace!(target: "rpc::engine", wait_for_persistence, wait_for_caches, "Serving reth_newPayload");
 
         let payload = match input {
             RethNewPayloadInput::ExecutionData(data) => data,
@@ -53,7 +49,7 @@ impl<Payload: PayloadTypes> RethEngineApiServer<Payload::ExecutionData> for Reth
 
         let (status, timings) = self
             .beacon_engine_handle
-            .reth_new_payload(payload, big_block_data, wait_for_persistence, wait_for_caches)
+            .reth_new_payload(payload, wait_for_persistence, wait_for_caches)
             .await
             .map_err(EngineApiError::from)?;
         Ok(RethPayloadStatus {

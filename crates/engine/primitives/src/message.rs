@@ -208,8 +208,6 @@ pub enum BeaconEngineMessage<Payload: PayloadTypes> {
     RethNewPayload {
         /// The execution payload received by Engine API.
         payload: Payload::ExecutionData,
-        /// Optional big block data containing environment switches and prior block hashes.
-        big_block_data: Option<BigBlockData<Payload::ExecutionData>>,
         /// Whether to wait for in-flight persistence to complete before processing.
         wait_for_persistence: bool,
         /// Whether to wait for execution cache and sparse trie locks before processing.
@@ -305,14 +303,12 @@ where
     pub async fn reth_new_payload(
         &self,
         payload: Payload::ExecutionData,
-        big_block_data: Option<BigBlockData<Payload::ExecutionData>>,
         wait_for_persistence: bool,
         wait_for_caches: bool,
     ) -> Result<(PayloadStatus, NewPayloadTimings), BeaconOnNewPayloadError> {
         let (tx, rx) = oneshot::channel();
         let _ = self.to_engine.send(BeaconEngineMessage::RethNewPayload {
             payload,
-            big_block_data,
             wait_for_persistence,
             wait_for_caches,
             tx,
