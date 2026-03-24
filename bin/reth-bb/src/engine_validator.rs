@@ -49,21 +49,24 @@ use tracing::{debug, debug_span, info, trace, warn, Span};
 // ---------------------------------------------------------------------------
 
 /// Execution plan derived from [`BigBlockData`] for multi-segment execution.
+///
+/// Each segment covers a range of transactions executed under a single EVM environment.
+/// The first segment always starts at transaction index 0.
 struct BlockExecutionPlan {
-    /// If the first env_switch starts at tx index 0, this is the original base block's
-    /// ExecutionData used to build the initial EVM environment.
-    initial_execution_data: Option<ExecutionData>,
     /// Block hashes from prior big blocks for the BLOCKHASH opcode.
     seed_block_hashes: Vec<(u64, B256)>,
-    /// Segment boundaries with distinct EVM environments.
+    /// Ordered segments. The first segment's `execution_data` provides the initial EVM
+    /// environment; subsequent segments switch the environment at their `stop_before_tx`
+    /// boundary. There is always at least one segment.
     segments: Vec<ExecutionSegment>,
 }
 
 /// A single execution segment within a big block.
 struct ExecutionSegment {
-    /// Stop executing before this transaction index (exclusive upper bound).
+    /// Transactions `[prev_stop..stop_before_tx)` are executed under this segment's
+    /// environment. For the first segment, `prev_stop` is implicitly 0.
     stop_before_tx: usize,
-    /// The execution data to use for the EVM environment after this boundary.
+    /// The execution data defining the EVM environment for this segment.
     execution_data: ExecutionData,
 }
 
@@ -163,27 +166,28 @@ where
     V: PayloadValidator<EthEngineTypes, Block = reth_ethereum_primitives::Block> + Clone,
 {
     /// Extracts and removes big-block metadata for the given payload hash.
+    ///
+    /// # Panics
+    ///
+    /// If the first `env_switch` does not start at transaction index 0.
     fn take_execution_plan(&self, payload_hash: B256) -> Option<BlockExecutionPlan> {
         let bb = self.pending.lock().unwrap().remove(&payload_hash)?;
 
-        let mut segments = Vec::new();
-        let mut initial_execution_data = None;
+        assert!(
+            bb.env_switches.first().is_some_and(|(idx, _)| *idx == 0),
+            "first env_switch must be at transaction index 0"
+        );
 
-        for (idx, (cumulative_tx_count, execution_data)) in bb.env_switches.into_iter().enumerate()
-        {
-            if idx == 0 && cumulative_tx_count == 0 {
-                initial_execution_data = Some(execution_data);
-            } else {
-                segments
-                    .push(ExecutionSegment { stop_before_tx: cumulative_tx_count, execution_data });
-            }
-        }
+        let segments = bb
+            .env_switches
+            .into_iter()
+            .map(|(cumulative_tx_count, execution_data)| ExecutionSegment {
+                stop_before_tx: cumulative_tx_count,
+                execution_data,
+            })
+            .collect();
 
-        Some(BlockExecutionPlan {
-            initial_execution_data,
-            seed_block_hashes: bb.prior_block_hashes,
-            segments,
-        })
+        Some(BlockExecutionPlan { seed_block_hashes: bb.prior_block_hashes, segments })
     }
 
     /// Multi-segment validation path.
@@ -264,15 +268,12 @@ where
             .into())
         };
 
-        // Build EVM env — use initial_execution_data if present
-        let evm_env = if let Some(ref initial_data) = plan.initial_execution_data {
-            self.inner
-                .evm_config
-                .evm_env_for_payload(initial_data)
-                .map_err(NewPayloadError::other)?
-        } else {
-            self.inner.evm_env_for(&input).map_err(NewPayloadError::other)?
-        };
+        // Build initial EVM env from the first segment's execution data
+        let evm_env = self
+            .inner
+            .evm_config
+            .evm_env_for_payload(&plan.segments[0].execution_data)
+            .map_err(NewPayloadError::other)?;
 
         let env = ExecutionEnv {
             evm_env,
@@ -573,7 +574,6 @@ where
         debug!(
             target: "engine::bb",
             num_segments = plan.segments.len(),
-            has_initial_data = plan.initial_execution_data.is_some(),
             seed_hashes = plan.seed_block_hashes.len(),
             "Starting multi-segment execution"
         );
@@ -605,66 +605,8 @@ where
         let executed_tx_index = Arc::clone(handle.executed_tx_index());
         let execution_start = Instant::now();
 
-        // If no segments, execute all normally
-        if plan.segments.is_empty() {
-            let initial_ctx = if let Some(ref initial_data) = plan.initial_execution_data {
-                self.inner
-                    .evm_config
-                    .context_for_payload(initial_data)
-                    .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?
-            } else {
-                self.inner
-                    .execution_ctx_for(input)
-                    .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?
-            };
-
-            let evm = self.inner.evm_config.evm_with_env(&mut db, env.evm_env.clone());
-            let mut executor = self.inner.evm_config.create_executor(evm, initial_ctx);
-
-            if !self.inner.config.precompile_cache_disabled() {
-                executor.evm_mut().precompiles_mut().map_cacheable_precompiles(
-                    |address, precompile| {
-                        let metrics = self
-                            .inner
-                            .precompile_cache_metrics
-                            .entry(*address)
-                            .or_insert_with(|| CachedPrecompileMetrics::new_with_address(*address))
-                            .clone();
-                        CachedPrecompile::wrap(
-                            precompile,
-                            self.inner.precompile_cache_map.cache_for_address(*address),
-                            spec_id,
-                            Some(metrics),
-                        )
-                    },
-                );
-            }
-
-            let executor = executor.with_state_hook(
-                handle.state_hook().map(|hook| Box::new(hook) as Box<dyn OnStateHook>),
-            );
-
-            let (executor, senders) = self.inner.execute_transactions(
-                executor,
-                transaction_count,
-                handle.iter_transactions(),
-                &receipt_tx,
-                &executed_tx_index,
-            )?;
-            drop(receipt_tx);
-
-            let result = executor.finish()?.1;
-
-            db.merge_transitions(BundleRetention::Reverts);
-
-            let output = BlockExecutionOutput { result, state: db.take_bundle() };
-            self.inner.metrics.record_block_execution(&output, execution_start.elapsed());
-            return Ok((output, senders, result_rx));
-        }
-
-        // Collect all transactions up front. This releases the mutable borrow
-        // on `handle` so we can call state_hook/state_hook_no_finish in the
-        // segment loop.
+        // Collect all transactions up front so the mutable borrow on `handle`
+        // is released before the segment loop calls state_hook/state_hook_no_finish.
         let all_txs: Vec<Result<Tx, Err>> = handle.iter_transactions().collect();
         let mut tx_drain = all_txs.into_iter();
         let mut all_senders = Vec::with_capacity(transaction_count);
@@ -676,38 +618,52 @@ where
         let mut global_tx_idx = 0usize;
         let num_segments = plan.segments.len();
 
-        // Track the EVM environment for the current segment
-        let mut cur_evm_env = env.evm_env.clone();
-        let mut cur_ctx_data: Option<&ExecutionData> = plan.initial_execution_data.as_ref();
-
+        // Each iteration executes transactions in [global_tx_idx..stop_before)
+        // under the segment's EVM environment. The first segment (idx 0) has
+        // stop_before_tx == 0, meaning it is used for environment only — real
+        // boundaries start from segments[1]. After the last segment boundary,
+        // remaining transactions form the "tail".
         for (seg_idx, segment) in plan.segments.iter().enumerate() {
-            let is_last_segment = seg_idx == num_segments - 1;
-            let stop_before = segment.stop_before_tx;
-            let is_truly_final = is_last_segment && stop_before >= transaction_count;
+            // The tx boundary for this segment is the *next* segment's
+            // stop_before_tx, or transaction_count for the last segment.
+            let stop_before = if seg_idx + 1 < num_segments {
+                plan.segments[seg_idx + 1].stop_before_tx
+            } else {
+                transaction_count
+            };
+
+            // Skip segments that would execute 0 transactions (e.g. a trailing
+            // env_switch at exactly transaction_count).
+            if stop_before <= global_tx_idx {
+                continue;
+            }
+
+            let is_final = stop_before >= transaction_count;
 
             debug!(
                 target: "engine::bb",
-                seg_idx, global_tx_idx, stop_before, gas_offset, is_truly_final,
+                seg_idx, global_tx_idx, stop_before, gas_offset, is_final,
                 "Executing segment"
             );
 
-            // Create EVM and executor for this segment in a block scope so
-            // the mutable borrow on `db` is released when the scope ends.
+            // Create EVM and executor in a block scope so the &mut db borrow
+            // is released when the scope ends, allowing the next iteration to
+            // borrow db again.
             let result = {
-                let evm = self.inner.evm_config.evm_with_env(&mut db, cur_evm_env.clone());
-                let ctx = if let Some(data) = cur_ctx_data {
-                    self.inner
-                        .evm_config
-                        .context_for_payload(data)
-                        .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?
-                } else {
-                    self.inner
-                        .execution_ctx_for(input)
-                        .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?
-                };
-                let mut executor = self.inner.evm_config.create_executor(evm, ctx);
+                let seg_evm_env = self
+                    .inner
+                    .evm_config
+                    .evm_env_for_payload(&segment.execution_data)
+                    .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
+                let seg_ctx = self
+                    .inner
+                    .evm_config
+                    .context_for_payload(&segment.execution_data)
+                    .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
 
-                // Setup precompile cache
+                let evm = self.inner.evm_config.evm_with_env(&mut db, seg_evm_env);
+                let mut executor = self.inner.evm_config.create_executor(evm, seg_ctx);
+
                 if !self.inner.config.precompile_cache_disabled() {
                     executor.evm_mut().precompiles_mut().map_cacheable_precompiles(
                         |address, precompile| {
@@ -729,18 +685,15 @@ where
                     );
                 }
 
-                // Attach state hook
-                let state_hook: Option<Box<dyn OnStateHook>> = if is_truly_final {
+                let state_hook: Option<Box<dyn OnStateHook>> = if is_final {
                     handle.state_hook().map(|h| Box::new(h) as Box<dyn OnStateHook>)
                 } else {
                     handle.state_hook_no_finish().map(|h| Box::new(h) as Box<dyn OnStateHook>)
                 };
                 let mut executor = executor.with_state_hook(state_hook);
 
-                // Apply pre-execution changes
                 executor.apply_pre_execution_changes()?;
 
-                // Execute transactions for this segment
                 let mut last_sent_len = 0usize;
                 while global_tx_idx < stop_before {
                     let tx_result = tx_drain.next().ok_or_else(|| {
@@ -774,9 +727,8 @@ where
 
                 executor.finish()?.1
             };
-            // db borrow released here
 
-            // Accumulate results — adjust receipt gas offsets for cross-segment
+            // Accumulate results with gas offset adjustment
             for receipt in &result.receipts {
                 all_receipts.push(if gas_offset > 0 {
                     receipt.with_gas_offset(gas_offset)
@@ -793,108 +745,14 @@ where
                 "Segment finished"
             );
 
-            // Seed virtual parent hash and prepare next segment's env
-            let seg_block_number = segment.execution_data.block_number();
-            if seg_block_number > 0 {
-                db.block_hashes.insert(seg_block_number - 1, segment.execution_data.parent_hash());
-            }
-
-            cur_evm_env = self
-                .inner
-                .evm_config
-                .evm_env_for_payload(&segment.execution_data)
-                .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
-            cur_ctx_data = Some(&segment.execution_data);
-        }
-
-        // Execute remaining (tail) transactions after last segment boundary
-        if global_tx_idx < transaction_count {
-            debug!(
-                target: "engine::bb",
-                global_tx_idx,
-                remaining = transaction_count - global_tx_idx,
-                gas_offset,
-                "Executing tail transactions"
-            );
-
-            let result = {
-                let evm = self.inner.evm_config.evm_with_env(&mut db, cur_evm_env);
-                let ctx = if let Some(data) = cur_ctx_data {
-                    self.inner
-                        .evm_config
-                        .context_for_payload(data)
-                        .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?
-                } else {
-                    self.inner
-                        .execution_ctx_for(input)
-                        .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?
-                };
-                let mut executor = self.inner.evm_config.create_executor(evm, ctx);
-
-                if !self.inner.config.precompile_cache_disabled() {
-                    executor.evm_mut().precompiles_mut().map_cacheable_precompiles(
-                        |address, precompile| {
-                            let metrics = self
-                                .inner
-                                .precompile_cache_metrics
-                                .entry(*address)
-                                .or_insert_with(|| {
-                                    CachedPrecompileMetrics::new_with_address(*address)
-                                })
-                                .clone();
-                            CachedPrecompile::wrap(
-                                precompile,
-                                self.inner.precompile_cache_map.cache_for_address(*address),
-                                spec_id,
-                                Some(metrics),
-                            )
-                        },
-                    );
+            // Seed this segment's block hash for BLOCKHASH in subsequent segments
+            if !is_final {
+                let seg_block_number = segment.execution_data.block_number();
+                if seg_block_number > 0 {
+                    db.block_hashes
+                        .insert(seg_block_number - 1, segment.execution_data.parent_hash());
                 }
-
-                let state_hook: Option<Box<dyn OnStateHook>> =
-                    handle.state_hook().map(|h| Box::new(h) as Box<dyn OnStateHook>);
-                let mut executor = executor.with_state_hook(state_hook);
-
-                executor.apply_pre_execution_changes()?;
-
-                let mut last_sent_len = 0usize;
-                for tx_result in &mut tx_drain {
-                    let tx = tx_result.map_err(reth_errors::BlockExecutionError::other)?;
-                    let tx_signer = *<Tx as alloy_evm::RecoveredTx<_>>::signer(&tx);
-                    all_senders.push(tx_signer);
-
-                    executor.execute_transaction(tx)?;
-                    global_tx_idx += 1;
-                    executed_tx_index.store(global_tx_idx, Ordering::Relaxed);
-
-                    let current_len = executor.receipts().len();
-                    if current_len > last_sent_len {
-                        last_sent_len = current_len;
-                        if let Some(receipt) = executor.receipts().last() {
-                            let adjusted = if gas_offset > 0 {
-                                receipt.with_gas_offset(gas_offset)
-                            } else {
-                                receipt.clone()
-                            };
-                            let _ =
-                                receipt_tx.send(IndexedReceipt::new(global_tx_idx - 1, adjusted));
-                        }
-                    }
-                }
-
-                executor.finish()?.1
-            };
-            for receipt in &result.receipts {
-                all_receipts.push(if gas_offset > 0 {
-                    receipt.with_gas_offset(gas_offset)
-                } else {
-                    receipt.clone()
-                });
             }
-            all_requests.extend(result.requests);
-            gas_offset += result.gas_used;
-            blob_gas_used += result.blob_gas_used;
         }
 
         drop(receipt_tx);
@@ -906,7 +764,10 @@ where
             result: reth_evm::block::BlockExecutionResult {
                 receipts: all_receipts,
                 requests: all_requests,
-                gas_used: gas_offset,
+                // Use the merged payload header's gas_used rather than summing
+                // segment results, because segment finish() may not account for
+                // all gas (e.g., system calls in apply_pre_execution_changes).
+                gas_used: env.gas_used,
                 blob_gas_used,
             },
             state: db.take_bundle(),
