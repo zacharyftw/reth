@@ -87,15 +87,26 @@ pub struct RevmcMetrics {
     pub events_dropped: metrics::Gauge,
     /// Number of entries in the resident compiled map.
     pub resident_entries: metrics::Gauge,
+    /// Approximate total bytes of compiled code in the resident map.
+    pub resident_bytes: metrics::Gauge,
 }
 
 impl RevmcMetrics {
     /// Records a [`RuntimeStatsSnapshot`] into the metrics.
     pub fn record(&self, stats: &RuntimeStatsSnapshot) {
-        self.lookup_hits.set(stats.lookup_hits as f64);
-        self.lookup_misses.set(stats.lookup_misses as f64);
-        self.events_sent.set(stats.events_sent as f64);
-        self.events_dropped.set(stats.events_dropped as f64);
-        self.resident_entries.set(stats.resident_entries as f64);
+        let RuntimeStatsSnapshot {
+            lookup_hits,
+            lookup_misses,
+            events_sent,
+            events_dropped,
+            resident_entries,
+            resident_bytes,
+        } = *stats;
+        self.lookup_hits.set(lookup_hits as f64);
+        self.lookup_misses.set(lookup_misses as f64);
+        self.events_sent.set(events_sent as f64);
+        self.events_dropped.set(events_dropped as f64);
+        self.resident_entries.set(resident_entries as f64);
+        self.resident_bytes.set(resident_bytes as f64);
     }
 }
