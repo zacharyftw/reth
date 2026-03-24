@@ -104,10 +104,10 @@ pub type ValidationOutcome<N, E = InsertPayloadError<BlockTy<N>>> =
     Result<(ExecutedBlock<N>, Option<Box<ExecutionTimingStats>>), E>;
 
 /// Handle to a [`HashedPostState`] computed on a background thread.
-pub type LazyHashedPostState = reth_tasks::LazyHandle<HashedPostState>;
+type LazyHashedPostState = reth_tasks::LazyHandle<HashedPostState>;
 
 /// Result type for block validation with optional timing stats.
-pub type InsertPayloadResult<N> = Result<
+type InsertPayloadResult<N> = Result<
     (ExecutedBlock<N>, Option<Box<ExecutionTimingStats>>),
     InsertPayloadError<<N as NodePrimitives>::Block>,
 >;
@@ -177,32 +177,32 @@ where
     Evm: ConfigureEvm,
 {
     /// Provider for database access.
-    pub provider: P,
+    provider: P,
     /// Consensus implementation for validation.
-    pub consensus: Arc<dyn FullConsensus<Evm::Primitives>>,
+    consensus: Arc<dyn FullConsensus<Evm::Primitives>>,
     /// EVM configuration.
-    pub evm_config: Evm,
+    evm_config: Evm,
     /// Configuration for the tree.
-    pub config: TreeConfig,
+    config: TreeConfig,
     /// Payload processor for state root computation.
-    pub payload_processor: PayloadProcessor<Evm>,
+    payload_processor: PayloadProcessor<Evm>,
     /// Precompile cache map.
-    pub precompile_cache_map: PrecompileCacheMap<SpecFor<Evm>>,
+    precompile_cache_map: PrecompileCacheMap<SpecFor<Evm>>,
     /// Precompile cache metrics.
-    pub precompile_cache_metrics: HashMap<alloy_primitives::Address, CachedPrecompileMetrics>,
+    precompile_cache_metrics: HashMap<alloy_primitives::Address, CachedPrecompileMetrics>,
     /// Hook to call when invalid blocks are encountered.
     #[debug(skip)]
-    pub invalid_block_hook: Box<dyn InvalidBlockHook<Evm::Primitives>>,
+    invalid_block_hook: Box<dyn InvalidBlockHook<Evm::Primitives>>,
     /// Metrics for the engine api.
-    pub metrics: EngineApiMetrics,
+    metrics: EngineApiMetrics,
     /// Validator for the payload.
-    pub validator: V,
+    validator: V,
     /// Changeset cache for in-memory trie changesets
-    pub changeset_cache: ChangesetCache,
+    changeset_cache: ChangesetCache,
     /// Task runtime for spawning parallel work.
-    pub runtime: reth_tasks::Runtime,
+    runtime: reth_tasks::Runtime,
     /// Block executor strategy.
-    pub block_executor: X,
+    block_executor: X,
 }
 
 impl<N, P, Evm, V> BasicEngineValidator<P, Evm, V, DefaultBlockExecutor>
@@ -384,7 +384,7 @@ where
     ///
     /// When an execution error occurs, this function checks if there are any header validation
     /// errors that should be reported instead, as header validation errors have higher priority.
-    pub fn handle_execution_error<T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>>(
+    fn handle_execution_error<T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>>(
         &self,
         input: BlockOrPayload<T>,
         execution_err: InsertBlockErrorKind,
@@ -915,7 +915,7 @@ where
     }
 
     /// Return sealed block header from database or in-memory state by hash.
-    pub fn sealed_header_by_hash(
+    fn sealed_header_by_hash(
         &self,
         hash: B256,
         state: &EngineApiTreeState<N>,
@@ -933,7 +933,7 @@ where
     /// Validate if block is correct and satisfies all the consensus rules that concern the header
     /// and block body itself.
     #[instrument(level = "debug", target = "engine::tree::payload_validator", skip_all)]
-    pub fn validate_block_inner(
+    fn validate_block_inner(
         &self,
         block: &SealedBlock<N::Block>,
         transaction_root: Option<B256>,
@@ -964,7 +964,7 @@ where
     /// Returns `Ok(_)` if computed successfully.
     /// Returns `Err(_)` if error was encountered during computation.
     #[instrument(level = "debug", target = "engine::tree::payload_validator", skip_all)]
-    pub fn compute_state_root_parallel(
+    fn compute_state_root_parallel(
         &self,
         overlay_factory: OverlayStateProviderFactory<P>,
         hashed_state: &LazyHashedPostState,
@@ -985,7 +985,7 @@ where
     /// Uses an overlay factory which provides the state of the parent block, along with the
     /// [`HashedPostState`] containing the changes of this block, to compute the state root and
     /// trie updates for this block.
-    pub fn compute_state_root_serial(
+    fn compute_state_root_serial(
         overlay_factory: OverlayStateProviderFactory<P>,
         hashed_state: &LazyHashedPostState,
     ) -> ProviderResult<(B256, TrieUpdates)> {
@@ -1023,7 +1023,7 @@ where
         name = "await_state_root",
         skip_all
     )]
-    pub fn await_state_root_with_timeout<Tx, Err, R: Send + Sync + 'static>(
+    fn await_state_root_with_timeout<Tx, Err, R: Send + Sync + 'static>(
         &self,
         handle: &mut PayloadHandle<Tx, Err, R>,
         overlay_factory: OverlayStateProviderFactory<P>,
@@ -1116,7 +1116,7 @@ where
     /// task implementation. When enabled via `--engine.state-root-task-compare-updates`, this
     /// method runs a separate serial state root computation and compares the resulting trie
     /// updates.
-    pub fn compare_trie_updates_with_serial(
+    fn compare_trie_updates_with_serial(
         &self,
         overlay_factory: OverlayStateProviderFactory<P>,
         hashed_state: &LazyHashedPostState,
@@ -1176,7 +1176,7 @@ where
     /// The file is written to the current working directory as
     /// `trie_debug_block_{block_number}.json`.
     #[cfg(feature = "trie-debug")]
-    pub fn write_trie_debug_recorders(
+    fn write_trie_debug_recorders(
         block_number: u64,
         recorders: &[(Option<B256>, TrieDebugRecorder)],
     ) {
@@ -1222,7 +1222,7 @@ where
     /// The `hashed_state` handle wraps the background hashed post state computation.
     #[instrument(level = "debug", target = "engine::tree::payload_validator", skip_all)]
     #[expect(clippy::too_many_arguments)]
-    pub fn validate_post_execution<T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>>(
+    fn validate_post_execution<T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>>(
         &self,
         block: &RecoveredBlock<N::Block>,
         parent_block: &SealedHeader<N::BlockHeader>,
@@ -1312,7 +1312,7 @@ where
         skip_all,
         fields(?strategy)
     )]
-    pub fn spawn_payload_processor<T: ExecutableTxIterator<Evm>>(
+    fn spawn_payload_processor<T: ExecutableTxIterator<Evm>>(
         &mut self,
         env: ExecutionEnv<Evm>,
         txs: T,
@@ -1374,7 +1374,7 @@ where
     ///
     /// This method checks if the parent is in the tree state (in-memory) or persisted to disk,
     /// and creates the appropriate provider builder.
-    pub fn state_provider_builder(
+    fn state_provider_builder(
         &self,
         hash: B256,
         state: &EngineApiTreeState<N>,
@@ -1405,7 +1405,7 @@ where
     ///
     /// Note: Use state root task only if prefix sets are empty, otherwise proof generation is
     /// too expensive because it requires walking all paths in every proof.
-    pub const fn plan_state_root_computation(&self) -> StateRootStrategy {
+    const fn plan_state_root_computation(&self) -> StateRootStrategy {
         if self.config.state_root_fallback() {
             StateRootStrategy::Synchronous
         } else if self.config.use_state_root_task() {
@@ -1416,7 +1416,7 @@ where
     }
 
     /// Called when an invalid block is encountered during validation.
-    pub fn on_invalid_block(
+    fn on_invalid_block(
         &self,
         parent_header: &SealedHeader<N::BlockHeader>,
         block: &RecoveredBlock<N::Block>,
@@ -1440,7 +1440,7 @@ where
     /// If parent is on disk (no in-memory blocks), returns `None` for the lazy overlay.
     ///
     /// Uses a cached overlay if available for the canonical head (the common case).
-    pub fn get_parent_lazy_overlay(
+    fn get_parent_lazy_overlay(
         parent_hash: B256,
         state: &EngineApiTreeState<N>,
     ) -> (Option<LazyOverlay>, B256) {
@@ -1493,7 +1493,7 @@ where
     /// The validation hot path can return immediately after state root verification,
     /// while consumers (DB writes, overlay providers, proofs) get trie data either
     /// from the completed task or via fallback computation.
-    pub fn spawn_deferred_trie_task(
+    fn spawn_deferred_trie_task(
         &self,
         block: RecoveredBlock<N::Block>,
         execution_outcome: Arc<BlockExecutionOutput<N::Receipt>>,
@@ -1618,7 +1618,7 @@ where
         )
     }
 
-    pub fn calculate_timing_stats(
+    fn calculate_timing_stats(
         &self,
         block: &RecoveredBlock<N::Block>,
         provider_stats: Arc<StateProviderStats>,
@@ -1756,7 +1756,7 @@ where
 
 /// Strategy describing how to compute the state root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StateRootStrategy {
+pub(crate) enum StateRootStrategy {
     /// Use the state root task (background sparse trie computation).
     StateRootTask,
     /// Run the parallel state root computation on the calling thread.
