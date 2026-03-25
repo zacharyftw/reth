@@ -778,7 +778,7 @@ ipnet = "2.11"
 # jsonrpsee-http-client = { git = "https://github.com/paradigmxyz/jsonrpsee", branch = "matt/make-rpc-service-pub" }
 # jsonrpsee-types = { git = "https://github.com/paradigmxyz/jsonrpsee", branch = "matt/make-rpc-service-pub" }
 
-alloy-evm = { git = "https://github.com/alloy-rs/evm", rev = "ff30ee0" }
+alloy-evm = { git = "https://github.com/alloy-rs/evm", rev = "c19cbb8" }
 
 revm-inspectors = { git = "https://github.com/paradigmxyz/revm-inspectors", rev = "5700e02" }
 
