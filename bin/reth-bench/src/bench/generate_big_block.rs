@@ -326,7 +326,7 @@ impl Command {
 
                 let (rpc_block, receipts) = match fetch_result {
                     Ok((Some(block), Some(receipts))) => (block, receipts),
-                    Ok((None, _)) | Ok((_, None)) => {
+                    Ok((None, _) | (_, None)) => {
                         warn!(
                             target: "reth-bench",
                             block_number,
