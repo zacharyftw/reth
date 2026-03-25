@@ -25,7 +25,7 @@ use reth_ethereum_primitives::Receipt;
 use reth_primitives_traits::proofs;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
-use tracing::info;
+use tracing::{info, warn};
 
 /// A single transaction with its gas used and raw encoded bytes.
 #[derive(Debug, Clone)]
@@ -314,28 +314,29 @@ impl Command {
             let mut block_receipts: Vec<Vec<Receipt>> = Vec::new();
             let mut accumulated_block_gas: u64 = 0;
 
+            let mut reached_chain_tip = false;
             while accumulated_block_gas < self.target_gas {
                 let block_number = next_block;
                 info!(target: "reth-bench", block_number, big_block = big_block_idx, "Fetching block");
 
-                let (rpc_block, receipts) = tokio::try_join!(
-                    async {
-                        provider.get_block_by_number(block_number.into()).full().await?.ok_or_else(
-                            || {
-                                alloy_transport::TransportError::local_usage_str(&format!(
-                                    "Block {block_number} not found"
-                                ))
-                            },
-                        )
-                    },
-                    async {
-                        provider.get_block_receipts(block_number.into()).await?.ok_or_else(|| {
-                            alloy_transport::TransportError::local_usage_str(&format!(
-                                "Receipts not found for block {block_number}"
-                            ))
-                        })
+                let fetch_result = tokio::try_join!(
+                    provider.get_block_by_number(block_number.into()).full(),
+                    provider.get_block_receipts(block_number.into()),
+                );
+
+                let (rpc_block, receipts) = match fetch_result {
+                    Ok((Some(block), Some(receipts))) => (block, receipts),
+                    Ok((None, _)) | Ok((_, None)) => {
+                        warn!(
+                            target: "reth-bench",
+                            block_number,
+                            "Block not found — reached chain tip"
+                        );
+                        reached_chain_tip = true;
+                        break;
                     }
-                )?;
+                    Err(e) => return Err(e.into()),
+                };
 
                 // Convert RPC receipts to consensus receipts
                 let consensus_receipts: Vec<Receipt> = receipts
@@ -387,6 +388,17 @@ impl Command {
                 blocks.push(execution_data);
                 block_receipts.push(consensus_receipts);
                 next_block += 1;
+            }
+
+            // If we hit the chain tip without fetching any blocks, stop generating.
+            if blocks.is_empty() {
+                warn!(
+                    target: "reth-bench",
+                    big_block = big_block_idx,
+                    requested = self.num_big_blocks,
+                    "No blocks available, stopping generation early"
+                );
+                break;
             }
 
             // Block 0 is the base
@@ -600,6 +612,16 @@ impl Command {
                 prior_block_hashes = big_block.big_block_data.prior_block_hashes.len(),
                 "Big block payload saved"
             );
+
+            if reached_chain_tip {
+                warn!(
+                    target: "reth-bench",
+                    generated = big_block_idx + 1,
+                    requested = self.num_big_blocks,
+                    "Reached chain tip, stopping generation early"
+                );
+                break;
+            }
         }
 
         Ok(())
