@@ -448,8 +448,7 @@ where
             ..default_tuning
         };
 
-        let dump_dir =
-            if jit.debug { Some(ctx.config().datadir().data_dir().join("jit")) } else { None };
+        let dump_dir = jit.debug.then(|| ctx.config().datadir().data_dir().join("jit"));
 
         let config = RuntimeConfig {
             enabled: jit.enabled || jit.blocking,
