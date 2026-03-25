@@ -65,5 +65,5 @@ client = ["jsonrpsee/client", "jsonrpsee/async-client"]
 op = [
     "reth-evm/op",
     "reth-rpc-convert/op",
-    "alloy-evm/op",
+    
 ]
