@@ -8423,6 +8423,68 @@ mod tests {
         let _ = trie.root();
     }
 
+    #[test]
+    fn test_production_flow_stale_lower_root_path_panics_on_root_rehash() {
+        use crate::LeafUpdate;
+        use alloy_primitives::map::B256Map;
+
+        // 1) Start from a proof-like root and reveal additional proof nodes.
+        let root =
+            create_branch_node_with_children(&[0x5], [RlpNode::word_rlp(&B256::repeat_byte(0xA5))]);
+        let mut trie = ParallelSparseTrie::from_root(root, None, false).unwrap();
+
+        let branch_at_5 = create_branch_node_with_children(
+            &[0xD, 0xE, 0xF],
+            [
+                RlpNode::word_rlp(&B256::repeat_byte(0x1D)),
+                RlpNode::word_rlp(&B256::repeat_byte(0x1E)),
+                RlpNode::word_rlp(&B256::repeat_byte(0x1F)),
+            ],
+        );
+        let leaf_at_5d = TrieNode::Leaf(LeafNode::new(
+            Nibbles::from_nibbles([vec![0x1], vec![0; 61]].concat()),
+            vec![0x01],
+        ));
+        let branch_at_5d1 =
+            create_branch_node_with_children(&[0x2], [RlpNode::word_rlp(&B256::repeat_byte(0x22))]);
+        let leaf_at_5d12 = TrieNode::Leaf(LeafNode::new(Nibbles::from_nibbles([0x3]), vec![0x02]));
+
+        let mut nodes = vec![
+            ProofTrieNode { path: Nibbles::from_nibbles([0x5]), node: branch_at_5, masks: None },
+            ProofTrieNode {
+                path: Nibbles::from_nibbles([0x5, 0xD]),
+                node: leaf_at_5d,
+                masks: None,
+            },
+            ProofTrieNode {
+                path: Nibbles::from_nibbles([0x5, 0xD, 0x1]),
+                node: branch_at_5d1,
+                masks: None,
+            },
+            ProofTrieNode {
+                path: Nibbles::from_nibbles([0x5, 0xD, 0x1, 0x2]),
+                node: leaf_at_5d12,
+                masks: None,
+            },
+        ];
+        trie.reveal_nodes(&mut nodes).unwrap();
+
+        // 2) Apply a production-style leaf deletion via update_leaves.
+        let full_key = pad_nibbles_right(Nibbles::from_nibbles([0x5, 0xD, 0x1]));
+        let full_key_b256 =
+            full_key.pack().into_inner().expect("padded key packs to 32 bytes").into();
+        let mut updates = B256Map::default();
+        updates.insert(full_key_b256, LeafUpdate::Changed(Vec::new()));
+
+        trie.update_leaves(&mut updates, |_target, _min_len| {}).unwrap();
+        assert!(updates.is_empty(), "delete should be fully applied");
+
+        // 3) This is the production trigger point (`root` => `update_subtrie_hashes`).
+        // On current HEAD this panics with:
+        // "node at path Nibbles(0x5d) does not exist".
+        let _ = trie.root();
+    }
+
     // update_leaves tests
 
     #[test]
