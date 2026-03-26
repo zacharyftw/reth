@@ -113,6 +113,8 @@ where
     evm_config: Evm,
     /// Whether precompile cache should be disabled.
     precompile_cache_disabled: bool,
+    /// Whether state provider metrics are enabled.
+    state_provider_metrics: bool,
     /// Precompile cache map.
     precompile_cache_map: PrecompileCacheMap<SpecFor<Evm>>,
     /// A pruned `SparseStateTrie`, kept around as a cache of already revealed trie nodes and to
@@ -155,6 +157,7 @@ where
             evm_config,
             disable_state_cache: config.disable_state_cache(),
             precompile_cache_disabled: config.precompile_cache_disabled(),
+            state_provider_metrics: config.state_provider_metrics(),
             precompile_cache_map,
             sparse_state_trie: SharedPreservedSparseTrie::default(),
             sparse_trie_max_hot_slots: config.sparse_trie_max_hot_slots(),
@@ -488,6 +491,7 @@ where
             terminate_execution: Arc::new(AtomicBool::new(false)),
             executed_tx_index: Arc::clone(&executed_tx_index),
             precompile_cache_disabled: self.precompile_cache_disabled,
+            state_provider_metrics: self.state_provider_metrics,
             precompile_cache_map: self.precompile_cache_map.clone(),
         };
 

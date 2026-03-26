@@ -12,6 +12,7 @@
 //! 3. When actual block execution happens, it benefits from the warmed cache
 
 use crate::tree::{
+    instrumented_state::InstrumentedStateProvider,
     payload_processor::{bal, multiproof::MultiProofMessage},
     precompile_cache::{CachedPrecompile, PrecompileCacheMap},
     CachedStateProvider, ExecutionEnv, PayloadExecutionCache, SavedCache, StateProviderBuilder,
@@ -512,6 +513,8 @@ where
     pub executed_tx_index: Arc<AtomicUsize>,
     /// Whether the precompile cache is disabled.
     pub precompile_cache_disabled: bool,
+    /// Whether state provider metrics are enabled.
+    pub state_provider_metrics: bool,
     /// The precompile cache map.
     pub precompile_cache_map: PrecompileCacheMap<SpecFor<Evm>>,
 }
@@ -548,6 +551,10 @@ where
             let cache_metrics = saved_cache.metrics().clone();
             state_provider =
                 Box::new(CachedStateProvider::new_prewarm(state_provider, caches, cache_metrics));
+        }
+
+        if self.state_provider_metrics {
+            state_provider = Box::new(InstrumentedStateProvider::new(state_provider, "prewarm"));
         }
 
         let state_provider = StateProviderDatabase::new(state_provider);
