@@ -69,6 +69,9 @@ pub fn run(input: FuzzInput) {
         let mut pending_changeset = Some(changeset);
 
         let mut updates_applied = false;
+        // Pruning requires cached hashes, so we only allow it after roots have been
+        // checkpointed since the most recent successful ApplyUpdates.
+        let mut roots_fresh_since_last_apply = true;
         let mut pruned_this_round = false;
 
         let ops = materialize_round_ops(spec);
@@ -92,9 +95,15 @@ pub fn run(input: FuzzInput) {
                         apply_changeset_to_live_state(&mut live_state, &changeset);
                         harness.apply_changeset(changeset);
                         updates_applied = true;
+                        roots_fresh_since_last_apply = false;
                     }
                 }
                 RoundOp::Prune => {
+                    if !roots_fresh_since_last_apply {
+                        checkpoint_roots(&mut arena, &mut map_trie, &harness, round_idx, Some(op_idx));
+                        roots_fresh_since_last_apply = true;
+                    }
+
                     let mut prune_rng = StdRng::seed_from_u64(
                         spec.key_seed
                             .wrapping_add((round_idx as u64) << 16)
@@ -120,6 +129,7 @@ pub fn run(input: FuzzInput) {
                 }
                 RoundOp::CheckpointRoot => {
                     checkpoint_roots(&mut arena, &mut map_trie, &harness, round_idx, Some(op_idx));
+                    roots_fresh_since_last_apply = true;
                 }
             }
         }
