@@ -4294,6 +4294,74 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
+    fn test_reveal_nodes_panics_for_divergent_same_depth_lower_paths() {
+        // Make lower subtrie [0x1, 0x2] reachable from the upper trie.
+        let root_branch =
+            create_branch_node_with_children(&[0x1], [RlpNode::word_rlp(&B256::repeat_byte(0xAA))]);
+        let branch_at_1 =
+            create_branch_node_with_children(&[0x2], [RlpNode::word_rlp(&B256::repeat_byte(0xBB))]);
+        let mut trie = ParallelSparseTrie::from_root(root_branch, None, false).unwrap();
+        trie.reveal_nodes(&mut [ProofTrieNodeV2 {
+            path: Nibbles::from_nibbles([0x1]),
+            node: branch_at_1,
+            masks: None,
+        }])
+        .unwrap();
+
+        // Both nodes belong to the same lower subtrie index (prefix [0x1, 0x2]) but diverge at
+        // the next nibble. Revealing the first node sets the subtrie root path too deep; revealing
+        // the second then trips `debug_assert!(path.starts_with(&self.path))`.
+        trie.reveal_nodes(&mut [
+            ProofTrieNodeV2 {
+                path: Nibbles::from_nibbles([0x1, 0x2, 0x3]),
+                node: create_leaf_node([0x0], 1),
+                masks: None,
+            },
+            ProofTrieNodeV2 {
+                path: Nibbles::from_nibbles([0x1, 0x2, 0x4]),
+                node: create_leaf_node([0x0], 2),
+                masks: None,
+            },
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn test_root_panics_when_lower_subtrie_path_has_no_node() {
+        // Make lower subtrie [0x0, 0xa] reachable from the upper trie.
+        let root_branch =
+            create_branch_node_with_children(&[0x0], [RlpNode::word_rlp(&B256::repeat_byte(0xAA))]);
+        let branch_at_0 =
+            create_branch_node_with_children(&[0xa], [RlpNode::word_rlp(&B256::repeat_byte(0xBB))]);
+        let mut trie = ParallelSparseTrie::from_root(root_branch, None, false).unwrap();
+        trie.reveal_nodes(&mut [ProofTrieNodeV2 {
+            path: Nibbles::from_nibbles([0x0]),
+            node: branch_at_0,
+            masks: None,
+        }])
+        .unwrap();
+
+        // Revealing this lower node sets `subtrie.path` to 0x0a3, but does not insert a node at
+        // that path because its parent branch at 0x0a is not revealed.
+        trie.reveal_nodes(&mut [ProofTrieNodeV2 {
+            path: Nibbles::from_nibbles([0x0, 0xa, 0x3]),
+            node: create_leaf_node([0x0], 1),
+            masks: None,
+        }])
+        .unwrap();
+
+        let lower = trie.lower_subtries[0x0a].as_revealed_ref().unwrap();
+        assert!(!lower.nodes.contains_key(&Nibbles::from_nibbles([0x0, 0xa, 0x3])));
+
+        // Force this stale subtrie into hash recomputation path.
+        trie.prefix_set.insert(Nibbles::from_nibbles([0x0, 0xa, 0x3]));
+
+        // Hashing now tries to start from `subtrie.path`, which has no backing node.
+        let _ = trie.root();
+    }
+
+    #[test]
     fn test_update_subtrie_hashes_prefix_set_matching() {
         // Create a trie with a root branch that makes paths [0x0, ...] and [0x3, ...]
         // reachable from the upper trie.
