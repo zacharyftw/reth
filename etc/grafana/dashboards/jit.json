@@ -1,0 +1,390 @@
+{
+  "description": "revmc JIT compiler metrics: lookups, compilations, memory, evictions",
+  "panels": [
+    {
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "rate(reth_revmc_jit_lookup_hits[1m])",
+          "legendFormat": "hits/s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "rate(reth_revmc_jit_lookup_misses[1m])",
+          "legendFormat": "misses/s"
+        }
+      ],
+      "title": "JIT Lookup Hit Rate",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "reth_revmc_jit_lookup_hits",
+          "legendFormat": "hits"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "reth_revmc_jit_lookup_misses",
+          "legendFormat": "misses"
+        }
+      ],
+      "title": "JIT Lookups (cumulative)",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "reth_revmc_jit_jit_code_bytes",
+          "legendFormat": "code bytes"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "reth_revmc_jit_jit_data_bytes",
+          "legendFormat": "data bytes"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "reth_revmc_jit_jit_code_bytes + reth_revmc_jit_jit_data_bytes",
+          "legendFormat": "total"
+        }
+      ],
+      "title": "JIT Memory Usage",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "reth_revmc_jit_resident_entries",
+          "legendFormat": "resident entries"
+        }
+      ],
+      "title": "Resident Entries",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "reth_revmc_jit_jit_promotions",
+          "legendFormat": "promotions"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "reth_revmc_jit_jit_successes",
+          "legendFormat": "successes"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "reth_revmc_jit_jit_failures",
+          "legendFormat": "failures"
+        }
+      ],
+      "title": "JIT Compilations",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "rate(reth_revmc_jit_jit_promotions[1m])",
+          "legendFormat": "promotions/s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "rate(reth_revmc_jit_jit_successes[1m])",
+          "legendFormat": "successes/s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "rate(reth_revmc_jit_jit_failures[1m])",
+          "legendFormat": "failures/s"
+        }
+      ],
+      "title": "JIT Compilation Rate",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "reth_revmc_jit_evictions",
+          "legendFormat": "evictions (total)"
+        }
+      ],
+      "title": "Evictions",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "rate(reth_revmc_jit_evictions[1m])",
+          "legendFormat": "evictions/s"
+        }
+      ],
+      "title": "Eviction Rate",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "reth_revmc_jit_events_sent",
+          "legendFormat": "events sent"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "reth_revmc_jit_events_dropped",
+          "legendFormat": "events dropped"
+        }
+      ],
+      "title": "Event Channel",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "cfh1s6prbv4lcc"
+          },
+          "expr": "reth_revmc_jit_jit_queue_len",
+          "legendFormat": "queue length"
+        }
+      ],
+      "title": "JIT Queue Length",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "reth",
+    "revmc",
+    "jit"
+  ],
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "JIT"
+}
