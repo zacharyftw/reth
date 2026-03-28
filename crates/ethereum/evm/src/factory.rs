@@ -14,7 +14,10 @@ use revm::{
 use revmc::alloy_evm as jit;
 
 pub use jit::JitEvm;
-pub use revmc::runtime::{JitBackend, RuntimeConfig, RuntimeStatsSnapshot, RuntimeTuning};
+pub use revmc::runtime::{
+    CompilationEvent, CompilationKind, JitBackend, RuntimeConfig, RuntimeStatsSnapshot,
+    RuntimeTuning,
+};
 
 /// Newtype around [`revmc::alloy_evm::JitEvmFactory`] that implements [`Debug`].
 ///
@@ -101,6 +104,10 @@ pub struct RevmcMetrics {
     pub jit_successes: metrics::Gauge,
     /// Total number of failed JIT compilations.
     pub jit_failures: metrics::Gauge,
+    /// Histogram of JIT compilation durations (seconds).
+    pub jit_compilation_duration: metrics::Histogram,
+    /// Duration of the last JIT compilation (seconds).
+    pub jit_compilation_duration_last: metrics::Gauge,
 }
 
 impl RevmcMetrics {
@@ -132,5 +139,12 @@ impl RevmcMetrics {
         self.jit_promotions.set(jit_promotions as f64);
         self.jit_successes.set(jit_successes as f64);
         self.jit_failures.set(jit_failures as f64);
+    }
+
+    /// Records a [`CompilationEvent`] into the histogram metrics.
+    pub fn record_compilation(&self, event: &CompilationEvent) {
+        let duration_secs = event.duration.as_secs_f64();
+        self.jit_compilation_duration.record(duration_secs);
+        self.jit_compilation_duration_last.set(duration_secs);
     }
 }

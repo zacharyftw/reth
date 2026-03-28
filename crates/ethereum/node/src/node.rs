@@ -458,12 +458,17 @@ where
 
         let dump_dir = jit.debug.then(|| ctx.config().datadir().data_dir().join("jit"));
 
+        let revmc_metrics = Arc::new(RevmcMetrics::default());
+        let compilation_metrics = revmc_metrics.clone();
         let config = RuntimeConfig {
             enabled: jit.enabled || jit.blocking,
             tuning,
             dump_dir,
             debug_assertions: jit.debug,
             blocking: jit.blocking,
+            on_compilation: Some(Arc::new(move |event| {
+                compilation_metrics.record_compilation(&event);
+            })),
             ..Default::default()
         };
         let backend = JitBackend::start(config)?;
@@ -478,7 +483,6 @@ where
 
         // Periodically record JIT metrics.
         let metrics_backend = backend.clone();
-        let revmc_metrics = RevmcMetrics::default();
         ctx.task_executor().spawn_with_graceful_shutdown_signal(|shutdown| async move {
             let mut shutdown = std::pin::pin!(shutdown);
             loop {
