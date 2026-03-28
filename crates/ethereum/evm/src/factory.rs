@@ -14,9 +14,12 @@ use revm::{
 use revmc::alloy_evm as jit;
 
 pub use jit::JitEvm;
-pub use revmc::runtime::{
-    CompilationEvent, CompilationKind, JitBackend, RuntimeConfig, RuntimeStatsSnapshot,
-    RuntimeTuning,
+pub use revmc::{
+    CompileTimings,
+    runtime::{
+        CompilationEvent, CompilationKind, JitBackend, RuntimeConfig, RuntimeStatsSnapshot,
+        RuntimeTuning,
+    },
 };
 
 /// Newtype around [`revmc::alloy_evm::JitEvmFactory`] that implements [`Debug`].
@@ -104,10 +107,18 @@ pub struct RevmcMetrics {
     pub jit_successes: metrics::Gauge,
     /// Total number of failed JIT compilations.
     pub jit_failures: metrics::Gauge,
-    /// Histogram of JIT compilation durations (seconds).
+    /// Histogram of total JIT compilation durations (seconds).
     pub jit_compilation_duration: metrics::Histogram,
     /// Duration of the last JIT compilation (seconds).
     pub jit_compilation_duration_last: metrics::Gauge,
+    /// Histogram of parse phase durations (seconds).
+    pub jit_parse_duration: metrics::Histogram,
+    /// Histogram of translate phase durations (seconds).
+    pub jit_translate_duration: metrics::Histogram,
+    /// Histogram of optimize phase durations (seconds).
+    pub jit_optimize_duration: metrics::Histogram,
+    /// Histogram of codegen phase durations (seconds).
+    pub jit_codegen_duration: metrics::Histogram,
 }
 
 impl RevmcMetrics {
@@ -146,5 +157,9 @@ impl RevmcMetrics {
         let duration_secs = event.duration.as_secs_f64();
         self.jit_compilation_duration.record(duration_secs);
         self.jit_compilation_duration_last.set(duration_secs);
+        self.jit_parse_duration.record(event.timings.parse.as_secs_f64());
+        self.jit_translate_duration.record(event.timings.translate.as_secs_f64());
+        self.jit_optimize_duration.record(event.timings.optimize.as_secs_f64());
+        self.jit_codegen_duration.record(event.timings.codegen.as_secs_f64());
     }
 }

@@ -448,6 +448,90 @@
       ],
       "title": "JIT Compilation Duration (last)",
       "type": "timeseries"
+    },
+    {
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "cfh1s6prbv4lcc" },
+          "expr": "histogram_quantile(0.50, rate(reth_revmc_jit_jit_parse_duration_bucket[5m]))",
+          "legendFormat": "parse"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "cfh1s6prbv4lcc" },
+          "expr": "histogram_quantile(0.50, rate(reth_revmc_jit_jit_translate_duration_bucket[5m]))",
+          "legendFormat": "translate"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "cfh1s6prbv4lcc" },
+          "expr": "histogram_quantile(0.50, rate(reth_revmc_jit_jit_optimize_duration_bucket[5m]))",
+          "legendFormat": "optimize"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "cfh1s6prbv4lcc" },
+          "expr": "histogram_quantile(0.50, rate(reth_revmc_jit_jit_codegen_duration_bucket[5m]))",
+          "legendFormat": "codegen"
+        }
+      ],
+      "title": "Compilation Phase Duration (p50)",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "cfh1s6prbv4lcc" },
+          "expr": "histogram_quantile(0.99, rate(reth_revmc_jit_jit_parse_duration_bucket[5m]))",
+          "legendFormat": "parse"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "cfh1s6prbv4lcc" },
+          "expr": "histogram_quantile(0.99, rate(reth_revmc_jit_jit_translate_duration_bucket[5m]))",
+          "legendFormat": "translate"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "cfh1s6prbv4lcc" },
+          "expr": "histogram_quantile(0.99, rate(reth_revmc_jit_jit_optimize_duration_bucket[5m]))",
+          "legendFormat": "optimize"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "cfh1s6prbv4lcc" },
+          "expr": "histogram_quantile(0.99, rate(reth_revmc_jit_jit_codegen_duration_bucket[5m]))",
+          "legendFormat": "codegen"
+        }
+      ],
+      "title": "Compilation Phase Duration (p99)",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
