@@ -54,7 +54,7 @@ impl JitArgs {
     const DEFAULT_CHANNEL_CAPACITY: usize = 4096;
     const DEFAULT_MAX_PENDING_JOBS: usize = 2048;
     const DEFAULT_CODE_CACHE_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
-    const DEFAULT_IDLE_EVICT_SECS: u64 = 600;
+    const DEFAULT_IDLE_EVICT_SECS: u64 = 3600;
 }
 
 impl Default for JitArgs {
