@@ -707,8 +707,10 @@ where
         let mut cursor_metrics_cache = ProofTaskCursorMetricsCache::default();
         let trie_cursor = proof_tx.provider.storage_trie_cursor(B256::ZERO)?;
         let hashed_cursor = proof_tx.provider.hashed_storage_cursor(B256::ZERO)?;
-        let instrumented_trie_cursor =
-            InstrumentedTrieCursor::new(trie_cursor, &mut cursor_metrics_cache.storage_trie_cursor);
+        let instrumented_trie_cursor = InstrumentedTrieCursor::count_only(
+            trie_cursor,
+            &mut cursor_metrics_cache.storage_trie_cursor,
+        );
         let instrumented_hashed_cursor = InstrumentedHashedCursor::new(
             hashed_cursor,
             &mut cursor_metrics_cache.storage_hashed_cursor,
@@ -991,7 +993,7 @@ where
         let storage_trie_cursor = provider.storage_trie_cursor(B256::ZERO)?;
         let storage_hashed_cursor = provider.hashed_storage_cursor(B256::ZERO)?;
 
-        let instrumented_account_trie_cursor = InstrumentedTrieCursor::new(
+        let instrumented_account_trie_cursor = InstrumentedTrieCursor::count_only(
             account_trie_cursor,
             &mut cursor_metrics_cache.account_trie_cursor,
         );
@@ -999,7 +1001,7 @@ where
             account_hashed_cursor,
             &mut cursor_metrics_cache.account_hashed_cursor,
         );
-        let instrumented_storage_trie_cursor = InstrumentedTrieCursor::new(
+        let instrumented_storage_trie_cursor = InstrumentedTrieCursor::count_only(
             storage_trie_cursor,
             &mut cursor_metrics_cache.storage_trie_cursor,
         );

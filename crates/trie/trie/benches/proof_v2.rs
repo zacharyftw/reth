@@ -6,10 +6,16 @@ use alloy_primitives::{
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use proptest::{prelude::*, strategy::ValueTree, test_runner::TestRunner};
 use reth_trie::{
-    hashed_cursor::{mock::MockHashedCursorFactory, HashedCursorFactory},
+    hashed_cursor::{
+        mock::MockHashedCursorFactory, HashedCursorFactory, HashedCursorMetricsCache,
+        InstrumentedHashedCursor,
+    },
     proof::StorageProof,
     proof_v2::StorageProofCalculator,
-    trie_cursor::{mock::MockTrieCursorFactory, TrieCursorFactory},
+    trie_cursor::{
+        mock::MockTrieCursorFactory, InstrumentedTrieCursor, TrieCursorFactory,
+        TrieCursorMetricsCache,
+    },
 };
 use reth_trie_common::{HashedPostState, HashedStorage};
 
@@ -174,5 +180,89 @@ fn bench_proof_algos(c: &mut Criterion) {
     }
 }
 
-criterion_group!(proof_comparison, bench_proof_algos);
+fn bench_cursor_modes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("CursorModes");
+
+    for (dataset_size, num_targets) in [(1024, 64), (10240, 512)] {
+        let (hashed_address, hashed_post_state, targets, _) =
+            generate_test_data(dataset_size, num_targets);
+        let (trie_cursor_factory, hashed_cursor_factory) =
+            create_cursor_factories(&hashed_post_state);
+        let bench_name = format!("dataset_{dataset_size}/targets_{num_targets}");
+
+        group.bench_function(BenchmarkId::new("Plain", &bench_name), |b| {
+            let trie_cursor = trie_cursor_factory
+                .storage_trie_cursor(hashed_address)
+                .expect("Failed to create trie cursor");
+            let hashed_cursor = hashed_cursor_factory
+                .hashed_storage_cursor(hashed_address)
+                .expect("Failed to create hashed cursor");
+            let mut proof_calculator =
+                StorageProofCalculator::new_storage(trie_cursor, hashed_cursor);
+
+            b.iter_batched(
+                || targets.iter().copied().map(Into::into).collect::<Vec<_>>(),
+                |mut targets| {
+                    proof_calculator
+                        .storage_proof(hashed_address, &mut targets)
+                        .expect("Proof generation failed");
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        group.bench_function(BenchmarkId::new("Timed", &bench_name), |b| {
+            let trie_cursor = trie_cursor_factory
+                .storage_trie_cursor(hashed_address)
+                .expect("Failed to create trie cursor");
+            let hashed_cursor = hashed_cursor_factory
+                .hashed_storage_cursor(hashed_address)
+                .expect("Failed to create hashed cursor");
+            let mut trie_metrics = TrieCursorMetricsCache::default();
+            let mut hashed_metrics = HashedCursorMetricsCache::default();
+            let mut proof_calculator = StorageProofCalculator::new_storage(
+                InstrumentedTrieCursor::new(trie_cursor, &mut trie_metrics),
+                InstrumentedHashedCursor::new(hashed_cursor, &mut hashed_metrics),
+            );
+
+            b.iter_batched(
+                || targets.iter().copied().map(Into::into).collect::<Vec<_>>(),
+                |mut targets| {
+                    proof_calculator
+                        .storage_proof(hashed_address, &mut targets)
+                        .expect("Proof generation failed");
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // Proof workers keep hashed-cursor timing enabled; only trie-cursor timing changes.
+        group.bench_function(BenchmarkId::new("CountOnly", &bench_name), |b| {
+            let trie_cursor = trie_cursor_factory
+                .storage_trie_cursor(hashed_address)
+                .expect("Failed to create trie cursor");
+            let hashed_cursor = hashed_cursor_factory
+                .hashed_storage_cursor(hashed_address)
+                .expect("Failed to create hashed cursor");
+            let mut trie_metrics = TrieCursorMetricsCache::default();
+            let mut hashed_metrics = HashedCursorMetricsCache::default();
+            let mut proof_calculator = StorageProofCalculator::new_storage(
+                InstrumentedTrieCursor::count_only(trie_cursor, &mut trie_metrics),
+                InstrumentedHashedCursor::new(hashed_cursor, &mut hashed_metrics),
+            );
+
+            b.iter_batched(
+                || targets.iter().copied().map(Into::into).collect::<Vec<_>>(),
+                |mut targets| {
+                    proof_calculator
+                        .storage_proof(hashed_address, &mut targets)
+                        .expect("Proof generation failed");
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+}
+
+criterion_group!(proof_comparison, bench_proof_algos, bench_cursor_modes);
 criterion_main!(proof_comparison);
