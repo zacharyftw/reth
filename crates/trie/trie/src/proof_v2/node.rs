@@ -27,6 +27,42 @@ pub(crate) enum ProofTrieBranchChild<RF> {
     RlpNode(RlpNode),
 }
 
+/// Reusable scratch buffers for [`ProofTrieBranchChild::into_rlp`].
+#[derive(Debug)]
+pub(crate) struct ProofTrieBranchChildRlpScratch {
+    /// Temporary buffer for the RLP-encoded leaf value.
+    value_buf: Vec<u8>,
+    /// Temporary buffer for the final child node encoding.
+    rlp_buf: Vec<u8>,
+    /// Spare branch-child storage carried across branch encoding.
+    rlp_nodes: Option<Vec<RlpNode>>,
+}
+
+impl ProofTrieBranchChildRlpScratch {
+    /// Creates reusable scratch buffers sized for proof-v2 child encoding.
+    pub(crate) fn with_capacity(rlp_buf_capacity: usize, rlp_nodes_capacity: usize) -> Self {
+        Self {
+            value_buf: Vec::with_capacity(rlp_buf_capacity),
+            rlp_buf: Vec::with_capacity(rlp_buf_capacity),
+            rlp_nodes: Some(Vec::with_capacity(rlp_nodes_capacity)),
+        }
+    }
+
+    /// Takes the spare [`RlpNode`] buffer, if one is currently available.
+    pub(crate) fn take_rlp_nodes(&mut self) -> Option<Vec<RlpNode>> {
+        self.rlp_nodes.take().map(|mut buf| {
+            buf.clear();
+            buf
+        })
+    }
+
+    /// Stores a branch child buffer for reuse, returning any previously stored overflow buffer.
+    fn replace_rlp_nodes(&mut self, mut rlp_nodes: Vec<RlpNode>) -> Option<Vec<RlpNode>> {
+        rlp_nodes.clear();
+        self.rlp_nodes.replace(rlp_nodes)
+    }
+}
+
 impl<RF: DeferredValueEncoder> ProofTrieBranchChild<RF> {
     /// Converts this child into its RLP node representation.
     ///
@@ -34,34 +70,24 @@ impl<RF: DeferredValueEncoder> ProofTrieBranchChild<RF> {
     /// [`ProofTrieBranchChild`]s.
     pub(crate) fn into_rlp(
         self,
-        buf: &mut Vec<u8>,
+        scratch: &mut ProofTrieBranchChildRlpScratch,
     ) -> Result<(RlpNode, Option<Vec<RlpNode>>), StateProofError> {
         match self {
             Self::Leaf { short_key, value } => {
-                // RLP encode the value itself
-                value.encode(buf)?;
-                let value_enc_len = buf.len();
+                scratch.value_buf.clear();
+                value.encode(&mut scratch.value_buf)?;
 
-                // Determine the required buffer size for the encoded leaf
-                let leaf_enc_len = LeafNodeRef::new(&short_key, buf).length();
-
-                // We want to re-use buf for the encoding of the leaf node as well. To do this we
-                // will keep appending to it, leaving the already encoded value in-place. First we
-                // must ensure the buffer is big enough, then we'll split.
-                buf.resize(value_enc_len + leaf_enc_len, 0);
-
-                // SAFETY we have just resized the above to be greater than `value_enc_len`, so it
-                // must be in-bounds.
-                let (value_buf, mut leaf_buf) =
-                    unsafe { buf.split_at_mut_unchecked(value_enc_len) };
-
-                // Encode the leaf into the right side of the split buffer, and return the RlpNode.
-                LeafNodeRef::new(&short_key, value_buf).encode(&mut leaf_buf);
-                Ok((RlpNode::from_rlp(&buf[value_enc_len..]), None))
+                scratch.rlp_buf.clear();
+                Ok((
+                    LeafNodeRef::new(&short_key, &scratch.value_buf).rlp(&mut scratch.rlp_buf),
+                    None,
+                ))
             }
             Self::Branch { node: branch_node, .. } => {
-                branch_node.encode(buf);
-                Ok((RlpNode::from_rlp(buf), Some(branch_node.stack)))
+                scratch.rlp_buf.clear();
+                branch_node.encode(&mut scratch.rlp_buf);
+                let overflow_rlp_nodes = scratch.replace_rlp_nodes(branch_node.stack);
+                Ok((RlpNode::from_rlp(&scratch.rlp_buf), overflow_rlp_nodes))
             }
             Self::RlpNode(rlp_node) => Ok((rlp_node, None)),
         }

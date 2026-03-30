@@ -85,7 +85,9 @@ pub struct ProofCalculator<TC, HC, VE: LeafValueEncoder> {
     /// duration of a proof calculation, but occasionally we will lose one when a branch
     /// node is returned as a `ProofTrieNode`.
     rlp_nodes_bufs: Vec<Vec<RlpNode>>,
-    /// Re-usable byte buffer, used for RLP encoding.
+    /// Dedicated scratch for flattening non-retained branch children into [`RlpNode`]s.
+    child_rlp_scratch: ProofTrieBranchChildRlpScratch,
+    /// Re-usable byte buffer for non-child proof encoding work.
     rlp_encode_buf: Vec<u8>,
     /// Prefix set for tracking changed keys.
     prefix_set: PrefixSet,
@@ -103,6 +105,10 @@ impl<TC, HC, VE: LeafValueEncoder> ProofCalculator<TC, HC, VE> {
             cached_branch_stack: Vec::<_>::with_capacity(64),
             retained_proofs: Vec::<_>::with_capacity(32),
             rlp_nodes_bufs: Vec::<_>::with_capacity(8),
+            child_rlp_scratch: ProofTrieBranchChildRlpScratch::with_capacity(
+                RLP_ENCODE_BUF_SIZE,
+                16,
+            ),
             rlp_encode_buf: Vec::<_>::with_capacity(RLP_ENCODE_BUF_SIZE),
             prefix_set: PrefixSet::default(),
         }
@@ -132,6 +138,10 @@ where
     ///
     /// The returned Vec will have a length of zero.
     fn take_rlp_nodes_buf(&mut self) -> Vec<RlpNode> {
+        if let Some(buf) = self.child_rlp_scratch.take_rlp_nodes() {
+            return buf
+        }
+
         self.rlp_nodes_bufs
             .pop()
             .map(|mut buf| {
@@ -302,8 +312,7 @@ where
         // If the child path is not being retained then we convert directly to an `RlpNode`
         // using `into_rlp`. Since we are not retaining the node we can recover any `RlpNode`
         // buffers for the free-list here, hence why we do this as a separate logical branch.
-        self.rlp_encode_buf.clear();
-        let (child_rlp_node, freed_rlp_nodes_buf) = child.into_rlp(&mut self.rlp_encode_buf)?;
+        let (child_rlp_node, freed_rlp_nodes_buf) = child.into_rlp(&mut self.child_rlp_scratch)?;
 
         // If there is an `RlpNode` buffer which can be re-used then push it onto the free-list.
         if let Some(buf) = freed_rlp_nodes_buf {
@@ -543,9 +552,8 @@ where
                 ProofTrieBranchChild::RlpNode(rlp_node) => rlp_node,
                 uncommitted_child => {
                     // Convert uncommitted child (not retained for proof) to RlpNode now.
-                    self.rlp_encode_buf.clear();
                     let (rlp_node, freed_buf) =
-                        uncommitted_child.into_rlp(&mut self.rlp_encode_buf)?;
+                        uncommitted_child.into_rlp(&mut self.child_rlp_scratch)?;
                     if let Some(buf) = freed_buf {
                         self.rlp_nodes_bufs.push(buf);
                     }
