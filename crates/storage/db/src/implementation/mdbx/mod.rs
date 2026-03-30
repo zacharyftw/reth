@@ -142,7 +142,7 @@ impl DatabaseArguments {
             max_read_transaction_duration: None,
             exclusive: None,
             max_readers: None,
-            sync_mode: SyncMode::Durable,
+            sync_mode: SyncMode::NoMetaSync,
         }
     }
 
