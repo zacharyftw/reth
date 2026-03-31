@@ -14,7 +14,7 @@ use core::{
 use futures::{future::Either, FutureExt, TryFutureExt};
 use reth_errors::RethResult;
 use reth_payload_builder_primitives::PayloadBuilderError;
-use reth_payload_primitives::{EngineApiMessageVersion, PayloadTypes};
+use reth_payload_primitives::PayloadTypes;
 use std::time::Duration;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
@@ -149,12 +149,41 @@ pub struct NewPayloadTimings {
     /// Server-side execution latency.
     pub latency: Duration,
     /// Time spent waiting for persistence to complete.
-    /// `None` when no persistence was in-flight.
+    ///
+    /// `None` when wasn't asked to wait for persistence.
     pub persistence_wait: Option<Duration>,
     /// Time spent waiting for the execution cache lock.
-    pub execution_cache_wait: Duration,
-    /// Time spent waiting for the sparse trie lock.
-    pub sparse_trie_wait: Duration,
+    ///
+    /// `None` when wasn't asked to wait for execution cache.
+    pub execution_cache_wait: Option<Duration>,
+    /// Time spent waiting for the sparse trie cache lock.
+    ///
+    /// `None` when wasn't asked to wait for sparse trie cache.
+    pub sparse_trie_wait: Option<Duration>,
+}
+
+/// Additional data for big block payloads that merge multiple real blocks.
+///
+/// This is used by the `reth_newPayload` endpoint to pass environment switches
+/// and prior block hashes needed for correct multi-segment execution.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BigBlockData<ExecutionData> {
+    /// Environment switches at block boundaries.
+    /// Each entry is `(cumulative_tx_count, execution_data_of_next_block)`.
+    ///
+    /// The first entry at index 0 represents the **original unmutated** base block's
+    /// `ExecutionData`, which must be used to derive the initial EVM environment.
+    pub env_switches: Vec<(usize, ExecutionData)>,
+    /// Block number → real block hash for blocks covered by previous big blocks in a sequence.
+    /// When replaying chained big blocks, the BLOCKHASH opcode needs real hashes for blocks
+    /// that were merged into earlier big blocks (and thus not individually persisted).
+    pub prior_block_hashes: Vec<(u64, alloy_primitives::B256)>,
+}
+
+impl<T> Default for BigBlockData<T> {
+    fn default() -> Self {
+        Self { env_switches: Vec::new(), prior_block_hashes: Vec::new() }
+    }
 }
 
 /// A message for the beacon engine from other components of the node (engine RPC API invoked by the
@@ -170,11 +199,17 @@ pub enum BeaconEngineMessage<Payload: PayloadTypes> {
     },
     /// Message with new payload used by `reth_newPayload` endpoint.
     ///
-    /// Waits for persistence, execution cache, and sparse trie locks before processing,
-    /// and returns detailed timing breakdown alongside the payload status.
+    /// Supports independent control over waiting for persistence and cache locks before
+    /// processing, providing unbiased timing measurements when enabled.
+    ///
+    /// Returns detailed timing breakdown alongside the payload status.
     RethNewPayload {
         /// The execution payload received by Engine API.
         payload: Payload::ExecutionData,
+        /// Whether to wait for in-flight persistence to complete before processing.
+        wait_for_persistence: bool,
+        /// Whether to wait for execution cache and sparse trie locks before processing.
+        wait_for_caches: bool,
         /// The sender for returning payload status result and timing breakdown.
         tx: oneshot::Sender<Result<(PayloadStatus, NewPayloadTimings), BeaconOnNewPayloadError>>,
     },
@@ -184,8 +219,6 @@ pub enum BeaconEngineMessage<Payload: PayloadTypes> {
         state: ForkchoiceState,
         /// The payload attributes for block building.
         payload_attrs: Option<Payload::PayloadAttributes>,
-        /// The Engine API Version.
-        version: EngineApiMessageVersion,
         /// The sender for returning forkchoice updated result.
         tx: oneshot::Sender<RethResult<OnForkChoiceUpdated>>,
     },
@@ -259,14 +292,23 @@ where
 
     /// Sends a new payload message used by `reth_newPayload` endpoint.
     ///
-    /// Waits for persistence, execution cache, and sparse trie locks before processing,
-    /// and returns detailed timing breakdown alongside the payload status.
+    /// `wait_for_persistence`: waits for in-flight persistence to complete.
+    /// `wait_for_caches`: waits for execution cache and sparse trie locks.
+    ///
+    /// Returns detailed timing breakdown alongside the payload status.
     pub async fn reth_new_payload(
         &self,
         payload: Payload::ExecutionData,
+        wait_for_persistence: bool,
+        wait_for_caches: bool,
     ) -> Result<(PayloadStatus, NewPayloadTimings), BeaconOnNewPayloadError> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.to_engine.send(BeaconEngineMessage::RethNewPayload { payload, tx });
+        let _ = self.to_engine.send(BeaconEngineMessage::RethNewPayload {
+            payload,
+            wait_for_persistence,
+            wait_for_caches,
+            tx,
+        });
         rx.await.map_err(|_| BeaconOnNewPayloadError::EngineUnavailable)?
     }
 
@@ -277,10 +319,9 @@ where
         &self,
         state: ForkchoiceState,
         payload_attrs: Option<Payload::PayloadAttributes>,
-        version: EngineApiMessageVersion,
     ) -> Result<ForkchoiceUpdated, BeaconForkChoiceUpdateError> {
         Ok(self
-            .send_fork_choice_updated(state, payload_attrs, version)
+            .send_fork_choice_updated(state, payload_attrs)
             .map_err(|_| BeaconForkChoiceUpdateError::EngineUnavailable)
             .await?
             .map_err(BeaconForkChoiceUpdateError::internal)?
@@ -293,14 +334,12 @@ where
         &self,
         state: ForkchoiceState,
         payload_attrs: Option<Payload::PayloadAttributes>,
-        version: EngineApiMessageVersion,
     ) -> oneshot::Receiver<RethResult<OnForkChoiceUpdated>> {
         let (tx, rx) = oneshot::channel();
         let _ = self.to_engine.send(BeaconEngineMessage::ForkchoiceUpdated {
             state,
             payload_attrs,
             tx,
-            version,
         });
         rx
     }

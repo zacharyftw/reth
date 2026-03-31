@@ -18,7 +18,11 @@ set -euo pipefail
 LABEL="$1"
 BINARY="$2"
 OUTPUT_DIR="$3"
-DATADIR="$SCHELK_MOUNT/datadir"
+DATADIR_NAME="datadir"
+if [ "${BENCH_BIG_BLOCKS:-false}" = "true" ]; then
+  DATADIR_NAME="datadir-big-blocks"
+fi
+DATADIR="$SCHELK_MOUNT/$DATADIR_NAME"
 mkdir -p "$OUTPUT_DIR"
 LOG="${OUTPUT_DIR}/node.log"
 
@@ -120,9 +124,12 @@ RETH_ARGS=(
   --no-persist-peers
 )
 
-# Big blocks mode requires the testing API and skip-invalid-transactions
-if [ "$BIG_BLOCKS" = "true" ]; then
-  RETH_ARGS+=(--http.api eth,net,web3,reth,testing --testing.skip-invalid-transactions)
+# Gate flag on binary support (older baselines may not have it).
+# Uses --help which exits immediately via clap without node init.
+SYNC_STATE_IDLE=false
+if "$BINARY" node --help 2>/dev/null | grep -qF -- '--debug.startup-sync-state-idle'; then
+  RETH_ARGS+=(--debug.startup-sync-state-idle)
+  SYNC_STATE_IDLE=true
 fi
 
 # Append per-label extra node args (baseline or feature)
@@ -194,7 +201,7 @@ for i in $(seq 1 60); do
     -H 'Content-Type: application/json' \
     -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
     > /dev/null 2>&1; then
-    echo "reth (${LABEL}) is ready after ${i}s"
+    echo "reth (${LABEL}) RPC is up after ${i}s"
     break
   fi
   if [ "$i" -eq 60 ]; then
@@ -205,6 +212,29 @@ for i in $(seq 1 60); do
   sleep 1
 done
 
+# Wait for the pipeline to finish (eth_syncing returns false) so the
+# engine is in live mode and can accept newPayload calls.
+# Only possible when --debug.startup-sync-state-idle is supported.
+if [ "$SYNC_STATE_IDLE" = "true" ]; then
+  for i in $(seq 1 300); do
+    SYNC_RESULT=$(curl -sf http://127.0.0.1:8545 -X POST \
+      -H 'Content-Type: application/json' \
+      -d '{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}' 2>/dev/null || true)
+    if [ -n "$SYNC_RESULT" ] && jq -e '.result == false' <<< "$SYNC_RESULT" > /dev/null 2>&1; then
+      echo "reth (${LABEL}) pipeline finished after ${i}s, engine is live"
+      break
+    fi
+    if [ "$i" -eq 300 ]; then
+      echo "::error::reth (${LABEL}) pipeline did not finish within 300s"
+      cat "$LOG"
+      exit 1
+    fi
+    sleep 1
+  done
+else
+  echo "reth (${LABEL}) binary does not support --debug.startup-sync-state-idle, skipping sync wait"
+fi
+
 # Run reth-bench with high priority but as the current user so output
 # files are not root-owned (avoids EACCES on next checkout).
 BENCH_NICE="sudo nice -n -20 sudo -u $(id -un)"
@@ -212,19 +242,15 @@ BENCH_NICE="sudo nice -n -20 sudo -u $(id -un)"
 # Build optional flags
 EXTRA_BENCH_ARGS=()
 if [ "${BENCH_RETH_NEW_PAYLOAD:-true}" != "false" ]; then
-  EXTRA_BENCH_ARGS+=(--reth-new-payload)
+  EXTRA_BENCH_ARGS+=(--reth-new-payload --wait-for-persistence)
 fi
 if [ -n "${BENCH_WAIT_TIME:-}" ]; then
   EXTRA_BENCH_ARGS+=(--wait-time "$BENCH_WAIT_TIME")
 fi
 
 if [ "$BIG_BLOCKS" = "true" ]; then
-  # Big blocks mode: replay pre-generated payloads with gas ramp
-  BIG_BLOCKS_DIR="${BENCH_WORK_DIR}/big-blocks"
-  # Count gas ramp blocks for reporting
-  GAS_RAMP_COUNT=$(find "$BIG_BLOCKS_DIR/gas-ramp-dir" -name '*.json' | wc -l)
-  echo "$GAS_RAMP_COUNT" > "$OUTPUT_DIR/gas_ramp_blocks.txt"
-  echo "Gas ramp blocks: $GAS_RAMP_COUNT"
+  # Big blocks mode: replay pre-generated payloads
+  BIG_BLOCKS_DIR="${BENCH_BIG_BLOCKS_DIR:-${BENCH_WORK_DIR}/big-blocks}"
 
   # Start tracy-capture so profile only covers the benchmark
   if [ "${BENCH_TRACY:-off}" != "off" ]; then
@@ -234,10 +260,18 @@ if [ "$BIG_BLOCKS" = "true" ]; then
     sleep 0.5  # give tracy-capture time to connect
   fi
 
+  BB_BENCH_ARGS=(--reth-new-payload --wait-for-persistence)
+  if [ -n "${BENCH_WAIT_TIME:-}" ]; then
+    BB_BENCH_ARGS+=(--wait-time "$BENCH_WAIT_TIME")
+  fi
+  # Limit number of payloads if blocks count is specified
+  if [ "${BENCH_BLOCKS:-0}" -gt 0 ] 2>/dev/null; then
+    BB_BENCH_ARGS+=(--count "$BENCH_BLOCKS")
+  fi
+
   echo "Running big blocks benchmark (replay-payloads)..."
   $BENCH_NICE "$RETH_BENCH" replay-payloads \
-    "${EXTRA_BENCH_ARGS[@]}" \
-    --gas-ramp-dir "$BIG_BLOCKS_DIR/gas-ramp-dir" \
+    "${BB_BENCH_ARGS[@]}" \
     --payload-dir "$BIG_BLOCKS_DIR/payloads" \
     --engine-rpc-url http://127.0.0.1:8551 \
     --jwt-secret "$DATADIR/jwt.hex" \

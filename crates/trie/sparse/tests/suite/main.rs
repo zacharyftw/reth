@@ -238,6 +238,7 @@ sparse_trie_tests! {
     test_reveal_nodes_with_branch_masks,
     test_reveal_nodes_skips_on_empty_root,
     test_reveal_nodes_filters_unreachable_boundary_leaves,
+    test_reveal_boundary_node_with_missing_upper_parent_branch,
     test_reveal_insert_reveal_preserves_branch_state,
     test_remove_then_reveal_does_not_overwrite_collapsed_node,
     test_insert_then_reveal_does_not_overwrite_branch,
@@ -271,6 +272,7 @@ sparse_trie_tests! {
     test_branch_collapse_updates_leaf_key_len_across_subtries,
     test_remove_leaf_does_not_reveal_blind_subtries,
     test_branch_collapse_multi_empty_subtries_blinded_remaining,
+    test_subtrie_collapse_touched_with_blinded_sibling,
     test_subtrie_emptied_by_deletes_with_touched,
 
     // root

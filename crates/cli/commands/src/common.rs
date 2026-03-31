@@ -75,10 +75,15 @@ pub struct EnvironmentArgs<C: ChainSpecParser> {
 impl<C: ChainSpecParser> EnvironmentArgs<C> {
     /// Returns the storage settings for new database initialization.
     ///
-    /// Always returns [`StorageSettings::v2()`] — v2 is the default for all new
-    /// databases. Existing databases use the settings persisted in their metadata.
+    /// Determined by the `--storage.v2` flag (defaults to `true`).
+    /// Existing databases retain whatever settings are persisted in their
+    /// metadata (checked during genesis init).
     pub fn storage_settings(&self) -> StorageSettings {
-        StorageSettings::v2()
+        if self.storage.v2 {
+            StorageSettings::v2()
+        } else {
+            StorageSettings::v1()
+        }
     }
 
     /// Initializes environment according to [`AccessRights`] and returns an instance of
@@ -187,7 +192,6 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
     where
         C: ChainSpecParser<ChainSpec = N::ChainSpec>,
     {
-        let prune_modes = config.prune.segments.clone();
         let factory = ProviderFactory::<NodeTypesWithDBAdapter<N, DatabaseEnv>>::new(
             db,
             self.chain.clone(),
@@ -195,7 +199,8 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
             rocksdb_provider,
             runtime,
         )?
-        .with_prune_modes(prune_modes.clone());
+        .with_prune_modes(config.prune.segments.clone())
+        .with_minimum_pruning_distance(config.prune.minimum_pruning_distance);
 
         // Check for consistency between database and static files.
         if !access.is_read_only_inconsistent() &&
@@ -229,10 +234,13 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
                     NoopBodiesDownloader::default(),
                     NoopEvmConfig::<N::Evm>::default(),
                     config.stages.clone(),
-                    prune_modes.clone(),
+                    config.prune.segments.clone(),
                     None,
                 ))
-                .build(factory.clone(), StaticFileProducer::new(factory.clone(), prune_modes));
+                .build(
+                    factory.clone(),
+                    StaticFileProducer::new(factory.clone(), config.prune.segments.clone()),
+                );
 
             // Move all applicable data from database to static files.
             pipeline.move_to_static_files()?;
