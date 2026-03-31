@@ -239,7 +239,13 @@ impl<N: ProviderNodeTypes<DB = DatabaseEnv>> ProviderFactory<N> {
 }
 
 impl<N: ProviderNodeTypes> ProviderFactory<N> {
-    fn provider_read_view(
+    /// Opens a read-only MDBX transaction and, for `storage_v2`, pins a matching RocksDB
+    /// snapshot.
+    ///
+    /// The helper retries if an MDBX write commit lands between opening the read transaction and
+    /// taking the RocksDB snapshot. This keeps both stores aligned for historical reads that span
+    /// MDBX state and RocksDB history indices.
+    fn read_tx_and_rocksdb_snapshot(
         &self,
     ) -> ProviderResult<(<N::DB as Database>::TX, Option<RocksReadSnapshot>)> {
         if !self.cached_storage_settings().storage_v2 {
@@ -270,7 +276,7 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
     /// data.
     #[track_caller]
     pub fn provider(&self) -> ProviderResult<DatabaseProviderRO<N::DB, N>> {
-        let (tx, pinned_rocksdb_snapshot) = self.provider_read_view()?;
+        let (tx, pinned_rocksdb_snapshot) = self.read_tx_and_rocksdb_snapshot()?;
 
         let mut provider = DatabaseProvider::new(
             tx,

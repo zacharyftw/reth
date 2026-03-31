@@ -34,17 +34,34 @@ pub trait RocksDBProviderFactory {
     /// Unlike a transaction-based approach, this works in both read-only and read-write
     /// modes since the snapshot provides a consistent view of the data at the time it
     /// was created.
+    fn with_existing_or_new_rocksdb_snapshot<F, R>(
+        &self,
+        snapshot: RocksDBRefArg<'_>,
+        f: F,
+    ) -> ProviderResult<R>
+    where
+        Self: StorageSettingsCache,
+        F: for<'a> FnOnce(RocksDBRefArg<'a>) -> ProviderResult<R>,
+    {
+        if self.cached_storage_settings().storage_v2 {
+            if let Some(snapshot) = snapshot {
+                return f(Some(snapshot));
+            }
+
+            let rocksdb = self.rocksdb_provider();
+            let snapshot = rocksdb.snapshot();
+            return f(Some(&snapshot));
+        }
+        f(None)
+    }
+
+    /// Executes a closure with a `RocksDB` point-in-time snapshot for consistent reads.
     fn with_rocksdb_snapshot<F, R>(&self, f: F) -> ProviderResult<R>
     where
         Self: StorageSettingsCache,
-        F: FnOnce(RocksDBRefArg) -> ProviderResult<R>,
+        F: for<'a> FnOnce(RocksDBRefArg<'a>) -> ProviderResult<R>,
     {
-        if self.cached_storage_settings().storage_v2 {
-            let rocksdb = self.rocksdb_provider();
-            let snapshot = rocksdb.snapshot();
-            return f(Some(snapshot));
-        }
-        f(None)
+        self.with_existing_or_new_rocksdb_snapshot(None, f)
     }
 
     /// Executes a closure with a `RocksDB` batch, automatically registering it for commit.

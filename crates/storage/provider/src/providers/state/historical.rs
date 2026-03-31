@@ -9,10 +9,9 @@ use reth_db_api::{
     cursor::{DbCursorRO, DbDupCursorRO},
     table::Table,
     tables,
-    transaction::{CursorTy, DbTx},
+    transaction::DbTx,
     BlockNumberList,
 };
-use reth_node_types::NodePrimitives;
 use reth_primitives_traits::{Account, Bytecode};
 use reth_storage_api::{
     BlockNumReader, BytecodeReader, DBProvider, NodePrimitivesProvider, StateProofProvider,
@@ -110,71 +109,6 @@ impl HistoryInfo {
     }
 }
 
-type AccountHistoryReader<'a, Provider> = HistoryLookupReader<
-    'a,
-    CursorTy<<Provider as DBProvider>::Tx, tables::AccountsHistory>,
-    <Provider as NodePrimitivesProvider>::Primitives,
->;
-type StorageHistoryReader<'a, Provider> = HistoryLookupReader<
-    'a,
-    CursorTy<<Provider as DBProvider>::Tx, tables::StoragesHistory>,
-    <Provider as NodePrimitivesProvider>::Primitives,
->;
-
-enum HistoryLookupReader<'a, CURSOR, N> {
-    Snapshot(&'a RocksReadSnapshot),
-    Either(EitherReader<'a, CURSOR, N>),
-}
-
-impl<CURSOR, N: NodePrimitives> HistoryLookupReader<'_, CURSOR, N>
-where
-    CURSOR: DbCursorRO<tables::AccountsHistory>,
-{
-    fn account_history_info(
-        &mut self,
-        address: Address,
-        block_number: BlockNumber,
-        lowest_available_block_number: Option<BlockNumber>,
-    ) -> ProviderResult<HistoryInfo> {
-        match self {
-            Self::Snapshot(snapshot) => {
-                snapshot.account_history_info(address, block_number, lowest_available_block_number)
-            }
-            Self::Either(reader) => {
-                reader.account_history_info(address, block_number, lowest_available_block_number)
-            }
-        }
-    }
-}
-
-impl<CURSOR, N: NodePrimitives> HistoryLookupReader<'_, CURSOR, N>
-where
-    CURSOR: DbCursorRO<tables::StoragesHistory>,
-{
-    fn storage_history_info(
-        &mut self,
-        address: Address,
-        storage_key: B256,
-        block_number: BlockNumber,
-        lowest_available_block_number: Option<BlockNumber>,
-    ) -> ProviderResult<HistoryInfo> {
-        match self {
-            Self::Snapshot(snapshot) => snapshot.storage_history_info(
-                address,
-                storage_key,
-                block_number,
-                lowest_available_block_number,
-            ),
-            Self::Either(reader) => reader.storage_history_info(
-                address,
-                storage_key,
-                block_number,
-                lowest_available_block_number,
-            ),
-        }
-    }
-}
-
 /// State provider for a given block number which takes a tx reference.
 ///
 /// Historical state provider accesses the state at the start of the provided block number.
@@ -226,34 +160,6 @@ impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + Block
         self
     }
 
-    fn account_history_reader(&self) -> ProviderResult<AccountHistoryReader<'_, Provider>>
-    where
-        Provider: StorageSettingsCache + RocksDBProviderFactory + NodePrimitivesProvider,
-    {
-        if let Some(snapshot) = self.pinned_rocksdb_snapshot {
-            return Ok(HistoryLookupReader::Snapshot(snapshot))
-        }
-
-        self.provider.with_rocksdb_snapshot(|rocksdb_ref| {
-            EitherReader::new_accounts_history(self.provider, rocksdb_ref)
-                .map(HistoryLookupReader::Either)
-        })
-    }
-
-    fn storage_history_reader(&self) -> ProviderResult<StorageHistoryReader<'_, Provider>>
-    where
-        Provider: StorageSettingsCache + RocksDBProviderFactory + NodePrimitivesProvider,
-    {
-        if let Some(snapshot) = self.pinned_rocksdb_snapshot {
-            return Ok(HistoryLookupReader::Snapshot(snapshot))
-        }
-
-        self.provider.with_rocksdb_snapshot(|rocksdb_ref| {
-            EitherReader::new_storages_history(self.provider, rocksdb_ref)
-                .map(HistoryLookupReader::Either)
-        })
-    }
-
     /// Lookup an account in the `AccountsHistory` table using `EitherReader`.
     pub fn account_history_lookup(&self, address: Address) -> ProviderResult<HistoryInfo>
     where
@@ -263,11 +169,16 @@ impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + Block
             return Err(ProviderError::StateAtBlockPruned(self.block_number))
         }
 
-        let mut reader = self.account_history_reader()?;
-        reader.account_history_info(
-            address,
-            self.block_number,
-            self.lowest_available_blocks.account_history_block_number,
+        self.provider.with_existing_or_new_rocksdb_snapshot(
+            self.pinned_rocksdb_snapshot,
+            |rocksdb_ref| {
+                let mut reader = EitherReader::new_accounts_history(self.provider, rocksdb_ref)?;
+                reader.account_history_info(
+                    address,
+                    self.block_number,
+                    self.lowest_available_blocks.account_history_block_number,
+                )
+            },
         )
     }
 
@@ -286,12 +197,17 @@ impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + Block
             return Err(ProviderError::StateAtBlockPruned(self.block_number))
         }
 
-        let mut reader = self.storage_history_reader()?;
-        reader.storage_history_info(
-            address,
-            lookup_key,
-            self.block_number,
-            self.lowest_available_blocks.storage_history_block_number,
+        self.provider.with_existing_or_new_rocksdb_snapshot(
+            self.pinned_rocksdb_snapshot,
+            |rocksdb_ref| {
+                let mut reader = EitherReader::new_storages_history(self.provider, rocksdb_ref)?;
+                reader.storage_history_info(
+                    address,
+                    lookup_key,
+                    self.block_number,
+                    self.lowest_available_blocks.storage_history_block_number,
+                )
+            },
         )
     }
 
