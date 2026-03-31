@@ -1,6 +1,6 @@
 use crate::{
     either_writer::{RawRocksDBBatch, RocksBatchArg, RocksDBRefArg},
-    providers::RocksDBProvider,
+    providers::{RocksDBProvider, RocksReadSnapshot},
 };
 use reth_storage_api::StorageSettingsCache;
 use reth_storage_errors::provider::ProviderResult;
@@ -11,6 +11,14 @@ use reth_storage_errors::provider::ProviderResult;
 pub trait RocksDBProviderFactory {
     /// Returns the `RocksDB` provider.
     fn rocksdb_provider(&self) -> RocksDBProvider;
+
+    /// Returns a pinned `RocksDB` snapshot, if this provider already carries one.
+    ///
+    /// Read-only `storage_v2` providers use this to reuse the snapshot captured alongside the
+    /// MDBX read transaction. Other providers fall back to a fresh snapshot per read.
+    fn pinned_rocksdb_snapshot(&self) -> Option<&RocksReadSnapshot> {
+        None
+    }
 
     /// Adds a pending `RocksDB` batch to be committed when this provider is committed.
     ///
@@ -25,25 +33,22 @@ pub trait RocksDBProviderFactory {
     /// full commit path.
     fn commit_pending_rocksdb_batches(&self) -> ProviderResult<()>;
 
-    /// Executes a closure with either an existing `RocksDB` snapshot or a newly created one.
+    /// Executes a closure with a `RocksDB` point-in-time snapshot for consistent reads.
     ///
-    /// On `storage_v2` nodes this reuses the provided snapshot when one is available, otherwise it
-    /// creates a fresh point-in-time snapshot for the duration of the closure. On legacy MDBX-only
-    /// nodes (where `storage_v2` is false), it skips `RocksDB` access entirely and passes `None`.
+    /// On `storage_v2` nodes this reuses the provider's pinned snapshot when one is available,
+    /// otherwise it creates a fresh point-in-time snapshot for the duration of the closure. On
+    /// legacy MDBX-only nodes (where `storage_v2` is false), it skips `RocksDB` access entirely
+    /// and passes `None`.
     ///
     /// Unlike a transaction-based approach, snapshots work in both read-only and read-write modes
     /// because they provide a consistent view of the database at the moment they were created.
-    fn with_existing_or_new_rocksdb_snapshot<F, R>(
-        &self,
-        snapshot: RocksDBRefArg<'_>,
-        f: F,
-    ) -> ProviderResult<R>
+    fn with_rocksdb_snapshot<F, R>(&self, f: F) -> ProviderResult<R>
     where
         Self: StorageSettingsCache,
         F: for<'a> FnOnce(RocksDBRefArg<'a>) -> ProviderResult<R>,
     {
         if self.cached_storage_settings().storage_v2 {
-            if let Some(snapshot) = snapshot {
+            if let Some(snapshot) = self.pinned_rocksdb_snapshot() {
                 return f(Some(snapshot));
             }
 
@@ -52,15 +57,6 @@ pub trait RocksDBProviderFactory {
             return f(Some(&snapshot));
         }
         f(None)
-    }
-
-    /// Executes a closure with a `RocksDB` point-in-time snapshot for consistent reads.
-    fn with_rocksdb_snapshot<F, R>(&self, f: F) -> ProviderResult<R>
-    where
-        Self: StorageSettingsCache,
-        F: for<'a> FnOnce(RocksDBRefArg<'a>) -> ProviderResult<R>,
-    {
-        self.with_existing_or_new_rocksdb_snapshot(None, f)
     }
 
     /// Executes a closure with a `RocksDB` batch, automatically registering it for commit.
@@ -127,6 +123,7 @@ mod tests {
     struct TestProvider {
         settings: StorageSettings,
         mock_rocksdb: MockRocksDBProvider,
+        pinned_snapshot: Option<RocksReadSnapshot>,
         temp_dir: tempfile::TempDir,
     }
 
@@ -135,7 +132,20 @@ mod tests {
             Self {
                 settings,
                 mock_rocksdb: MockRocksDBProvider::new(),
+                pinned_snapshot: None,
                 temp_dir: tempfile::TempDir::new().unwrap(),
+            }
+        }
+
+        fn with_pinned_snapshot(settings: StorageSettings) -> Self {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let rocksdb = RocksDBProvider::new(temp_dir.path()).unwrap();
+
+            Self {
+                settings,
+                mock_rocksdb: MockRocksDBProvider::new(),
+                pinned_snapshot: Some(rocksdb.snapshot()),
+                temp_dir,
             }
         }
 
@@ -156,6 +166,10 @@ mod tests {
         fn rocksdb_provider(&self) -> RocksDBProvider {
             self.mock_rocksdb.increment_tx_count();
             RocksDBProvider::new(self.temp_dir.path()).unwrap()
+        }
+
+        fn pinned_rocksdb_snapshot(&self) -> Option<&RocksReadSnapshot> {
+            self.pinned_snapshot.as_ref()
         }
 
         fn set_pending_rocksdb_batch(&self, _batch: rocksdb::WriteBatchWithTransaction<true>) {}
@@ -197,6 +211,23 @@ mod tests {
             provider.tx_call_count(),
             1,
             "should create RocksDB provider when storage_v2 is true"
+        );
+    }
+
+    #[test]
+    fn test_rocksdb_settings_reuse_pinned_snapshot() {
+        let provider = TestProvider::with_pinned_snapshot(StorageSettings::v2());
+
+        let result = provider.with_rocksdb_snapshot(|rocksdb| {
+            assert!(rocksdb.is_some(), "rocksdb settings should pass Some snapshot");
+            Ok(42)
+        });
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(
+            provider.tx_call_count(),
+            0,
+            "should reuse the pinned RocksDB snapshot instead of creating a new provider"
         );
     }
 }

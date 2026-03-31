@@ -252,14 +252,6 @@ impl<TX, N: NodeTypes> DatabaseProvider<TX, N> {
         self.pinned_rocksdb_snapshot = Some(snapshot);
         self
     }
-
-    pub(crate) const fn pinned_rocksdb_snapshot(&self) -> Option<&RocksReadSnapshot> {
-        self.pinned_rocksdb_snapshot.as_ref()
-    }
-
-    const fn take_pinned_rocksdb_snapshot(&mut self) -> Option<RocksReadSnapshot> {
-        self.pinned_rocksdb_snapshot.take()
-    }
 }
 
 impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
@@ -291,9 +283,6 @@ impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
             self.get_prune_checkpoint(PruneSegment::StorageHistory)?;
 
         let mut state_provider = HistoricalStateProviderRef::new(self, block_number);
-        if let Some(snapshot) = self.pinned_rocksdb_snapshot() {
-            state_provider = state_provider.with_pinned_rocksdb_snapshot(snapshot);
-        }
 
         // If we pruned account or storage history, we can't return state on every historical block.
         // Instead, we should cap it at the latest prune checkpoint for corresponding prune segment.
@@ -345,6 +334,10 @@ impl<TX, N: NodeTypes> RocksDBProviderFactory for DatabaseProvider<TX, N> {
     /// Returns the `RocksDB` provider.
     fn rocksdb_provider(&self) -> RocksDBProvider {
         self.rocksdb_provider.clone()
+    }
+
+    fn pinned_rocksdb_snapshot(&self) -> Option<&RocksReadSnapshot> {
+        self.pinned_rocksdb_snapshot.as_ref()
     }
 
     fn set_pending_rocksdb_batch(&self, batch: rocksdb::WriteBatchWithTransaction<true>) {
@@ -888,7 +881,7 @@ impl<TX: DbTx + 'static, N: NodeTypes> TryIntoHistoricalStateProvider for Databa
         self,
         mut block_number: BlockNumber,
     ) -> ProviderResult<StateProviderBox> {
-        let mut provider = self;
+        let provider = self;
         let best_block = provider.best_block_number().unwrap_or_default();
 
         // Reject requests for blocks beyond the best block
@@ -912,12 +905,7 @@ impl<TX: DbTx + 'static, N: NodeTypes> TryIntoHistoricalStateProvider for Databa
         let storage_history_prune_checkpoint =
             provider.get_prune_checkpoint(PruneSegment::StorageHistory)?;
 
-        let pinned_rocksdb_snapshot = provider.take_pinned_rocksdb_snapshot();
-
         let mut state_provider = HistoricalStateProvider::new(provider, block_number);
-        if let Some(snapshot) = pinned_rocksdb_snapshot {
-            state_provider = state_provider.with_pinned_rocksdb_snapshot(snapshot);
-        }
 
         // If we pruned account or storage history, we can't return state on every historical block.
         // Instead, we should cap it at the latest prune checkpoint for corresponding prune segment.
