@@ -60,6 +60,20 @@ fn prefix_range(
     begin..end
 }
 
+/// Returns `true` if the fixed-width raw key begins with the given nibble prefix.
+///
+/// Sparse trie leaf keys are always 32-byte hashes, so lexicographic `B256` order matches the
+/// fully unpacked nibble-path order. This lets the hot `update_leaves` path sort and group raw
+/// keys first, and only materialize [`Nibbles`] when a walker actually consumes an item.
+fn key_starts_with_prefix(key: B256, prefix: &Nibbles) -> bool {
+    let key = key.as_slice();
+    prefix.iter().enumerate().all(|(idx, nibble)| {
+        let byte = key[idx / 2];
+        let key_nibble = if idx % 2 == 0 { byte >> 4 } else { byte & 0x0f };
+        key_nibble == nibble
+    })
+}
+
 /// Returns the per-slot byte size used by `SlotMap<_, T>`. `SlotMap` wraps each value in a
 /// `Slot<T>` containing the value union + a 4-byte version field, with struct alignment.
 const fn slotmap_slot_size<T>() -> usize {
@@ -337,7 +351,9 @@ impl ArenaSparseSubtrie {
     /// Applies leaf updates within this subtrie. Uses the same walk-down-with-cursor pattern as
     /// [`Self::reveal_nodes`], but checks accessibility for [`LeafUpdate::Touched`] entries.
     ///
-    /// `sorted_updates` must be sorted lexicographically by their nibbles path (index 1).
+    /// `sorted_updates` must be sorted lexicographically by their raw `B256` key.
+    /// Because trie leaf keys are always 32 bytes wide, this is equivalent to full nibble-path
+    /// ordering while letting the caller defer `Nibbles::unpack` until the update is consumed.
     ///
     /// Any required proofs are appended to `self.required_proofs` and should be drained by the
     /// caller after this method returns.
@@ -350,7 +366,7 @@ impl ArenaSparseSubtrie {
             num_updates = sorted_updates.len(),
         ),
     )]
-    fn update_leaves(&mut self, sorted_updates: &[(B256, Nibbles, LeafUpdate)]) {
+    fn update_leaves(&mut self, sorted_updates: &[(B256, LeafUpdate)]) {
         if sorted_updates.is_empty() {
             return;
         }
@@ -363,8 +379,9 @@ impl ArenaSparseSubtrie {
 
         self.buffers.cursor.reset(&self.arena, self.root, self.path);
 
-        for (idx, &(key, ref full_path, ref update)) in sorted_updates.iter().enumerate() {
-            let find_result = self.buffers.cursor.seek(&mut self.arena, full_path);
+        for (idx, &(key, ref update)) in sorted_updates.iter().enumerate() {
+            let full_path = Nibbles::unpack(key);
+            let find_result = self.buffers.cursor.seek(&mut self.arena, &full_path);
 
             // If the path hits a blinded node, request a proof regardless of update type.
             if matches!(find_result, SeekResult::Blinded) {
@@ -383,7 +400,7 @@ impl ArenaSparseSubtrie {
                         &mut self.arena,
                         &mut self.buffers.cursor,
                         &mut self.root,
-                        full_path,
+                        &full_path,
                         value,
                         find_result,
                     );
@@ -397,7 +414,7 @@ impl ArenaSparseSubtrie {
                         &mut self.buffers.cursor,
                         &mut self.root,
                         key,
-                        full_path,
+                        &full_path,
                         find_result,
                         &mut self.buffers.updates,
                     );
@@ -1780,11 +1797,11 @@ impl ArenaParallelSparseTrie {
     fn check_subtrie_collapse_needs_proof(
         arena: &NodeArena,
         cursor: &ArenaCursor,
-        subtrie_updates: &[(B256, Nibbles, LeafUpdate)],
+        subtrie_updates: &[(B256, LeafUpdate)],
     ) -> Option<ArenaRequiredProof> {
         let num_removals = subtrie_updates
             .iter()
-            .filter(|(_, _, u)| matches!(u, LeafUpdate::Changed(v) if v.is_empty()))
+            .filter(|(_, u)| matches!(u, LeafUpdate::Changed(v) if v.is_empty()))
             .count() as u64;
 
         // Touched is a no-op that doesn't alter trie structure, so it must be
@@ -1795,7 +1812,7 @@ impl ArenaParallelSparseTrie {
         // request for the blinded sibling, and later panic in
         // `maybe_collapse_or_remove_branch` when the subtrie empties inline.
         let num_changed =
-            subtrie_updates.iter().filter(|(_, _, u)| matches!(u, LeafUpdate::Changed(_))).count()
+            subtrie_updates.iter().filter(|(_, u)| matches!(u, LeafUpdate::Changed(_))).count()
                 as u64;
 
         if num_removals == 0 || num_removals != num_changed {
@@ -2821,10 +2838,11 @@ impl SparseTrie for ArenaParallelSparseTrie {
         #[cfg(feature = "trie-debug")]
         let mut recorded_proof_targets: Vec<(B256, u8)> = Vec::new();
 
-        // Drain and sort updates lexicographically by nibbles path.
-        let mut sorted: Vec<_> =
-            updates.drain().map(|(key, update)| (key, Nibbles::unpack(key), update)).collect();
-        sorted.sort_unstable_by_key(|entry| entry.1);
+        // Sort the raw fixed-width keys. For 32-byte trie keys, lexicographic `B256` order is
+        // the same as the unpacked nibble-path order, so we can defer `Nibbles::unpack` until a
+        // walker actually consumes an entry.
+        let mut sorted: Vec<_> = updates.drain().collect();
+        sorted.sort_unstable_by_key(|entry| entry.0);
 
         let threshold = self.parallelism_thresholds.min_updates;
 
@@ -2836,9 +2854,10 @@ impl SparseTrie for ArenaParallelSparseTrie {
 
         let mut update_idx = 0;
         while update_idx < sorted.len() {
-            let (key, ref full_path, ref update) = sorted[update_idx];
+            let (key, ref update) = sorted[update_idx];
+            let full_path = Nibbles::unpack(key);
 
-            let find_result = cursor.seek(&mut self.upper_arena, full_path);
+            let find_result = cursor.seek(&mut self.upper_arena, &full_path);
 
             match find_result {
                 // Blinded — request a proof regardless of update type.
@@ -2859,7 +2878,7 @@ impl SparseTrie for ArenaParallelSparseTrie {
 
                     let subtrie_start = update_idx;
                     while update_idx < sorted.len() &&
-                        sorted[update_idx].1.starts_with(&subtrie_root_path)
+                        key_starts_with_prefix(sorted[update_idx].0, &subtrie_root_path)
                     {
                         update_idx += 1;
                     }
@@ -2878,7 +2897,7 @@ impl SparseTrie for ArenaParallelSparseTrie {
                         proof_required_fn(proof.key, proof.min_len);
                         #[cfg(feature = "trie-debug")]
                         recorded_proof_targets.push((proof.key, proof.min_len));
-                        for &(key, _, ref update) in subtrie_updates {
+                        for &(key, ref update) in subtrie_updates {
                             updates.insert(key, update.clone());
                         }
                         // Pop the subtrie entry before continuing.
@@ -2895,8 +2914,8 @@ impl SparseTrie for ArenaParallelSparseTrie {
                         // Filter out Touched, as they don't affect the structure of the trie. So an
                         // update set with 2 removals and one Touched could still result in an empty
                         // sub trie.
-                        .filter(|(_, _, u)| matches!(u, LeafUpdate::Changed(_)))
-                        .all(|(_, _, u)| matches!(u, LeafUpdate::Changed(v) if v.is_empty()));
+                        .filter(|(_, u)| matches!(u, LeafUpdate::Changed(_)))
+                        .all(|(_, u)| matches!(u, LeafUpdate::Changed(v) if v.is_empty()));
                     let subtrie_num_leaves = match &self.upper_arena[child_idx] {
                         ArenaSparseNode::Subtrie(s) => s.num_leaves,
                         _ => 0,
@@ -2928,7 +2947,7 @@ impl SparseTrie for ArenaParallelSparseTrie {
                             proof_required_fn(proof.key, proof.min_len);
                             #[cfg(feature = "trie-debug")]
                             recorded_proof_targets.push((proof.key, proof.min_len));
-                            let (key, _, ref update) = subtrie_updates[target_idx];
+                            let (key, ref update) = subtrie_updates[target_idx];
                             updates.insert(key, update.clone());
                         }
 
@@ -2949,7 +2968,7 @@ impl SparseTrie for ArenaParallelSparseTrie {
                             &mut self.upper_arena,
                             &mut cursor,
                             &mut self.root,
-                            full_path,
+                            &full_path,
                             v,
                             find_result,
                         );
@@ -2981,7 +3000,7 @@ impl SparseTrie for ArenaParallelSparseTrie {
                             &mut cursor,
                             &mut self.root,
                             key,
-                            full_path,
+                            &full_path,
                             find_result,
                             &mut self.buffers.updates,
                         );
@@ -2991,7 +3010,7 @@ impl SparseTrie for ArenaParallelSparseTrie {
                                 #[cfg(feature = "trie-debug")]
                                 recorded_proof_targets.push((proof_key, min_len));
                                 let update =
-                                    mem::replace(&mut sorted[update_idx].2, LeafUpdate::Touched);
+                                    mem::replace(&mut sorted[update_idx].1, LeafUpdate::Touched);
                                 updates.insert(key, update);
                             }
                             RemoveLeafResult::Removed => {
@@ -3056,7 +3075,7 @@ impl SparseTrie for ArenaParallelSparseTrie {
                 proof_required_fn(proof.key, proof.min_len);
                 #[cfg(feature = "trie-debug")]
                 recorded_proof_targets.push((proof.key, proof.min_len));
-                let (key, _, ref update) = subtrie_updates[target_idx];
+                let (key, ref update) = subtrie_updates[target_idx];
                 updates.insert(key, update.clone());
             }
 
