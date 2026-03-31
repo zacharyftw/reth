@@ -20,11 +20,7 @@ use reth_provider::{
 use reth_stages_api::StageError;
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{ChangeSetReader, StorageChangeSetReader};
-use std::{
-    collections::HashMap,
-    hash::Hash,
-    ops::{Range, RangeBounds},
-};
+use std::{collections::HashMap, hash::Hash, ops::RangeBounds};
 use tracing::info;
 
 /// Number of blocks before pushing indices from cache to [`Collector`]
@@ -117,49 +113,6 @@ where
     Ok(())
 }
 
-/// Progress logger for a requested block range.
-struct BlockRangeProgress {
-    start_block: BlockNumber,
-    total_blocks: u64,
-    progress_interval: u64,
-    next_progress_block: BlockNumber,
-}
-
-impl BlockRangeProgress {
-    fn new(range: &Range<BlockNumber>) -> Option<Self> {
-        let start_block = range.start;
-        let total_blocks = range.end.saturating_sub(start_block);
-
-        // Static-file history collection only needs the requested block range. Using block-range
-        // progress avoids scanning every `.csoff` record just to format percentage logs.
-        (total_blocks > 1000).then_some(Self {
-            start_block,
-            total_blocks,
-            progress_interval: (total_blocks / 1000).max(1),
-            next_progress_block: start_block.saturating_add((total_blocks / 1000).max(1)),
-        })
-    }
-
-    fn maybe_log(&mut self, block_number: BlockNumber) {
-        if block_number < self.next_progress_block {
-            return;
-        }
-
-        let progressed_blocks = block_number.saturating_sub(self.start_block).saturating_add(1);
-        info!(
-            target: "sync::stages::index_history",
-            progress = %format!("{:.4}%", (progressed_blocks as f64 / self.total_blocks as f64) * 100.0),
-            "Collecting indices"
-        );
-
-        let next_interval = progressed_blocks
-            .saturating_div(self.progress_interval)
-            .saturating_add(1)
-            .saturating_mul(self.progress_interval);
-        self.next_progress_block = self.start_block.saturating_add(next_interval);
-    }
-}
-
 /// Collects account history indices using a provider that implements `ChangeSetReader`.
 pub(crate) fn collect_account_history_indices<Provider>(
     provider: &Provider,
@@ -184,7 +137,11 @@ where
 
     // Use the new walker for lazy iteration over static file changesets
     let static_file_provider = provider.static_file_provider();
-    let mut progress = BlockRangeProgress::new(&range);
+    let start_block = range.start;
+    let total_blocks = range.end.saturating_sub(start_block);
+    let progress_interval = (total_blocks / 1000).max(1);
+    let mut next_progress_block =
+        (total_blocks > 1000).then_some(start_block.saturating_add(progress_interval));
     let walker = static_file_provider.walk_account_changeset_range(range);
 
     let mut flush_counter = 0;
@@ -197,8 +154,21 @@ where
         if block_number != current_block_number {
             current_block_number = block_number;
             flush_counter += 1;
-            if let Some(progress) = progress.as_mut() {
-                progress.maybe_log(block_number);
+            if let Some(next_block) = next_progress_block &&
+                block_number >= next_block
+            {
+                let progressed_blocks = block_number.saturating_sub(start_block).saturating_add(1);
+                info!(
+                    target: "sync::stages::index_history",
+                    progress = %format!("{:.4}%", (progressed_blocks as f64 / total_blocks as f64) * 100.0),
+                    "Collecting indices"
+                );
+
+                let next_interval = progressed_blocks
+                    .saturating_div(progress_interval)
+                    .saturating_add(1)
+                    .saturating_mul(progress_interval);
+                next_progress_block = Some(start_block.saturating_add(next_interval));
             }
         }
 
@@ -235,7 +205,11 @@ where
 
     let range = to_range(range);
     let static_file_provider = provider.static_file_provider();
-    let mut progress = BlockRangeProgress::new(&range);
+    let start_block = range.start;
+    let total_blocks = range.end.saturating_sub(start_block);
+    let progress_interval = (total_blocks / 1000).max(1);
+    let mut next_progress_block =
+        (total_blocks > 1000).then_some(start_block.saturating_add(progress_interval));
     let walker = static_file_provider.walk_storage_changeset_range(range);
 
     let mut flush_counter = 0;
@@ -248,8 +222,21 @@ where
         if block_number != current_block_number {
             current_block_number = block_number;
             flush_counter += 1;
-            if let Some(progress) = progress.as_mut() {
-                progress.maybe_log(block_number);
+            if let Some(next_block) = next_progress_block &&
+                block_number >= next_block
+            {
+                let progressed_blocks = block_number.saturating_sub(start_block).saturating_add(1);
+                info!(
+                    target: "sync::stages::index_history",
+                    progress = %format!("{:.4}%", (progressed_blocks as f64 / total_blocks as f64) * 100.0),
+                    "Collecting indices"
+                );
+
+                let next_interval = progressed_blocks
+                    .saturating_div(progress_interval)
+                    .saturating_add(1)
+                    .saturating_mul(progress_interval);
+                next_progress_block = Some(start_block.saturating_add(next_interval));
             }
         }
 
