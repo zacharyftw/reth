@@ -881,8 +881,7 @@ impl<TX: DbTx + 'static, N: NodeTypes> TryIntoHistoricalStateProvider for Databa
         self,
         mut block_number: BlockNumber,
     ) -> ProviderResult<StateProviderBox> {
-        let provider = self;
-        let best_block = provider.best_block_number().unwrap_or_default();
+        let best_block = self.best_block_number().unwrap_or_default();
 
         // Reject requests for blocks beyond the best block
         if block_number > best_block {
@@ -894,18 +893,18 @@ impl<TX: DbTx + 'static, N: NodeTypes> TryIntoHistoricalStateProvider for Databa
 
         // If requesting state at the best block, use the latest state provider
         if block_number == best_block {
-            return Ok(Box::new(LatestStateProvider::new(provider)));
+            return Ok(Box::new(LatestStateProvider::new(self)));
         }
 
         // +1 as the changeset that we want is the one that was applied after this block.
         block_number += 1;
 
         let account_history_prune_checkpoint =
-            provider.get_prune_checkpoint(PruneSegment::AccountHistory)?;
+            self.get_prune_checkpoint(PruneSegment::AccountHistory)?;
         let storage_history_prune_checkpoint =
-            provider.get_prune_checkpoint(PruneSegment::StorageHistory)?;
+            self.get_prune_checkpoint(PruneSegment::StorageHistory)?;
 
-        let mut state_provider = HistoricalStateProvider::new(provider, block_number);
+        let mut state_provider = HistoricalStateProvider::new(self, block_number);
 
         // If we pruned account or storage history, we can't return state on every historical block.
         // Instead, we should cap it at the latest prune checkpoint for corresponding prune segment.
