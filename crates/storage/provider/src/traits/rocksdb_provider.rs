@@ -25,15 +25,14 @@ pub trait RocksDBProviderFactory {
     /// full commit path.
     fn commit_pending_rocksdb_batches(&self) -> ProviderResult<()>;
 
-    /// Executes a closure with a `RocksDB` point-in-time snapshot for consistent reads.
+    /// Executes a closure with either an existing `RocksDB` snapshot or a newly created one.
     ///
-    /// This helper encapsulates `RocksDB` access for read operations.
-    /// On legacy MDBX-only nodes (where `storage_v2` is false), this skips creating
-    /// the `RocksDB` snapshot entirely, avoiding unnecessary overhead.
+    /// On `storage_v2` nodes this reuses the provided snapshot when one is available, otherwise it
+    /// creates a fresh point-in-time snapshot for the duration of the closure. On legacy MDBX-only
+    /// nodes (where `storage_v2` is false), it skips `RocksDB` access entirely and passes `None`.
     ///
-    /// Unlike a transaction-based approach, this works in both read-only and read-write
-    /// modes since the snapshot provides a consistent view of the data at the time it
-    /// was created.
+    /// Unlike a transaction-based approach, snapshots work in both read-only and read-write modes
+    /// because they provide a consistent view of the database at the moment they were created.
     fn with_existing_or_new_rocksdb_snapshot<F, R>(
         &self,
         snapshot: RocksDBRefArg<'_>,
