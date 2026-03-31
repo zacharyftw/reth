@@ -2512,11 +2512,12 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
                     .with_extension("csoff");
                 if csoff_path.exists() {
                     let len = header.changeset_offsets_len();
-                    let mut reader = ChangesetOffsetReader::new(&csoff_path, len)
-                        .map_err(ProviderError::other)?;
-                    let offsets = reader.get_range(0, len).map_err(ProviderError::other)?;
-                    for offset in offsets {
-                        count += offset.num_changes() as usize;
+                    if len > 0 {
+                        let mut reader = ChangesetOffsetReader::new(&csoff_path, len)
+                            .map_err(ProviderError::other)?;
+                        if let Some(offset) = reader.get(len - 1).map_err(ProviderError::other)? {
+                            count += (offset.offset() + offset.num_changes()) as usize;
+                        }
                     }
                 }
             }
@@ -2638,11 +2639,12 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
                     .with_extension("csoff");
                 if csoff_path.exists() {
                     let len = header.changeset_offsets_len();
-                    let mut reader = ChangesetOffsetReader::new(&csoff_path, len)
-                        .map_err(ProviderError::other)?;
-                    let offsets = reader.get_range(0, len).map_err(ProviderError::other)?;
-                    for offset in offsets {
-                        count += offset.num_changes() as usize;
+                    if len > 0 {
+                        let mut reader = ChangesetOffsetReader::new(&csoff_path, len)
+                            .map_err(ProviderError::other)?;
+                        if let Some(offset) = reader.get(len - 1).map_err(ProviderError::other)? {
+                            count += (offset.offset() + offset.num_changes()) as usize;
+                        }
                     }
                 }
             }

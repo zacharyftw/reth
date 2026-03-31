@@ -761,6 +761,36 @@ mod tests {
     }
 
     #[test]
+    fn test_account_changeset_count() {
+        let (static_dir, _) = create_test_static_files_dir();
+
+        let sf_rw: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir)
+                .with_blocks_per_file(3)
+                .build()
+                .unwrap();
+
+        let changes_per_block = [2usize, 0, 3, 1, 4, 0];
+        let expected_total = changes_per_block.iter().sum::<usize>();
+
+        let mut writer = sf_rw.latest_writer(StaticFileSegment::AccountChangeSets).unwrap();
+        for (block_num, changes) in changes_per_block.into_iter().enumerate() {
+            let changeset = (0..changes)
+                .map(|index| {
+                    let mut address = Address::ZERO;
+                    address.0[0] = block_num as u8;
+                    address.0[1] = index as u8;
+                    AccountBeforeTx { address, info: None }
+                })
+                .collect::<Vec<_>>();
+            writer.append_account_changeset(changeset, block_num as u64).unwrap();
+        }
+        writer.commit().unwrap();
+
+        assert_eq!(sf_rw.account_changeset_count().unwrap(), expected_total);
+    }
+
+    #[test]
     fn test_get_account_before_block() {
         let (static_dir, _) = create_test_static_files_dir();
 
@@ -1104,6 +1134,40 @@ mod tests {
                 assert_eq!(offset.num_changes(), 5, "Block {} should have 5 changes", i);
             }
         }
+    }
+
+    #[test]
+    fn test_storage_changeset_count() {
+        let (static_dir, _) = create_test_static_files_dir();
+
+        let sf_rw: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir)
+                .with_blocks_per_file(3)
+                .build()
+                .unwrap();
+
+        let changes_per_block = [2usize, 0, 3, 1, 4, 0];
+        let expected_total = changes_per_block.iter().sum::<usize>();
+
+        let mut writer = sf_rw.latest_writer(StaticFileSegment::StorageChangeSets).unwrap();
+        for (block_num, changes) in changes_per_block.into_iter().enumerate() {
+            let changeset = (0..changes)
+                .map(|index| {
+                    let mut address = Address::ZERO;
+                    address.0[0] = block_num as u8;
+                    address.0[1] = index as u8;
+                    StorageBeforeTx {
+                        address,
+                        key: B256::with_last_byte(index as u8),
+                        value: U256::from((block_num * 100 + index) as u64),
+                    }
+                })
+                .collect::<Vec<_>>();
+            writer.append_storage_changeset(changeset, block_num as u64).unwrap();
+        }
+        writer.commit().unwrap();
+
+        assert_eq!(sf_rw.storage_changeset_count().unwrap(), expected_total);
     }
 
     #[test]
