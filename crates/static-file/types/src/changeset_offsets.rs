@@ -228,9 +228,7 @@ impl ChangesetOffsetReader {
         self.len == 0
     }
 
-    /// Returns the total number of changeset entries across all blocks in this sidecar.
-    ///
-    /// O(1): reads the last record and returns `offset + num_changes`.
+    /// Returns the total number of changeset entries by reading the last sidecar record.
     pub fn total_changes(&mut self) -> io::Result<u64> {
         if self.len == 0 {
             return Ok(0);
