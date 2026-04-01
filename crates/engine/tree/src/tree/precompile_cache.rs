@@ -9,7 +9,7 @@ use reth_evm::precompiles::{
     DynPrecompile, Precompile, PrecompileInput, PrecompileOutputExt, PrecompileResultExt,
 };
 use reth_primitives_traits::dashmap::DashMap;
-use revm::precompile::PrecompileId;
+use revm::{interpreter::gas::GasTracker, precompile::PrecompileId};
 use revm_primitives::Address;
 use std::{hash::Hash, sync::Arc};
 
@@ -87,8 +87,16 @@ impl<S> CacheEntry<S> {
         self.output.gas.limit() - self.output.gas.remaining()
     }
 
-    fn to_precompile_result(&self) -> PrecompileResultExt {
-        Ok(self.output.clone())
+    /// Construct a result using the cached output bytes and regular gas cost,
+    /// but with the *caller's current* gas limit and reservoir so we don't
+    /// overwrite live state-gas accounting (`reservoir`, `state_gas_spent`).
+    fn to_precompile_result(&self, gas_limit: u64, reservoir: u64) -> PrecompileResultExt {
+        let gas_used = self.regular_gas_used();
+        Ok(PrecompileOutputExt {
+            gas: GasTracker::new(gas_limit, gas_limit - gas_used, reservoir),
+            bytes: self.output.bytes.clone(),
+            reverted: self.output.reverted,
+        })
     }
 }
 
@@ -175,7 +183,7 @@ where
             input.gas >= entry.regular_gas_used()
         {
             self.increment_by_one_precompile_cache_hits();
-            return entry.to_precompile_result();
+            return entry.to_precompile_result(input.gas, input.reservoir);
         }
 
         let calldata = input.data;
@@ -365,5 +373,35 @@ mod tests {
             .into_output()
             .unwrap();
         assert_eq!(result3.as_ref(), b"output_from_precompile_1");
+    }
+
+    /// Cache hits must return the *caller's current* gas_limit and reservoir,
+    /// not the stale values captured during the original (miss) execution.
+    #[test]
+    fn test_cache_hit_preserves_caller_reservoir() {
+        let precompile_gas_cost = 5000u64;
+
+        let cache_entry = CacheEntry {
+            output: PrecompileOutputExt {
+                // Original call had gas_limit=100_000, reservoir=800
+                gas: GasTracker::new(100_000, 100_000 - precompile_gas_cost, 800),
+                bytes: Bytes::copy_from_slice(b"result"),
+                reverted: false,
+            },
+            spec: SpecId::PRAGUE,
+        };
+
+        assert_eq!(cache_entry.regular_gas_used(), precompile_gas_cost);
+
+        // Simulate a cache hit where caller has different gas_limit and reservoir.
+        let caller_gas = 50_000u64;
+        let caller_reservoir = 200u64;
+        let result = cache_entry.to_precompile_result(caller_gas, caller_reservoir).unwrap();
+
+        // The returned GasTracker must reflect the *caller's* values.
+        assert_eq!(result.gas.limit(), caller_gas);
+        assert_eq!(result.gas.remaining(), caller_gas - precompile_gas_cost);
+        assert_eq!(result.gas.reservoir(), caller_reservoir);
+        assert_eq!(result.gas.state_gas_spent(), 0);
     }
 }

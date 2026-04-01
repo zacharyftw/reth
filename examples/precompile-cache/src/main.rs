@@ -5,9 +5,10 @@
 use alloy_evm::{
     eth::EthEvmContext,
     precompiles::{
-        DynPrecompile, Precompile, PrecompileInput, PrecompileResultExt, PrecompilesMap,
+        DynPrecompile, Precompile, PrecompileInput, PrecompileOutputExt, PrecompileResultExt,
+        PrecompilesMap,
     },
-    revm::{handler::EthPrecompiles, precompile::PrecompileId},
+    revm::{handler::EthPrecompiles, interpreter::gas::GasTracker, precompile::PrecompileId},
     Evm, EvmFactory,
 };
 use alloy_genesis::Genesis;
@@ -41,14 +42,26 @@ use reth_tracing::{RethTracer, Tracer};
 use schnellru::{ByLength, LruMap};
 use std::sync::Arc;
 
+/// Cached output of a successful precompile call.
+///
+/// Only the output bytes, regular gas cost, and reverted flag are stored.
+/// The gas tracker is reconstructed on cache hit using the caller's current
+/// gas limit and reservoir to avoid returning stale EIP-8037 state gas values.
+#[derive(Debug, Clone)]
+pub struct CachedOutput {
+    bytes: Bytes,
+    gas_used: u64,
+    reverted: bool,
+}
+
 /// Type alias for the LRU cache used within the [`PrecompileCache`].
-type PrecompileLRUCache = LruMap<(Bytes, u64), PrecompileResultExt>;
+type PrecompileLRUCache = LruMap<Bytes, CachedOutput>;
 
 /// A cache for precompile inputs / outputs.
 ///
-/// This cache works with standard precompiles that take input data and gas limit as parameters.
-/// The cache key is composed of the input bytes and gas limit, and the cached value is the
-/// precompile execution result.
+/// The cache key is the input bytes. On cache hit, a fresh `GasTracker` is built
+/// from the caller's current gas limit and reservoir so that EIP-8037 state gas
+/// accounting is never corrupted by stale cached values.
 #[derive(Debug)]
 pub struct PrecompileCache {
     /// Caches for each precompile input / output.
@@ -86,7 +99,7 @@ impl EvmFactory for MyEvmFactory {
 
         let mut evm = EthEvm::new(evm, false);
 
-        evm.precompiles_mut().map_precompiles(|_, precompile| {
+        evm.precompiles_mut().map_cacheable_precompiles(|_, precompile| {
             WrappedPrecompile::wrap(precompile, new_cache.clone())
         });
 
@@ -136,20 +149,33 @@ impl Precompile for WrappedPrecompile {
 
     fn call(&self, input: PrecompileInput<'_>) -> PrecompileResultExt {
         let mut cache = self.cache.write();
-        let key = (Bytes::copy_from_slice(input.data), input.gas);
+        let key = Bytes::copy_from_slice(input.data);
 
-        // get the result if it exists
-        if let Some(result) = cache.cache.get(&key) {
-            return result.clone()
+        // On cache hit, rebuild the GasTracker from the *caller's current* gas
+        // limit and reservoir so we never return stale EIP-8037 state gas values.
+        if let Some(cached) = cache.cache.get(&key) &&
+            input.gas >= cached.gas_used
+        {
+            return Ok(PrecompileOutputExt {
+                gas: GasTracker::new(input.gas, input.gas - cached.gas_used, input.reservoir),
+                bytes: cached.bytes.clone(),
+                reverted: cached.reverted,
+            });
         }
 
-        // call the precompile if cache miss
-        let output = self.precompile.call(input);
+        // Call the precompile on cache miss.
+        let result = self.precompile.call(input);
 
-        // insert the result into the cache
-        cache.cache.insert(key, output.clone());
+        // Cache successful results.
+        if let Ok(output) = &result {
+            let gas_used = output.gas.limit() - output.gas.remaining();
+            cache.cache.insert(
+                key,
+                CachedOutput { bytes: output.bytes.clone(), gas_used, reverted: output.reverted },
+            );
+        }
 
-        output
+        result
     }
 }
 
@@ -163,9 +189,8 @@ pub struct MyExecutorBuilder {
 
 impl Default for MyExecutorBuilder {
     fn default() -> Self {
-        let precompile_cache = PrecompileCache {
-            cache: LruMap::<(Bytes, u64), PrecompileResultExt>::new(ByLength::new(100)),
-        };
+        let precompile_cache =
+            PrecompileCache { cache: LruMap::<Bytes, CachedOutput>::new(ByLength::new(100)) };
         Self { precompile_cache: Arc::new(RwLock::new(precompile_cache)) }
     }
 }
