@@ -2,7 +2,6 @@
 use alloy_consensus::BlockHeader;
 use alloy_eips::eip7928::BlockAccessList;
 use alloy_primitives::B256;
-use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_errors::RethError;
 use reth_evm::{block::BlockExecutor, ConfigureEvm, Evm};
 use reth_revm::{database::StateProviderDatabase, State};
@@ -33,11 +32,6 @@ pub trait GetBlockAccessList: Trace + Call + LoadBlock {
             let earliest_block = self.provider().earliest_block_number()?;
             if block.header().number() < earliest_block {
                 return Err(EthApiError::PrunedHistoryUnavailable.into());
-            }
-            // Check if the block is pre-Amsterdam, as access lists are not available for those
-            // blocks
-            if !self.provider().chain_spec().is_amsterdam_active_at_timestamp(block.timestamp()) {
-                return Err(EthApiError::BlockAccessListNotAvailablePreAmsterdam.into());
             }
 
             self.spawn_blocking_io(move |eth_api| {
