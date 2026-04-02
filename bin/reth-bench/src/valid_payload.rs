@@ -3,6 +3,7 @@
 //! before sending additional calls.
 
 use alloy_consensus::TxEnvelope;
+use alloy_eips::eip7928::BlockAccessList;
 use alloy_primitives::Bytes;
 use alloy_provider::{ext::EngineApi, network::AnyRpcBlock, Network, Provider};
 use alloy_rpc_types_engine::{
@@ -187,6 +188,7 @@ pub(crate) fn block_to_new_payload(
                 RethNewPayloadInput::<ExecutionData>::BlockRlp(rlp),
                 wait_for_persistence,
                 no_wait_for_caches.then_some(false),
+                None::<BlockAccessList>,
             ))?,
         ));
     }
@@ -208,6 +210,7 @@ pub(crate) fn block_to_new_payload(
                 RethNewPayloadInput::ExecutionData(execution_data),
                 wait_for_persistence,
                 no_wait_for_caches.then_some(false),
+                None::<BlockAccessList>,
             ))?,
         ))
     } else {

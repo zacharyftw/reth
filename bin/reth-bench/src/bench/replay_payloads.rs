@@ -12,6 +12,7 @@ use crate::{
     },
     valid_payload::{call_forkchoice_updated_with_reth, call_new_payload_with_reth},
 };
+use alloy_eips::eip7928::BlockAccessList;
 use alloy_primitives::B256;
 use alloy_provider::{network::AnyNetwork, Provider, RootProvider};
 use alloy_rpc_client::ClientBuilder;
@@ -126,6 +127,8 @@ struct LoadedPayload {
     block_hash: B256,
     /// Big block data containing environment switches and prior block hashes.
     big_block_data: BigBlockData<ExecutionData>,
+    /// Optional BAL flattened into the payload file.
+    block_access_list: Option<BlockAccessList>,
 }
 
 impl Command {
@@ -189,11 +192,21 @@ impl Command {
         if !self.reth_new_payload {
             let has_env_switches =
                 payloads.iter().any(|p| !p.big_block_data.env_switches.is_empty());
+            let has_block_access_lists = payloads.iter().any(|p| {
+                p.block_access_list.as_ref().is_some_and(|bal: &BlockAccessList| !bal.is_empty())
+            });
             if has_env_switches {
                 warn!(
                     target: "reth-bench",
                     "Payloads contain env_switches but --reth-new-payload is not set. \
                      env_switches are only supported with reth_newPayload and will be ignored."
+                );
+            }
+            if has_block_access_lists {
+                warn!(
+                    target: "reth-bench",
+                    "Payloads contain block_access_list data but --reth-new-payload is not set. \
+                     BALs are only forwarded with reth_newPayload and will be ignored."
                 );
             }
         }
@@ -249,6 +262,7 @@ impl Command {
                         RethNewPayloadInput::ExecutionData(execution_data.clone()),
                         wait_for_persistence,
                         self.no_wait_for_caches.then_some(false),
+                        payload.block_access_list.clone(),
                         big_block_data_param,
                     ))?,
                 )
@@ -417,26 +431,27 @@ impl Command {
                 .wrap_err_with(|| format!("Failed to read {:?}", path))?;
 
             // Try BigBlockPayload first, then fall back to legacy ExecutionPayloadEnvelopeV4
-            let (execution_data, big_block_data) =
-                if let Ok(big_block) = serde_json::from_str::<BigBlockPayload>(&content) {
-                    (big_block.execution_data, big_block.big_block_data)
-                } else {
-                    let envelope: ExecutionPayloadEnvelopeV4 = serde_json::from_str(&content)
-                        .wrap_err_with(|| format!("Failed to parse {:?}", path))?;
-                    let execution_data = ExecutionData {
-                        payload: envelope.envelope_inner.execution_payload.clone().into(),
-                        sidecar: ExecutionPayloadSidecar::v4(
-                            CancunPayloadFields {
-                                versioned_hashes: Vec::new(),
-                                parent_beacon_block_root: B256::ZERO,
-                            },
-                            PraguePayloadFields {
-                                requests: envelope.execution_requests.clone().into(),
-                            },
-                        ),
-                    };
-                    (execution_data, BigBlockData::default())
+            let (execution_data, big_block_data, block_access_list) = if let Ok(big_block) =
+                serde_json::from_str::<BigBlockPayload>(&content)
+            {
+                (big_block.execution_data, big_block.big_block_data, big_block.block_access_list)
+            } else {
+                let envelope: ExecutionPayloadEnvelopeV4 = serde_json::from_str(&content)
+                    .wrap_err_with(|| format!("Failed to parse {:?}", path))?;
+                let execution_data = ExecutionData {
+                    payload: envelope.envelope_inner.execution_payload.clone().into(),
+                    sidecar: ExecutionPayloadSidecar::v4(
+                        CancunPayloadFields {
+                            versioned_hashes: Vec::new(),
+                            parent_beacon_block_root: B256::ZERO,
+                        },
+                        PraguePayloadFields {
+                            requests: envelope.execution_requests.clone().into(),
+                        },
+                    ),
                 };
+                (execution_data, BigBlockData::default(), None)
+            };
 
             let block_hash = execution_data.payload.as_v1().block_hash;
 
@@ -446,11 +461,18 @@ impl Command {
                 block_hash = %block_hash,
                 env_switches = big_block_data.env_switches.len(),
                 prior_block_hashes = big_block_data.prior_block_hashes.len(),
+                bal_accounts = block_access_list.as_ref().map_or(0, Vec::len),
                 path = %path.display(),
                 "Loaded payload"
             );
 
-            payloads.push(LoadedPayload { index, execution_data, block_hash, big_block_data });
+            payloads.push(LoadedPayload {
+                index,
+                execution_data,
+                block_hash,
+                big_block_data,
+                block_access_list,
+            });
         }
 
         Ok(payloads)

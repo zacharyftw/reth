@@ -9,10 +9,7 @@ use alloy_consensus::{TxEnvelope, TxReceipt};
 use alloy_eips::{
     eip1559::BaseFeeParams,
     eip7840::BlobParams,
-    eip7928::{
-        AccountChanges, BalanceChange, BlockAccessList, CodeChange, NonceChange, SlotChanges,
-        StorageChange,
-    },
+    eip7928::{AccountChanges, BlockAccessList, SlotChanges},
     BlockNumberOrTag, Typed2718,
 };
 use alloy_primitives::{Bloom, Bytes, B256};
@@ -750,6 +747,7 @@ fn merge_slot_changes(existing: &mut Vec<SlotChanges>, incoming: Vec<SlotChanges
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_eips::eip7928::{BalanceChange, CodeChange, NonceChange, StorageChange};
     use alloy_primitives::{Address, U256};
 
     #[test]

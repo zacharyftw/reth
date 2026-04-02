@@ -1,5 +1,6 @@
 //! Reth-specific engine API extensions.
 
+use alloy_eip7928::BlockAccessList;
 use alloy_primitives::Bytes;
 use alloy_rpc_types_engine::{ForkchoiceState, ForkchoiceUpdated, PayloadStatus};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
@@ -43,8 +44,8 @@ pub enum RethNewPayloadInput<ExecutionData> {
 /// Reth-specific engine API extensions.
 ///
 /// This trait provides a `reth_newPayload` endpoint that accepts either `ExecutionData` directly
-/// (payload + sidecar) or an RLP-encoded block, optionally waiting for persistence and cache locks
-/// before processing.
+/// (payload + sidecar) or an RLP-encoded block, optionally alongside a block access list and
+/// waiting for persistence and cache locks before processing.
 ///
 /// By default, the endpoint waits for both in-flight persistence and cache updates to complete
 /// before executing the payload, providing unbiased timing measurements. Each can be independently
@@ -65,6 +66,7 @@ pub trait RethEngineApi<ExecutionData> {
         payload: RethNewPayloadInput<ExecutionData>,
         wait_for_persistence: Option<bool>,
         wait_for_caches: Option<bool>,
+        block_access_list: Option<BlockAccessList>,
     ) -> RpcResult<RethPayloadStatus>;
 
     /// Reth-specific forkchoiceUpdated that sends a regular forkchoice update with no payload
