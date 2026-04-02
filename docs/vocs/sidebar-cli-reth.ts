@@ -74,6 +74,10 @@ export const rethCliSidebar: SidebarItem = {
                     link: "/cli/reth/db/diff"
                 },
                 {
+                    text: "reth db extract",
+                    link: "/cli/reth/db/extract"
+                },
+                {
                     text: "reth db get",
                     link: "/cli/reth/db/get",
                     collapsed: true,

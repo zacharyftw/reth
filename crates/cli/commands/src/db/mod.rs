@@ -14,6 +14,7 @@ mod checksum;
 mod clear;
 mod copy;
 mod diff;
+mod extract;
 mod get;
 mod list;
 mod prune_checkpoints;
@@ -49,6 +50,8 @@ pub enum Subcommands {
     Copy(copy::Command),
     /// Create a diff between two database tables or two entire databases.
     Diff(diff::Command),
+    /// Extracts the most recent N blocks of data from each static file segment
+    Extract(extract::Command),
     /// Gets the content of a table for the given key
     Get(get::Command),
     /// Deletes all database entries
@@ -140,6 +143,11 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
                 });
             }
             Subcommands::Diff(command) => {
+                db_exec!(self.env, tool, N, AccessRights::RO, {
+                    command.execute(&tool)?;
+                });
+            }
+            Subcommands::Extract(command) => {
                 db_exec!(self.env, tool, N, AccessRights::RO, {
                     command.execute(&tool)?;
                 });

@@ -7740,6 +7740,7 @@ dependencies = [
  "reth-network",
  "reth-network-p2p",
  "reth-network-peers",
+ "reth-nippy-jar",
  "reth-node-api",
  "reth-node-builder",
  "reth-node-core",
