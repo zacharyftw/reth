@@ -1,14 +1,41 @@
 use alloy_eips::BlockId;
-use alloy_primitives::{map::AddressMap, U256, U64};
+use alloy_primitives::{map::AddressMap, Bytes, B256, U256, U64};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 
 // Required for the subscription attributes below
 use reth_chain_state as _;
 
+/// Response for `reth_getReceiptWithProof`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptWithProofResponse {
+    /// The receipt encoded as EIP-2718.
+    pub receipt: Bytes,
+    /// The Merkle proof: an array of RLP-encoded trie nodes from the receipts root to the leaf.
+    pub proof: Vec<Bytes>,
+    /// The receipts trie root from the block header.
+    pub receipts_root: B256,
+    /// The block hash.
+    pub block_hash: B256,
+    /// The transaction index within the block.
+    pub tx_index: u64,
+}
+
 /// Reth API namespace for reth-specific methods
 #[cfg_attr(not(feature = "client"), rpc(server, namespace = "reth"))]
 #[cfg_attr(feature = "client", rpc(server, client, namespace = "reth"))]
 pub trait RethApi {
+    /// Returns the receipt for a transaction along with its Merkle proof against the block's
+    /// receipts root.
+    ///
+    /// The proof allows verifying that a specific receipt (and its logs) is included in a block
+    /// without downloading all receipts for that block.
+    #[method(name = "getReceiptWithProof")]
+    async fn reth_get_receipt_with_proof(
+        &self,
+        tx_hash: B256,
+    ) -> RpcResult<Option<ReceiptWithProofResponse>>;
+
     /// Returns all ETH balance changes in a block
     #[method(name = "getBalanceChangesInBlock")]
     async fn reth_get_balance_changes_in_block(

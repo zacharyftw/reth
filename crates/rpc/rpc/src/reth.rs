@@ -1,8 +1,9 @@
 use std::{future::Future, sync::Arc};
 
-use alloy_consensus::BlockHeader;
-use alloy_eips::BlockId;
-use alloy_primitives::{map::AddressMap, U256, U64};
+use alloy_consensus::{BlockHeader, TxReceipt};
+use alloy_eips::{eip2718::Encodable2718, BlockId};
+use alloy_primitives::{map::AddressMap, Bytes, B256, U256, U64};
+use alloy_trie::{proof::ProofRetainer, root::adjust_index_for_rlp, HashBuilder};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use jsonrpsee::{core::RpcResult, PendingSubscriptionSink, SubscriptionMessage, SubscriptionSink};
@@ -14,12 +15,14 @@ use reth_errors::RethResult;
 use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_execution_types::ExecutionOutcome;
 use reth_primitives_traits::{NodePrimitives, SealedHeader};
-use reth_rpc_api::RethApiServer;
+use reth_rpc_api::{ReceiptWithProofResponse, RethApiServer};
 use reth_rpc_eth_types::{EthApiError, EthResult};
 use reth_storage_api::{
-    BlockReader, BlockReaderIdExt, ChangeSetReader, StateProviderFactory, TransactionVariant,
+    BlockReader, BlockReaderIdExt, ChangeSetReader, HeaderProvider, ReceiptProvider,
+    StateProviderFactory, TransactionVariant, TransactionsProvider,
 };
 use reth_tasks::{pool::BlockingTaskGuard, Runtime};
+use reth_trie_common::Nibbles;
 use serde::Serialize;
 use tokio::sync::oneshot;
 
@@ -102,6 +105,105 @@ where
             },
         )?;
         Ok(hash_map)
+    }
+
+    /// Returns the receipt for a transaction along with its Merkle proof against the receipts root.
+    pub async fn receipt_with_proof(
+        &self,
+        tx_hash: B256,
+    ) -> EthResult<Option<ReceiptWithProofResponse>>
+    where
+        Provider: TransactionsProvider + ReceiptProvider + HeaderProvider,
+        Provider::Receipt: TxReceipt,
+    {
+        let permit = self
+            .inner
+            .blocking_task_guard
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| EthApiError::InternalEthError)?;
+        self.on_blocking_task(async move |this| {
+            let _permit = permit;
+            this.try_receipt_with_proof(tx_hash)
+        })
+        .await
+    }
+
+    fn try_receipt_with_proof(&self, tx_hash: B256) -> EthResult<Option<ReceiptWithProofResponse>>
+    where
+        Provider: TransactionsProvider + ReceiptProvider + HeaderProvider,
+        Provider::Receipt: TxReceipt,
+    {
+        let Some((_, meta)) = self.provider().transaction_by_hash_with_meta(tx_hash)? else {
+            return Ok(None);
+        };
+
+        let block_hash = meta.block_hash;
+        let tx_index = meta.index as usize;
+
+        let header = self
+            .provider()
+            .header(block_hash)?
+            .ok_or(EthApiError::HeaderNotFound(block_hash.into()))?;
+        let receipts_root = header.receipts_root();
+
+        let receipts = self
+            .provider()
+            .receipts_by_block(block_hash.into())?
+            .ok_or(EthApiError::HeaderNotFound(block_hash.into()))?;
+
+        let len = receipts.len();
+        if tx_index >= len {
+            return Err(EthApiError::InvalidParams(format!(
+                "tx index {tx_index} out of bounds for block with {len} receipts"
+            )));
+        }
+
+        // Encode all receipts as EIP-2718 bytes (with bloom filter).
+        let encoded: Vec<Vec<u8>> = receipts
+            .iter()
+            .map(|r| {
+                let with_bloom = TxReceipt::with_bloom_ref(r);
+                let mut buf = Vec::new();
+                with_bloom.encode_2718(&mut buf);
+                buf
+            })
+            .collect();
+
+        // Build the trie key for the target tx index.
+        let target_key_buf = alloy_rlp::encode_fixed_size(&tx_index);
+        let target_nibbles = Nibbles::unpack(&target_key_buf);
+
+        // Build the receipts MPT with a ProofRetainer for the target tx.
+        let retainer = ProofRetainer::from_iter([target_nibbles.clone()]);
+        let mut hb = HashBuilder::default().with_proof_retainer(retainer);
+
+        for i in 0..len {
+            let exec_index = adjust_index_for_rlp(i, len);
+            let index_buffer = alloy_rlp::encode_fixed_size(&exec_index);
+            hb.add_leaf(Nibbles::unpack(&index_buffer), &encoded[exec_index]);
+        }
+
+        let root = hb.root();
+        if root != receipts_root {
+            return Err(EthApiError::InternalEthError);
+        }
+
+        let proof_nodes = hb.take_proof_nodes();
+        let proof = proof_nodes
+            .matching_nodes_sorted(&target_nibbles)
+            .into_iter()
+            .map(|(_, node)| node)
+            .collect();
+
+        Ok(Some(ReceiptWithProofResponse {
+            receipt: Bytes::from(encoded[tx_index].clone()),
+            proof,
+            receipts_root,
+            block_hash,
+            tx_index: meta.index,
+        }))
     }
 }
 
@@ -198,6 +300,14 @@ where
         + 'static,
     EvmConfig: ConfigureEvm<Primitives = Provider::Primitives> + 'static,
 {
+    /// Handler for `reth_getReceiptWithProof`
+    async fn reth_get_receipt_with_proof(
+        &self,
+        tx_hash: B256,
+    ) -> RpcResult<Option<ReceiptWithProofResponse>> {
+        Ok(Self::receipt_with_proof(self, tx_hash).await?)
+    }
+
     /// Handler for `reth_getBalanceChangesInBlock`
     async fn reth_get_balance_changes_in_block(
         &self,
