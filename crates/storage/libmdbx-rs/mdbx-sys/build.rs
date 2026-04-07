@@ -24,7 +24,11 @@ fn main() {
 
     // Enable debugging on debug builds
     #[cfg(debug_assertions)]
-    cc.define("MDBX_DEBUG", "1").define("MDBX_ENABLE_PROFGC", "1");
+    cc.define("MDBX_DEBUG", "1")
+        .define("MDBX_ENABLE_PROFGC", "1")
+        // Disable search dispatching validation — it adds a field to the cursor struct and
+        // asserts on search-step deltas, which is intended for libmdbx internal development.
+        .define("MDBX_DEBUG_SEARCH_DISPATCHING", "0");
 
     // Disables debug logging on optimized builds
     #[cfg(not(debug_assertions))]
