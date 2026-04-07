@@ -195,24 +195,38 @@ where
         let has_plan = self.pending.lock().unwrap().contains_key(&payload_hash);
 
         if has_plan {
-            // Compute the env from the first segment BEFORE removing the
-            // entry (stage_plan_for_payload removes it).
-            let first_exec_data = {
+            let has_env_switches = {
                 let pending = self.pending.lock().unwrap();
                 let bb_data = pending.get(&payload_hash).unwrap();
-                bb_data.env_switches[0].1.clone()
+                !bb_data.env_switches.is_empty()
             };
-            let mut env = self.inner.evm_env_for_payload(&first_exec_data)?;
 
-            // Disable basefee validation: transactions from different
-            // original blocks may have gas prices below the big block's
-            // effective basefee.
-            env.cfg_env.disable_base_fee = true;
+            if has_env_switches {
+                // Compute the env from the first segment BEFORE removing the
+                // entry (stage_plan_for_payload removes it).
+                let first_exec_data = {
+                    let pending = self.pending.lock().unwrap();
+                    let bb_data = pending.get(&payload_hash).unwrap();
+                    bb_data.env_switches[0].1.clone()
+                };
+                let mut env = self.inner.evm_env_for_payload(&first_exec_data)?;
 
-            // Now stage the plan on the factory (removes the entry).
-            self.stage_plan_for_payload(&payload_hash);
+                // Disable basefee validation: transactions from different
+                // original blocks may have gas prices below the big block's
+                // effective basefee.
+                env.cfg_env.disable_base_fee = true;
 
-            Ok(env)
+                // Now stage the plan on the factory (removes the entry).
+                self.stage_plan_for_payload(&payload_hash);
+
+                Ok(env)
+            } else {
+                // Single-block big block with only prior_block_hashes — no env
+                // switches needed. Stage the plan (for block hash seeding) and
+                // use the standard payload path.
+                self.stage_plan_for_payload(&payload_hash);
+                self.inner.evm_env_for_payload(payload)
+            }
         } else {
             self.inner.evm_env_for_payload(payload)
         }
