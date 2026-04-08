@@ -430,12 +430,7 @@ impl<N: ProviderNodeTypes> Pipeline<N> {
 
         let stage_id = self.stage(stage_index).id();
         let mut made_progress = false;
-        let target = match (self.max_block, previous_stage) {
-            (Some(max), Some(prev)) => Some(max.min(prev)),
-            (Some(max), None) => Some(max),
-            (None, Some(prev)) => Some(prev),
-            (None, None) => None,
-        };
+        let target = self.max_block.or(previous_stage);
 
         loop {
             let prev_checkpoint = self.provider_factory.get_stage_checkpoint(stage_id)?;
