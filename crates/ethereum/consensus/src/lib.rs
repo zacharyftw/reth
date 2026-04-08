@@ -47,6 +47,8 @@ pub struct EthBeaconConsensus<ChainSpec> {
     skip_gas_limit_ramp_check: bool,
     /// When true, skips the blob gas used check in header validation.
     skip_blob_gas_used_check: bool,
+    /// When true, skips the Osaka block RLP size check in pre-execution validation.
+    skip_block_rlp_size_check: bool,
     /// When true, skips the requests hash check in post-execution validation.
     skip_requests_hash_check: bool,
 }
@@ -59,6 +61,7 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> EthBeaconConsensus<ChainSpec> 
             max_extra_data_size: MAXIMUM_EXTRA_DATA_SIZE,
             skip_gas_limit_ramp_check: false,
             skip_blob_gas_used_check: false,
+            skip_block_rlp_size_check: false,
             skip_requests_hash_check: false,
         }
     }
@@ -83,6 +86,12 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> EthBeaconConsensus<ChainSpec> 
     /// Disables the blob gas used check in header validation.
     pub const fn with_skip_blob_gas_used_check(mut self, skip: bool) -> Self {
         self.skip_blob_gas_used_check = skip;
+        self
+    }
+
+    /// Disables the Osaka block RLP size check in pre-execution validation.
+    pub const fn with_skip_block_rlp_size_check(mut self, skip: bool) -> Self {
+        self.skip_block_rlp_size_check = skip;
         self
     }
 
@@ -141,7 +150,7 @@ where
     }
 
     fn validate_block_pre_execution(&self, block: &SealedBlock<B>) -> Result<(), ConsensusError> {
-        validate_block_pre_execution(block, &self.chain_spec)
+        validate_block_pre_execution(block, &self.chain_spec, self.skip_block_rlp_size_check)
     }
 
     fn validate_block_pre_execution_with_tx_root(
@@ -149,7 +158,12 @@ where
         block: &SealedBlock<B>,
         transaction_root: Option<TransactionRoot>,
     ) -> Result<(), ConsensusError> {
-        validate_block_pre_execution_with_tx_root(block, &self.chain_spec, transaction_root)
+        validate_block_pre_execution_with_tx_root(
+            block,
+            &self.chain_spec,
+            transaction_root,
+            self.skip_block_rlp_size_check,
+        )
     }
 }
 
@@ -267,10 +281,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::Header;
-    use alloy_primitives::B256;
+    use alloy_consensus::{BlockBody, Header, TxLegacy};
+    use alloy_eips::eip4895::Withdrawals;
+    use alloy_primitives::{Address, Bytes, Signature, TxKind, B256, U256};
     use reth_chainspec::{ChainSpec, ChainSpecBuilder};
-    use reth_consensus_common::validation::validate_against_parent_gas_limit;
+    use reth_consensus_common::validation::{
+        validate_against_parent_gas_limit, MAX_RLP_BLOCK_SIZE,
+    };
+    use reth_ethereum_primitives::{Transaction, TransactionSigned};
     use reth_primitives_traits::{
         constants::{GAS_LIMIT_BOUND_DIVISOR, MINIMUM_GAS_LIMIT},
         proofs,
@@ -361,6 +379,50 @@ mod tests {
 
         assert!(EthBeaconConsensus::new(chain_spec)
             .validate_header(&SealedHeader::seal_slow(header,))
+            .is_ok());
+    }
+
+    #[test]
+    fn osaka_block_rlp_size_check_can_be_skipped() {
+        let chain_spec = Arc::new(ChainSpecBuilder::mainnet().osaka_activated().build());
+        let transaction = TransactionSigned::new_unhashed(
+            Transaction::Legacy(TxLegacy {
+                chain_id: Some(chain_spec.chain.id()),
+                gas_limit: 30_000_000,
+                to: TxKind::Call(Address::ZERO),
+                input: Bytes::from(vec![0; MAX_RLP_BLOCK_SIZE]),
+                ..Default::default()
+            }),
+            Signature::new(U256::default(), U256::default(), true),
+        );
+        let header = Header {
+            base_fee_per_gas: Some(1337),
+            withdrawals_root: Some(proofs::calculate_withdrawals_root(&[])),
+            transactions_root: proofs::calculate_transaction_root(std::slice::from_ref(
+                &transaction,
+            )),
+            blob_gas_used: Some(0),
+            ..Default::default()
+        };
+        let body = BlockBody {
+            transactions: vec![transaction],
+            ommers: vec![],
+            withdrawals: Some(Withdrawals::default()),
+        };
+        let block = SealedBlock::seal_slow(alloy_consensus::Block { header, body });
+
+        assert!(block.rlp_length() > MAX_RLP_BLOCK_SIZE);
+
+        assert!(matches!(
+            EthBeaconConsensus::new(chain_spec.clone())
+                .validate_block_pre_execution(&block)
+                .unwrap_err(),
+            ConsensusError::BlockTooLarge { .. }
+        ));
+
+        assert!(EthBeaconConsensus::new(chain_spec)
+            .with_skip_block_rlp_size_check(true)
+            .validate_block_pre_execution(&block)
             .is_ok());
     }
 }

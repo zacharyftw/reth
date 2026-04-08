@@ -344,6 +344,7 @@ where
             EthBeaconConsensus::new(ctx.chain_spec())
                 .with_skip_gas_limit_ramp_check(true)
                 .with_skip_blob_gas_used_check(true)
+                .with_skip_block_rlp_size_check(true)
                 .with_skip_requests_hash_check(true),
         ))
     }

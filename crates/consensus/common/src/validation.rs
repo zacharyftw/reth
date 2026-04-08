@@ -141,12 +141,13 @@ where
 pub fn validate_block_pre_execution<B, ChainSpec>(
     block: &SealedBlock<B>,
     chain_spec: &ChainSpec,
+    skip_block_rlp_size_check: bool,
 ) -> Result<(), ConsensusError>
 where
     B: Block,
     ChainSpec: EthChainSpec + EthereumHardforks,
 {
-    validate_block_pre_execution_with_tx_root(block, chain_spec, None)
+    validate_block_pre_execution_with_tx_root(block, chain_spec, None, skip_block_rlp_size_check)
 }
 
 /// Validate a block without regard for state using an optional pre-computed transaction root.
@@ -162,12 +163,13 @@ pub fn validate_block_pre_execution_with_tx_root<B, ChainSpec>(
     block: &SealedBlock<B>,
     chain_spec: &ChainSpec,
     transaction_root: Option<B256>,
+    skip_block_rlp_size_check: bool,
 ) -> Result<(), ConsensusError>
 where
     B: Block,
     ChainSpec: EthChainSpec + EthereumHardforks,
 {
-    post_merge_hardfork_fields(block, chain_spec)?;
+    post_merge_hardfork_fields(block, chain_spec, skip_block_rlp_size_check)?;
 
     // Check transaction root
     let expected_transaction_root = block.header().transactions_root();
@@ -194,6 +196,7 @@ where
 pub fn post_merge_hardfork_fields<B, ChainSpec>(
     block: &SealedBlock<B>,
     chain_spec: &ChainSpec,
+    skip_block_rlp_size_check: bool,
 ) -> Result<(), ConsensusError>
 where
     B: Block,
@@ -220,7 +223,8 @@ where
         validate_cancun_gas(block)?;
     }
 
-    if chain_spec.is_osaka_active_at_timestamp(block.timestamp()) &&
+    if !skip_block_rlp_size_check &&
+        chain_spec.is_osaka_active_at_timestamp(block.timestamp()) &&
         block.rlp_length() > MAX_RLP_BLOCK_SIZE
     {
         return Err(ConsensusError::BlockTooLarge {
@@ -513,7 +517,7 @@ mod tests {
 
         // validate blob, it should fail blob gas used validation
         assert!(matches!(
-            validate_block_pre_execution(&block, &chain_spec).unwrap_err(),
+            validate_block_pre_execution(&block, &chain_spec, false).unwrap_err(),
             ConsensusError::BlobGasUsedDiff(diff)
                 if diff.got == 1 && diff.expected == expected_blob_gas_used
         ));
@@ -560,10 +564,14 @@ mod tests {
         let block = SealedBlock::seal_slow(alloy_consensus::Block { header, body });
 
         // Some(correct_root) should pass just like None
-        assert!(
-            validate_block_pre_execution_with_tx_root(&block, &chain_spec, Some(tx_root)).is_ok()
-        );
-        assert!(validate_block_pre_execution_with_tx_root(&block, &chain_spec, None).is_ok());
+        assert!(validate_block_pre_execution_with_tx_root(
+            &block,
+            &chain_spec,
+            Some(tx_root),
+            false
+        )
+        .is_ok());
+        assert!(validate_block_pre_execution_with_tx_root(&block, &chain_spec, None, false).is_ok());
     }
 
     #[test]
@@ -591,7 +599,7 @@ mod tests {
 
         let wrong_root = B256::repeat_byte(0xff);
         assert!(matches!(
-            validate_block_pre_execution_with_tx_root(&block, &chain_spec, Some(wrong_root))
+            validate_block_pre_execution_with_tx_root(&block, &chain_spec, Some(wrong_root), false)
                 .unwrap_err(),
             ConsensusError::BodyTransactionRootDiff(diff)
                 if diff.0.got == wrong_root && diff.0.expected == tx_root
