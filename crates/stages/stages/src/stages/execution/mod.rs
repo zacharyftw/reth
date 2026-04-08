@@ -6,7 +6,12 @@ use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_config::config::ExecutionConfig;
 use reth_consensus::FullConsensus;
 use reth_db::{static_file::HeaderMask, tables};
-use reth_evm::{execute::Executor, metrics::ExecutorMetrics, ConfigureEvm};
+use reth_evm::{
+    execute::{BasicBlockExecutor, Executor},
+    metrics::ExecutorMetrics,
+    precompile_cache::PrecompileCacheMap,
+    ConfigureEvm, SpecFor,
+};
 use reth_execution_types::Chain;
 use reth_exex::{ExExManagerHandle, ExExNotification, ExExNotificationSource};
 use reth_primitives_traits::{format_gas_throughput, BlockBody, NodePrimitives};
@@ -94,6 +99,8 @@ where
     exex_manager_handle: ExExManagerHandle<E::Primitives>,
     /// Executor metrics.
     metrics: ExecutorMetrics,
+    /// Shared precompile cache persisted across stage batches.
+    precompile_cache_map: PrecompileCacheMap<SpecFor<E>>,
 }
 
 impl<E> ExecutionStage<E>
@@ -117,6 +124,7 @@ where
             post_unwind_commit_input: None,
             exex_manager_handle,
             metrics: ExecutorMetrics::default(),
+            precompile_cache_map: PrecompileCacheMap::default(),
         }
     }
 
@@ -303,7 +311,8 @@ where
         self.ensure_consistency(provider, input.checkpoint().block_number, None)?;
 
         let db = StateProviderDatabase(LatestStateProviderRef::new(provider));
-        let mut executor = self.evm_config.batch_executor(db);
+        let mut executor = BasicBlockExecutor::new(&self.evm_config, db)
+            .with_precompile_cache(self.precompile_cache_map.clone());
 
         // Progress tracking
         let mut stage_progress = start_block;

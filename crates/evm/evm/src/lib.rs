@@ -45,6 +45,9 @@ mod engine;
 #[cfg(feature = "std")]
 pub use engine::{ConfigureEngineEvm, ConvertTx, ExecutableTxIterator, ExecutableTxTuple};
 
+#[cfg(feature = "std")]
+pub mod precompile_cache;
+
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod noop;

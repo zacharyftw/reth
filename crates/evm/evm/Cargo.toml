@@ -32,6 +32,7 @@ auto_impl.workspace = true
 derive_more.workspace = true
 futures-util.workspace = true
 metrics = { workspace = true, optional = true }
+moka = { workspace = true, features = ["sync"], optional = true }
 rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -40,7 +41,9 @@ reth-ethereum-primitives.workspace = true
 [features]
 default = ["std"]
 std = [
+    "dep:moka",
     "dep:rayon",
+    "reth-primitives-traits/dashmap",
     "reth-primitives-traits/std",
     "alloy-eips/std",
     "alloy-primitives/std",

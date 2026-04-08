@@ -533,18 +533,37 @@ where
 /// A generic block executor that uses a [`BlockExecutor`] to
 /// execute blocks.
 #[expect(missing_debug_implementations)]
-pub struct BasicBlockExecutor<F, DB> {
+pub struct BasicBlockExecutor<F: ConfigureEvm, DB> {
     /// Block execution strategy.
     pub(crate) strategy_factory: F,
     /// Database.
     pub(crate) db: State<DB>,
+    /// Optional precompile cache shared across blocks.
+    #[cfg(feature = "std")]
+    pub(crate) precompile_cache:
+        Option<crate::precompile_cache::PrecompileCacheMap<crate::SpecFor<F>>>,
 }
 
-impl<F, DB: Database> BasicBlockExecutor<F, DB> {
+impl<F: ConfigureEvm, DB: Database> BasicBlockExecutor<F, DB> {
     /// Creates a new `BasicBlockExecutor` with the given strategy.
     pub fn new(strategy_factory: F, db: DB) -> Self {
         let db = State::builder().with_database(db).with_bundle_update().build();
-        Self { strategy_factory, db }
+        Self {
+            strategy_factory,
+            db,
+            #[cfg(feature = "std")]
+            precompile_cache: None,
+        }
+    }
+
+    /// Sets the precompile cache to use across block executions.
+    #[cfg(feature = "std")]
+    pub fn with_precompile_cache(
+        mut self,
+        cache: crate::precompile_cache::PrecompileCacheMap<crate::SpecFor<F>>,
+    ) -> Self {
+        self.precompile_cache = Some(cache);
+        self
     }
 }
 
@@ -561,6 +580,11 @@ where
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
+        #[cfg(feature = "std")]
+        if self.precompile_cache.is_some() {
+            return self.execute_one_cached(block, None);
+        }
+
         let result = self
             .strategy_factory
             .executor_for_block(&mut self.db, block)
@@ -580,6 +604,11 @@ where
     where
         H: OnStateHook + 'static,
     {
+        #[cfg(feature = "std")]
+        if self.precompile_cache.is_some() {
+            return self.execute_one_cached(block, Some(Box::new(state_hook)));
+        }
+
         let result = self
             .strategy_factory
             .executor_for_block(&mut self.db, block)
@@ -598,6 +627,52 @@ where
 
     fn size_hint(&self) -> usize {
         self.db.bundle_state.size_hint()
+    }
+}
+
+#[cfg(feature = "std")]
+impl<F, DB> BasicBlockExecutor<F, DB>
+where
+    F: ConfigureEvm,
+    DB: Database,
+{
+    /// Executes a block with precompile caching enabled.
+    ///
+    /// Inlines the `executor_for_block` logic to capture the spec id and wrap cacheable
+    /// precompiles before execution.
+    fn execute_one_cached(
+        &mut self,
+        block: &RecoveredBlock<<F::Primitives as NodePrimitives>::Block>,
+        state_hook: Option<Box<dyn OnStateHook>>,
+    ) -> Result<BlockExecutionResult<<F::Primitives as NodePrimitives>::Receipt>, BlockExecutionError>
+    {
+        let evm_env =
+            self.strategy_factory.evm_env(block.header()).map_err(BlockExecutionError::other)?;
+        let spec_id = *evm_env.spec_id();
+        let mut evm = self.strategy_factory.evm_with_env(&mut self.db, evm_env);
+
+        if let Some(cache_map) = &self.precompile_cache {
+            evm.precompiles_mut().map_cacheable_precompiles(|address, precompile| {
+                crate::precompile_cache::CachedPrecompile::wrap(
+                    precompile,
+                    cache_map.cache_for_address(*address),
+                    spec_id,
+                    #[cfg(feature = "metrics")]
+                    None,
+                )
+            });
+        }
+
+        let ctx =
+            self.strategy_factory.context_for_block(block).map_err(BlockExecutionError::other)?;
+        let executor = self.strategy_factory.create_executor(evm, ctx);
+
+        let result =
+            executor.with_state_hook(state_hook).execute_block(block.transactions_recovered())?;
+
+        self.db.merge_transitions(BundleRetention::Reverts);
+
+        Ok(result)
     }
 }
 

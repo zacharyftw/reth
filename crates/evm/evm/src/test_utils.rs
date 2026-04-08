@@ -1,9 +1,9 @@
 //! Helpers for testing.
 
-use crate::execute::BasicBlockExecutor;
+use crate::{execute::BasicBlockExecutor, ConfigureEvm};
 use revm::database::State;
 
-impl<Factory, DB> BasicBlockExecutor<Factory, DB> {
+impl<Factory: ConfigureEvm, DB> BasicBlockExecutor<Factory, DB> {
     /// Provides safe read access to the state
     pub fn with_state<F, R>(&self, f: F) -> R
     where
