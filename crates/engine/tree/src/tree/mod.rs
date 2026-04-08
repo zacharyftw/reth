@@ -2140,6 +2140,7 @@ where
                 gas_used: block.gas_used(),
                 blob_gas_used: block.blob_gas_used().unwrap_or_default(),
             },
+            cache_state: Default::default(),
         });
 
         Ok(ExecutedBlock::new(

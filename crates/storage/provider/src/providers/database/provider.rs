@@ -48,7 +48,7 @@ use reth_db_api::{
     transaction::{DbTx, DbTxMut},
     BlockNumberList, PlainAccountState, PlainStorageState,
 };
-use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult, Chain, ExecutionOutcome};
+use reth_execution_types::{BlockExecutionOutput, Chain, ExecutionOutcome};
 use reth_node_types::{BlockTy, BodyTy, HeaderTy, NodeTypes, ReceiptTy, TxTy};
 use reth_primitives_traits::{
     Account, Block as _, BlockBody as _, Bytecode, FastInstant as Instant, RecoveredBlock,
@@ -3477,15 +3477,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> BlockWriter
         // Wrap block in ExecutedBlock with empty execution output (no receipts/state/trie)
         let executed_block = ExecutedBlock::new(
             Arc::new(block.clone()),
-            Arc::new(BlockExecutionOutput {
-                result: BlockExecutionResult {
-                    receipts: Default::default(),
-                    requests: Default::default(),
-                    gas_used: 0,
-                    blob_gas_used: 0,
-                },
-                state: Default::default(),
-            }),
+            Arc::new(BlockExecutionOutput::default()),
             ComputedTrieData::default(),
         );
 
@@ -4985,15 +4977,7 @@ mod tests {
 
         let genesis_executed = ExecutedBlock::new(
             Arc::new(genesis.try_recover().unwrap()),
-            Arc::new(BlockExecutionOutput {
-                result: BlockExecutionResult {
-                    receipts: vec![],
-                    requests: Default::default(),
-                    gas_used: 0,
-                    blob_gas_used: 0,
-                },
-                state: Default::default(),
-            }),
+            Arc::new(BlockExecutionOutput::default()),
             ComputedTrieData::default(),
         );
         let provider_rw = factory.provider_rw().unwrap();
@@ -5062,6 +5046,7 @@ mod tests {
                         blob_gas_used: 0,
                     },
                     state: bundle,
+                    cache_state: Default::default(),
                 }),
                 ComputedTrieData { hashed_state: Arc::new(hashed_state), ..Default::default() },
             );

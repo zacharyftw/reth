@@ -1,6 +1,6 @@
 use alloy_primitives::{Address, B256, U256};
 use reth_primitives_traits::{Account, Bytecode};
-use revm::database::{states::BundleState, BundleAccount};
+use revm::database::{states::BundleState, states::CacheState, BundleAccount};
 
 pub use alloy_evm::block::BlockExecutionResult;
 
@@ -24,6 +24,10 @@ pub struct BlockExecutionOutput<T> {
     pub result: BlockExecutionResult<T>,
     /// The changed state of the block after execution.
     pub state: BundleState,
+    /// The full EVM cache state containing all accessed accounts and storage (both read-only and
+    /// modified). Used to populate the cross-block execution cache with read-only state that
+    /// would otherwise be lost.
+    pub cache_state: CacheState,
 }
 
 impl<T> BlockExecutionOutput<T> {
@@ -60,6 +64,7 @@ impl<T> Default for BlockExecutionOutput<T> {
                 blob_gas_used: 0,
             },
             state: Default::default(),
+            cache_state: Default::default(),
         }
     }
 }

@@ -983,7 +983,9 @@ where
         debug_span!(target: "engine::tree", "merge_transitions")
             .in_scope(|| db.merge_transitions(BundleRetention::Reverts));
 
-        let output = BlockExecutionOutput { result, state: db.take_bundle() };
+        let state = db.take_bundle();
+        let cache_state = std::mem::take(&mut db.cache);
+        let output = BlockExecutionOutput { result, state, cache_state };
 
         let execution_duration = execution_start.elapsed();
         self.metrics.record_block_execution(&output, execution_duration);
@@ -2011,7 +2013,7 @@ where
     fn on_inserted_executed_block(&self, block: ExecutedBlock<N>) {
         self.payload_processor.on_inserted_executed_block(
             block.recovered_block.block_with_parent(),
-            &block.execution_output.state,
+            &block.execution_output,
         );
     }
 

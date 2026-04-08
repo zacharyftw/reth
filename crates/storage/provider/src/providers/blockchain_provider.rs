@@ -933,6 +933,7 @@ mod tests {
                             blob_gas_used: 0,
                         },
                         state: BundleState::default(),
+                        cache_state: Default::default(),
                     };
 
                     ExecutedBlock {
@@ -1734,6 +1735,7 @@ mod tests {
                                 gas_used: 0,
                                 blob_gas_used: 0,
                             },
+                            cache_state: Default::default(),
                         }),
                         ..Default::default()
                     }

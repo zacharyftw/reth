@@ -10,7 +10,7 @@ use alloy_primitives::{map::B256Map, BlockNumber, TxHash, B256};
 use parking_lot::RwLock;
 use reth_chainspec::ChainInfo;
 use reth_ethereum_primitives::EthPrimitives;
-use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult, Chain, ExecutionOutcome};
+use reth_execution_types::{BlockExecutionOutput, Chain, ExecutionOutcome};
 use reth_metrics::{metrics::Gauge, Metrics};
 use reth_primitives_traits::{
     BlockBody as _, IndexedTx, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
@@ -766,15 +766,7 @@ impl<N: NodePrimitives> Default for ExecutedBlock<N> {
     fn default() -> Self {
         Self {
             recovered_block: Default::default(),
-            execution_output: Arc::new(BlockExecutionOutput {
-                result: BlockExecutionResult {
-                    receipts: Default::default(),
-                    requests: Default::default(),
-                    gas_used: 0,
-                    blob_gas_used: 0,
-                },
-                state: Default::default(),
-            }),
+            execution_output: Arc::new(BlockExecutionOutput::default()),
             trie_data: DeferredTrieData::ready(ComputedTrieData::default()),
         }
     }

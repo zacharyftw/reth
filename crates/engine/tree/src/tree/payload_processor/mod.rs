@@ -24,7 +24,6 @@ use reth_primitives_traits::{FastInstant as Instant, NodePrimitives};
 use reth_provider::{
     BlockExecutionOutput, BlockReader, DatabaseProviderROFactory, StateProviderFactory, StateReader,
 };
-use reth_revm::db::BundleState;
 use reth_tasks::{utils::increase_thread_priority, ForEachOrdered, Runtime};
 use reth_trie::{hashed_cursor::HashedCursorFactory, trie_cursor::TrieCursorFactory};
 use reth_trie_parallel::{
@@ -681,7 +680,7 @@ where
     pub fn on_inserted_executed_block(
         &self,
         block_with_parent: BlockWithParent,
-        bundle_state: &BundleState,
+        output: &BlockExecutionOutput<impl Send + Sync>,
     ) {
         let disable_cache_metrics = self.disable_cache_metrics;
         self.execution_cache.update_with_guard(|cached| {
@@ -704,11 +703,11 @@ where
                 ),
             };
 
-            // Insert the block's bundle state into cache
+            // Insert the block's full cache state into the execution cache
             let new_cache =
                 SavedCache::new(block_with_parent.block.hash, caches, cache_metrics)
                     .with_disable_cache_metrics(disable_cache_metrics);
-            if new_cache.cache().insert_state(bundle_state).is_err() {
+            if new_cache.cache().insert_state(&output.cache_state, &output.state).is_err() {
                 *cached = None;
                 debug!(target: "engine::caching", "cleared execution cache on update error");
                 return
@@ -965,7 +964,7 @@ mod tests {
     use reth_provider::{
         providers::{BlockchainProvider, OverlayStateProviderFactory},
         test_utils::create_test_provider_factory_with_chain_spec,
-        ChainSpecProvider, HashingWriter,
+        BlockExecutionOutput, ChainSpecProvider, HashingWriter,
     };
     use reth_revm::db::BundleState;
     use reth_testing_utils::generators;
@@ -1071,13 +1070,13 @@ mod tests {
             block: BlockNumHash { hash: block_hash, number: 1 },
             parent: parent_hash,
         };
-        let bundle_state = BundleState::default();
+        let output = BlockExecutionOutput::default();
 
         // Cache should be empty initially
         assert!(payload_processor.execution_cache.get_cache_for(block_hash).is_none());
 
         // Update cache with inserted block
-        payload_processor.on_inserted_executed_block(block_with_parent, &bundle_state);
+        payload_processor.on_inserted_executed_block(block_with_parent, &output);
 
         // Cache should now exist for the block hash
         let cached = payload_processor.execution_cache.get_cache_for(block_hash);
@@ -1107,9 +1106,9 @@ mod tests {
             block: BlockNumHash { hash: block3_hash, number: 3 },
             parent: wrong_parent,
         };
-        let bundle_state = BundleState::default();
+        let output = BlockExecutionOutput::default();
 
-        payload_processor.on_inserted_executed_block(block_with_parent, &bundle_state);
+        payload_processor.on_inserted_executed_block(block_with_parent, &output);
 
         // Cache should still be for block 1 (unchanged)
         let cached = payload_processor.execution_cache.get_cache_for(block1_hash);

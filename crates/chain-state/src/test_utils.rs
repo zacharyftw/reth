@@ -241,6 +241,7 @@ impl<N: NodePrimitives> TestBlockBuilder<N> {
                         blob_gas_used: 0,
                     },
                     state: BundleState::default(),
+                    cache_state: Default::default(),
                 }),
                 ComputedTrieData::default(),
             );
@@ -327,6 +328,7 @@ impl<N: NodePrimitives> TestBlockBuilder<N> {
                     blob_gas_used: 0,
                 },
                 state: bundle,
+                cache_state: Default::default(),
             }),
             trie_data,
         );

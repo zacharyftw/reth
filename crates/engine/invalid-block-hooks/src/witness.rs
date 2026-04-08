@@ -841,6 +841,7 @@ mod tests {
                 gas_used: 0,
                 blob_gas_used: 0,
             },
+            cache_state: Default::default(),
         };
 
         // Create test trie updates

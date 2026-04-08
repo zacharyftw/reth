@@ -575,7 +575,7 @@ mod tests {
     use metrics_util::debugging::{DebuggingRecorder, Snapshotter};
     use reth_ethereum_primitives::Receipt;
     use reth_execution_types::BlockExecutionResult;
-    use reth_revm::db::BundleState;
+    use reth_revm::db::{BundleState, CacheState};
 
     fn setup_test_recorder() -> Snapshotter {
         let recorder = DebuggingRecorder::new();
@@ -602,6 +602,7 @@ mod tests {
                 gas_used: 21000,
                 blob_gas_used: 0,
             },
+            cache_state: CacheState::default(),
         };
 
         metrics.record_block_execution(&output, Duration::from_millis(100));
