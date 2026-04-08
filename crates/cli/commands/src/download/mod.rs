@@ -261,11 +261,13 @@ pub struct DownloadCommand<C: ChainSpecParser> {
     #[arg(long, short = 'y')]
     non_interactive: bool,
 
-    /// Use resumable two-phase downloads (download to disk first, then extract).
+    /// Enable resumable downloads with HTTP Range support.
     ///
-    /// Archives are downloaded to a .part file with HTTP Range resume support
-    /// before extraction. Slower but tolerates network interruptions without
-    /// restarting. By default, archives stream directly into the extractor.
+    /// On a fresh download, streams the archive into the extractor while
+    /// simultaneously caching compressed bytes to a .part file on disk. If
+    /// the download is interrupted, the next attempt resumes from the cached
+    /// bytes via HTTP Range requests. By default, archives stream directly
+    /// into the extractor without caching to disk.
     #[arg(long)]
     resumable: bool,
 
@@ -1149,6 +1151,76 @@ impl<R: Read> Read for SharedProgressReader<R> {
     }
 }
 
+/// Reader adapter that tees all read bytes into a writer.
+///
+/// Every chunk read from the inner reader is also written to the tee writer,
+/// enabling simultaneous download-to-disk and decompression/extraction.
+struct TeeReader<R, W: Write> {
+    reader: R,
+    writer: BufWriter<W>,
+}
+
+impl<R: Read, W: Write> Read for TeeReader<R, W> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.reader.read(buf)?;
+        if n > 0 {
+            self.writer.write_all(&buf[..n])?;
+        }
+        Ok(n)
+    }
+}
+
+/// Downloads and extracts simultaneously while caching compressed bytes to disk.
+///
+/// Streams the HTTP response through a [`TeeReader`] that writes compressed bytes
+/// to `cache_path` while feeding them into the decompressor/extractor in parallel.
+/// On success the cache file is removed. On failure the partial cache remains so
+/// a subsequent [`resumable_download`] call can resume the download via HTTP Range.
+fn resumable_stream_and_extract(
+    url: &str,
+    format: CompressionFormat,
+    cache_path: &Path,
+    target_dir: &Path,
+    shared: Option<&Arc<SharedProgress>>,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    let quiet = shared.is_some();
+    let client = BlockingClient::builder().connect_timeout(Duration::from_secs(30)).build()?;
+
+    let response = client.get(url).send().and_then(|r| r.error_for_status())?;
+
+    if !quiet && let Some(size) = response.content_length() {
+        info!(target: "reth::cli",
+            url = %url,
+            size = %DownloadProgress::format_size(size),
+            "Streaming (resumable) download + extract"
+        );
+    }
+
+    let cache_file = fs::create_file(cache_path)?;
+    let tee = TeeReader { reader: response, writer: BufWriter::new(cache_file) };
+
+    let result = if let Some(sp) = shared {
+        let reader = SharedProgressReader { inner: tee, progress: Arc::clone(sp) };
+        extract_archive_raw(reader, format, target_dir)
+    } else {
+        let total_size = 0; // unknown for tee path
+        extract_archive(tee, total_size, format, target_dir, cancel_token)
+    };
+
+    match result {
+        Ok(()) => {
+            // Extraction succeeded — cache file no longer needed
+            let _ = fs::remove_file(cache_path);
+            Ok(())
+        }
+        Err(e) => {
+            // Cache file stays on disk for HTTP Range resume on next attempt
+            Err(e)
+        }
+    }
+}
+
 /// Downloads a file with resume support using HTTP Range requests.
 /// Automatically retries on failure, resuming from where it left off.
 /// Returns the path to the downloaded file and its total size.
@@ -1400,6 +1472,11 @@ fn streaming_download_and_extract(
 }
 
 /// Fetches the snapshot from a remote URL with resume support, then extracts it.
+///
+/// When starting fresh (no existing `.part` file), streams the download through a
+/// [`TeeReader`] so extraction happens simultaneously with the download. When a
+/// partial `.part` file exists from a prior interrupted attempt, falls back to
+/// finishing the download first and then extracting from the completed file.
 fn download_and_extract(
     url: &str,
     format: CompressionFormat,
@@ -1407,16 +1484,39 @@ fn download_and_extract(
     shared: Option<&Arc<SharedProgress>>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
+    let file_name = Url::parse(url)
+        .ok()
+        .and_then(|u| u.path_segments()?.next_back().map(|s| s.to_string()))
+        .unwrap_or_else(|| "snapshot.tar".to_string());
+
+    let cache_path = target_dir.join(&file_name);
+    let part_path = target_dir.join(format!("{file_name}.part"));
+
+    let has_partial = fs::metadata(&part_path).map(|m| m.len() > 0).unwrap_or(false);
+
+    if !has_partial {
+        // Fresh download: stream + extract simultaneously, cache to .part for resume
+        return resumable_stream_and_extract(
+            url,
+            format,
+            &part_path,
+            target_dir,
+            shared,
+            cancel_token,
+        );
+    }
+
+    // Partial .part exists: finish download first, then extract from completed file
     let quiet = shared.is_some();
     let (downloaded_path, total_size) =
         resumable_download(url, target_dir, shared, cancel_token.clone())?;
 
-    let file_name =
+    let dl_name =
         downloaded_path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
 
     if !quiet {
         info!(target: "reth::cli",
-            file = %file_name,
+            file = %dl_name,
             size = %DownloadProgress::format_size(total_size),
             "Extracting archive"
         );
@@ -1424,17 +1524,17 @@ fn download_and_extract(
     let file = fs::open(&downloaded_path)?;
 
     if quiet {
-        // Skip progress tracking for extraction in parallel mode
         extract_archive_raw(file, format, target_dir)?;
     } else {
         extract_archive(file, total_size, format, target_dir, cancel_token)?;
         info!(target: "reth::cli",
-            file = %file_name,
+            file = %dl_name,
             "Extraction complete"
         );
     }
 
     fs::remove_file(&downloaded_path)?;
+    let _ = fs::remove_file(&cache_path);
 
     if let Some(sp) = shared {
         sp.archive_done();
@@ -1446,8 +1546,9 @@ fn download_and_extract(
 /// Downloads and extracts a snapshot, blocking until finished.
 ///
 /// Supports `file://` URLs for local files and HTTP(S) URLs for remote downloads.
-/// When `resumable` is true, downloads to a `.part` file first with HTTP Range resume
-/// support. Otherwise streams directly into the extractor.
+/// When `resumable` is true, streams directly into the extractor while caching
+/// compressed bytes to a `.part` file for HTTP Range resume on failure. If a
+/// partial `.part` already exists, finishes the download first then extracts.
 fn blocking_download_and_extract(
     url: &str,
     target_dir: &Path,
@@ -1488,7 +1589,8 @@ fn blocking_download_and_extract(
 ///
 /// When `shared` is provided, download progress is reported to the shared
 /// counter for aggregated display. Otherwise uses a local progress bar.
-/// When `resumable` is true, uses two-phase download with `.part` files.
+/// When `resumable` is true, caches compressed bytes to `.part` files for
+/// HTTP Range resume while extracting simultaneously.
 async fn stream_and_extract(
     url: &str,
     target_dir: &Path,
@@ -1559,16 +1661,32 @@ fn blocking_process_modular_archive(
             let cache_dir = cache_dir.ok_or_else(|| eyre::eyre!("Missing cache directory"))?;
             let archive_path = cache_dir.join(&archive.file_name);
             let part_path = cache_dir.join(format!("{}.part", archive.file_name));
-            let result =
+
+            let has_partial = fs::metadata(&part_path).map(|m| m.len() > 0).unwrap_or(false);
+
+            let result = if !has_partial {
+                // Fresh: stream download + extract simultaneously, tee to .part
+                resumable_stream_and_extract(
+                    &archive.url,
+                    format,
+                    &part_path,
+                    target_dir,
+                    shared.as_ref(),
+                    cancel_token.clone(),
+                )
+            } else {
+                // Partial .part exists: finish download, then extract
                 resumable_download(&archive.url, cache_dir, shared.as_ref(), cancel_token.clone())
                     .and_then(|(downloaded_path, _)| {
                         let file = fs::open(&downloaded_path)?;
-                        extract_archive_raw(file, format, target_dir)
-                    });
-            let _ = fs::remove_file(&archive_path);
-            let _ = fs::remove_file(&part_path);
+                        let res = extract_archive_raw(file, format, target_dir);
+                        let _ = fs::remove_file(&downloaded_path);
+                        res
+                    })
+            };
 
             if let Err(e) = result {
+                // Keep .part for HTTP Range resume on next attempt
                 warn!(target: "reth::cli",
                     file = %archive.file_name,
                     component = %planned.component,
@@ -1582,6 +1700,10 @@ fn blocking_process_modular_archive(
                 }
                 continue;
             }
+
+            // Clean up cache only after successful extraction
+            let _ = fs::remove_file(&archive_path);
+            let _ = fs::remove_file(&part_path);
         } else {
             // streaming_download_and_extract already has its own internal retry loop
             streaming_download_and_extract(
