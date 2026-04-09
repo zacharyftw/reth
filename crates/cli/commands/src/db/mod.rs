@@ -1,28 +1,14 @@
 use crate::common::{AccessRights, CliNodeTypes, Environment, EnvironmentArgs};
-use alloy_primitives::B256;
 use clap::{Parser, Subcommand};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_runner::CliContext;
-use reth_consensus::noop::NoopConsensus;
-use reth_db::{
-    version::{get_db_version, DatabaseVersionError, DB_VERSION},
-    DatabaseEnv,
-};
+use reth_db::version::{get_db_version, DatabaseVersionError, DB_VERSION};
 use reth_db_common::DbTool;
-use reth_downloaders::{bodies::noop::NoopBodiesDownloader, headers::noop::NoopHeaderDownloader};
-use reth_evm::noop::NoopEvmConfig;
-use reth_node_builder::NodeTypesWithDBAdapter;
-use reth_provider::StageCheckpointReader;
-use reth_stages::{sets::DefaultStages, Pipeline};
-use reth_stages_types::StageId;
-use reth_static_file::StaticFileProducer;
 use std::{
     io::{self, Write},
     sync::Arc,
 };
-use tokio::sync::watch;
-use tracing::info;
 mod account_storage;
 mod checksum;
 mod clear;
@@ -253,56 +239,14 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
                 let Environment { provider_factory, config, .. } =
                     self.env.init::<N>(AccessRights::RW, ctx.task_executor.clone())?;
 
-                let tool = DbTool::new(provider_factory.clone())?;
-                command.execute(&tool)?;
+                // Migrate changesets+receipts, clear tables, compact MDBX
+                command.execute::<N>(provider_factory).await?;
 
-                // Run pipeline to rebuild senders, indices, and trie
-                info!(target: "reth::cli", "Running pipeline to rebuild cleared tables");
+                // Reopen DB after compaction swap and run pipeline to rebuild
+                let Environment { provider_factory, .. } =
+                    self.env.init::<N>(AccessRights::RW, ctx.task_executor.clone())?;
 
-                let tip = provider_factory
-                    .provider()?
-                    .get_stage_checkpoint(StageId::Execution)?
-                    .map(|c| c.block_number)
-                    .unwrap_or(0);
-
-                let (_tip_tx, tip_rx) = watch::channel(B256::ZERO);
-
-                let mut pipeline = Pipeline::<NodeTypesWithDBAdapter<N, DatabaseEnv>>::builder()
-                    .with_max_block(tip)
-                    .add_stages(DefaultStages::new(
-                        provider_factory.clone(),
-                        tip_rx,
-                        Arc::new(NoopConsensus::default()),
-                        NoopHeaderDownloader::default(),
-                        NoopBodiesDownloader::default(),
-                        NoopEvmConfig::<N::Evm>::default(),
-                        config.stages.clone(),
-                        config.prune.segments.clone(),
-                        None,
-                    ))
-                    .build(
-                        provider_factory.clone(),
-                        StaticFileProducer::new(
-                            provider_factory.clone(),
-                            config.prune.segments.clone(),
-                        ),
-                    );
-
-                pipeline.run().await?;
-
-                info!(target: "reth::cli", "Pipeline finished, compacting MDBX");
-
-                // Compact MDBX while DB handle is still open
-                migrate_v2::Command::compact_mdbx(tool.provider_factory.db_ref())?;
-
-                // Drop everything to release the DB handle
-                drop(pipeline);
-                drop(tool);
-                drop(provider_factory);
-
-                // Swap compacted copy in
-                let compact_path = db_path.with_file_name("db_compact");
-                migrate_v2::Command::swap_compacted_db(&db_path, &compact_path)?;
+                migrate_v2::Command::run_pipeline::<N>(provider_factory, &config).await?;
             }
         }
 

@@ -1,15 +1,18 @@
 //! `reth db migrate-v2` command for migrating v1 storage layout to v2.
 //!
 //! Migrates data that cannot be recomputed (changesets + receipts) from MDBX to
-//! static files, clears tables that *can* be recomputed (senders, indices, trie,
-//! plain state), resets the corresponding stage checkpoints, and flips
-//! `StorageSettings` to v2. The node will rebuild the cleared tables via the
-//! normal pipeline on next startup.
+//! static files, clears recomputable tables (senders, indices, trie, plain
+//! state), compacts MDBX, then runs the pipeline to rebuild them.
 
+use crate::common::CliNodeTypes;
+use alloy_primitives::B256;
 use clap::Parser;
+use reth_config::Config;
+use reth_consensus::noop::NoopConsensus;
 use reth_db::{
     mdbx::{self, ffi},
     models::StorageBeforeTx,
+    DatabaseEnv,
 };
 use reth_db_api::{
     cursor::DbCursorRO,
@@ -18,17 +21,22 @@ use reth_db_api::{
     tables,
     transaction::{DbTx, DbTxMut},
 };
-use reth_db_common::DbTool;
+use reth_downloaders::{bodies::noop::NoopBodiesDownloader, headers::noop::NoopHeaderDownloader};
+use reth_evm::noop::NoopEvmConfig;
+use reth_node_builder::NodeTypesWithDBAdapter;
 use reth_provider::{
     providers::ProviderNodeTypes, DBProvider, DatabaseProviderFactory, MetadataProvider,
-    MetadataWriter, PruneCheckpointReader, StageCheckpointWriter, StaticFileProviderFactory,
-    StaticFileWriter, StorageSettings,
+    MetadataWriter, ProviderFactory, PruneCheckpointReader, StageCheckpointWriter,
+    StaticFileProviderFactory, StaticFileWriter, StorageSettings,
 };
 use reth_prune_types::PruneSegment;
+use reth_stages::{sets::DefaultStages, Pipeline};
 use reth_stages_types::{StageCheckpoint, StageId};
+use reth_static_file::StaticFileProducer;
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::StageCheckpointReader;
-use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::watch;
 use tracing::info;
 
 /// `reth db migrate-v2` command
@@ -36,12 +44,17 @@ use tracing::info;
 pub struct Command;
 
 impl Command {
-    /// Execute the migration.
+    /// Execute the full v1 → v2 migration:
     ///
-    /// Only migrates changesets + receipts (data that cannot be recomputed),
-    /// then clears recomputable tables and resets their stage checkpoints.
-    /// The pipeline will rebuild senders, indices, trie, etc. on next startup.
-    pub fn execute<N: ProviderNodeTypes>(self, tool: &DbTool<N>) -> eyre::Result<()>
+    /// 1. Migrate changesets + receipts to static files
+    /// 2. Flip `StorageSettings` to v2
+    /// 3. Clear recomputable MDBX tables + reset stage checkpoints
+    /// 4. Compact MDBX
+    /// 5. Run pipeline to rebuild senders, indices, and trie
+    pub async fn execute<N: CliNodeTypes>(
+        self,
+        provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, DatabaseEnv>>,
+    ) -> eyre::Result<()>
     where
         N::Primitives: reth_primitives_traits::NodePrimitives<
             Receipt: reth_db_api::table::Value + reth_codecs::Compact,
@@ -50,7 +63,7 @@ impl Command {
         // === Phase 0: Preflight ===
         info!(target: "reth::cli", "Starting v1 → v2 storage migration");
 
-        let provider = tool.provider_factory.provider()?;
+        let provider = provider_factory.provider()?;
         let current_settings = provider.storage_settings()?;
 
         if current_settings.is_some_and(|s| s.is_v2()) {
@@ -63,9 +76,8 @@ impl Command {
 
         info!(target: "reth::cli", tip, "Chain tip block number");
 
-        let sf_provider = tool.provider_factory.static_file_provider();
+        let sf_provider = provider_factory.static_file_provider();
 
-        // Check that target static file segments are empty
         for segment in [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets]
         {
             if sf_provider.get_highest_static_file_block(segment).is_some() {
@@ -79,67 +91,99 @@ impl Command {
         drop(provider);
         info!(target: "reth::cli", "Preflight checks passed");
 
-        // === Phase 1: AccountChangeSets → static files ===
-        self.migrate_account_changesets(tool, tip)?;
+        // === Phase 1: Migrate changesets → static files ===
+        Self::migrate_account_changesets(&provider_factory, tip)?;
+        Self::migrate_storage_changesets(&provider_factory, tip)?;
 
-        // === Phase 2: StorageChangeSets → static files ===
-        self.migrate_storage_changesets(tool, tip)?;
+        // === Phase 2: Migrate receipts → static files ===
+        Self::migrate_receipts::<NodeTypesWithDBAdapter<N, DatabaseEnv>>(&provider_factory, tip)?;
 
-        // === Phase 3: Receipts → static files ===
-        self.migrate_receipts::<N>(tool, tip)?;
-
-        // === Phase 4: Update metadata to v2 ===
+        // === Phase 3: Flip metadata to v2 ===
         info!(target: "reth::cli", "Writing StorageSettings v2 metadata");
         {
-            let provider_rw = tool.provider_factory.database_provider_rw()?;
+            let provider_rw = provider_factory.database_provider_rw()?;
             provider_rw.write_storage_settings(StorageSettings::v2())?;
             provider_rw.commit()?;
         }
         info!(target: "reth::cli", "Storage settings updated to v2");
 
-        // === Phase 5: Clear recomputable tables and reset stage checkpoints ===
-        self.clear_recomputable_tables(tool)?;
+        // === Phase 4: Clear recomputable tables ===
+        Self::clear_recomputable_tables(&provider_factory)?;
 
-        info!(target: "reth::cli", "Migration complete! Start the node to rebuild indices, senders, and trie.");
+        // === Phase 5: Compact MDBX (before pipeline, so it runs on a smaller DB) ===
+        let db_path = provider_factory.db_ref().path();
+        Self::compact_mdbx(provider_factory.db_ref())?;
+
+        // Drop to release DB handle for swap
+        drop(provider_factory);
+
+        let compact_path = db_path.with_file_name("db_compact");
+        Self::swap_compacted_db(&db_path, &compact_path)?;
+
+        // === Phase 6: Reopen DB and run pipeline ===
+        // The caller will reopen the environment and run the pipeline.
+        // We return here — the pipeline step is handled in mod.rs after
+        // reopening the database with the compacted copy.
+        info!(target: "reth::cli", "Migration data phases complete");
         Ok(())
     }
 
-    /// Swaps the original MDBX database with a compacted copy.
+    /// Builds and runs the pipeline to rebuild cleared tables.
     ///
-    /// Must be called after the database handle has been dropped.
-    pub fn swap_compacted_db(
-        db_path: &std::path::Path,
-        compact_path: &std::path::Path,
-    ) -> eyre::Result<()> {
-        let backup_path = db_path.with_file_name("db_pre_compact");
+    /// Must be called after the database has been compacted and reopened.
+    pub async fn run_pipeline<N: CliNodeTypes>(
+        provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, DatabaseEnv>>,
+        config: &Config,
+    ) -> eyre::Result<()>
+    where
+        N::Primitives: reth_primitives_traits::NodePrimitives<
+            Receipt: reth_db_api::table::Value + reth_codecs::Compact,
+        >,
+    {
+        let tip = provider_factory
+            .provider()?
+            .get_stage_checkpoint(StageId::Execution)?
+            .map(|c| c.block_number)
+            .unwrap_or(0);
 
-        info!(target: "reth::cli", ?db_path, ?compact_path, "Swapping compacted database");
+        info!(target: "reth::cli", tip, "Running pipeline to rebuild tables");
 
-        std::fs::rename(db_path, &backup_path)?;
+        let (_tip_tx, tip_rx) = watch::channel(B256::ZERO);
 
-        if let Err(e) = std::fs::rename(compact_path, db_path) {
-            let _ = std::fs::rename(&backup_path, db_path);
-            return Err(e.into());
-        }
+        let mut pipeline = Pipeline::<NodeTypesWithDBAdapter<N, DatabaseEnv>>::builder()
+            .with_max_block(tip)
+            .add_stages(DefaultStages::new(
+                provider_factory.clone(),
+                tip_rx,
+                Arc::new(NoopConsensus::default()),
+                NoopHeaderDownloader::default(),
+                NoopBodiesDownloader::default(),
+                NoopEvmConfig::<N::Evm>::default(),
+                config.stages.clone(),
+                config.prune.segments.clone(),
+                None,
+            ))
+            .build(
+                provider_factory.clone(),
+                StaticFileProducer::new(provider_factory, config.prune.segments.clone()),
+            );
 
-        std::fs::remove_dir_all(&backup_path)?;
+        pipeline.run().await?;
 
-        info!(target: "reth::cli", "Database compaction swap complete");
+        info!(target: "reth::cli", "Pipeline finished");
         Ok(())
     }
 
     fn migrate_account_changesets<N: ProviderNodeTypes>(
-        &self,
-        tool: &DbTool<N>,
+        factory: &ProviderFactory<N>,
         tip: u64,
     ) -> eyre::Result<()> {
         info!(target: "reth::cli", "Migrating AccountChangeSets → static files");
-        let provider = tool.provider_factory.provider()?.disable_long_read_transaction_safety();
-        let sf_provider = tool.provider_factory.static_file_provider();
+        let provider = factory.provider()?.disable_long_read_transaction_safety();
+        let sf_provider = factory.static_file_provider();
 
         let mut cursor = provider.tx_ref().cursor_read::<tables::AccountChangeSets>()?;
 
-        // Find the first unpruned block from AccountHistory prune checkpoint
         let first_block = provider
             .get_prune_checkpoint(PruneSegment::AccountHistory)?
             .and_then(|cp| cp.block_number)
@@ -167,24 +211,21 @@ impl Command {
         }
 
         writer.commit()?;
-        drop(provider);
 
         info!(target: "reth::cli", count, "AccountChangeSets migrated");
         Ok(())
     }
 
     fn migrate_storage_changesets<N: ProviderNodeTypes>(
-        &self,
-        tool: &DbTool<N>,
+        factory: &ProviderFactory<N>,
         tip: u64,
     ) -> eyre::Result<()> {
         info!(target: "reth::cli", "Migrating StorageChangeSets → static files");
-        let provider = tool.provider_factory.provider()?.disable_long_read_transaction_safety();
-        let sf_provider = tool.provider_factory.static_file_provider();
+        let provider = factory.provider()?.disable_long_read_transaction_safety();
+        let sf_provider = factory.static_file_provider();
 
         let mut cursor = provider.tx_ref().cursor_read::<tables::StorageChangeSets>()?;
 
-        // Find the first unpruned block from StorageHistory prune checkpoint
         let first_block = provider
             .get_prune_checkpoint(PruneSegment::StorageHistory)?
             .and_then(|cp| cp.block_number)
@@ -216,28 +257,28 @@ impl Command {
         }
 
         writer.commit()?;
-        drop(provider);
 
         info!(target: "reth::cli", count, "StorageChangeSets migrated");
         Ok(())
     }
 
-    fn migrate_receipts<N: ProviderNodeTypes>(&self, tool: &DbTool<N>, tip: u64) -> eyre::Result<()>
+    fn migrate_receipts<N: ProviderNodeTypes>(
+        factory: &ProviderFactory<N>,
+        tip: u64,
+    ) -> eyre::Result<()>
     where
         N::Primitives: reth_primitives_traits::NodePrimitives<
             Receipt: reth_db_api::table::Value + reth_codecs::Compact,
         >,
     {
-        // If receipt log filter pruning is enabled, receipts must stay in MDBX
-        let provider = tool.provider_factory.provider()?;
+        let provider = factory.provider()?;
         if !provider.prune_modes_ref().receipts_log_filter.is_empty() {
             info!(target: "reth::cli", "Receipt log filter pruning is enabled, keeping receipts in MDBX");
-            drop(provider);
             return Ok(());
         }
         drop(provider);
 
-        let sf_provider = tool.provider_factory.static_file_provider();
+        let sf_provider = factory.static_file_provider();
         let existing = sf_provider.get_highest_static_file_block(StaticFileSegment::Receipts);
 
         if existing.is_some_and(|b| b >= tip) {
@@ -247,7 +288,7 @@ impl Command {
 
         info!(target: "reth::cli", "Migrating Receipts → static files");
 
-        let provider = tool.provider_factory.provider()?.disable_long_read_transaction_safety();
+        let provider = factory.provider()?.disable_long_read_transaction_safety();
         let prune_start = provider
             .get_prune_checkpoint(PruneSegment::Receipts)?
             .and_then(|cp| cp.block_number)
@@ -266,13 +307,12 @@ impl Command {
     }
 
     /// Clears tables that can be recomputed by the pipeline and resets their
-    /// stage checkpoints. The node will rebuild them on next startup.
+    /// stage checkpoints.
     fn clear_recomputable_tables<N: ProviderNodeTypes>(
-        &self,
-        tool: &DbTool<N>,
+        factory: &ProviderFactory<N>,
     ) -> eyre::Result<()> {
         info!(target: "reth::cli", "Clearing recomputable MDBX tables");
-        let db = tool.provider_factory.db_ref();
+        let db = factory.db_ref();
 
         macro_rules! clear_table {
             ($table:ty) => {{
@@ -287,11 +327,10 @@ impl Command {
         clear_table!(tables::AccountChangeSets);
         clear_table!(tables::StorageChangeSets);
 
-        // Senders — will be recomputed by SenderRecovery stage
+        // Senders — rebuilt by SenderRecovery
         clear_table!(tables::TransactionSenders);
 
-        // Indices — will be recomputed by TransactionLookup / IndexAccountHistory /
-        // IndexStorageHistory
+        // Indices — rebuilt by TransactionLookup / IndexAccountHistory / IndexStorageHistory
         clear_table!(tables::TransactionHashNumbers);
         clear_table!(tables::AccountsHistory);
         clear_table!(tables::StoragesHistory);
@@ -300,13 +339,13 @@ impl Command {
         clear_table!(tables::PlainAccountState);
         clear_table!(tables::PlainStorageState);
 
-        // Trie — will be rebuilt by MerkleExecute
+        // Trie — rebuilt by MerkleExecute
         clear_table!(tables::AccountsTrie);
         clear_table!(tables::StoragesTrie);
 
         // Reset stage checkpoints so the pipeline rebuilds everything
         info!(target: "reth::cli", "Resetting stage checkpoints");
-        let provider_rw = tool.provider_factory.database_provider_rw()?;
+        let provider_rw = factory.database_provider_rw()?;
         for stage in [
             StageId::SenderRecovery,
             StageId::TransactionLookup,
@@ -321,15 +360,12 @@ impl Command {
         provider_rw.save_stage_checkpoint_progress(StageId::MerkleExecute, vec![])?;
         provider_rw.commit()?;
 
-        info!(target: "reth::cli", "Recomputable tables cleared and checkpoints reset");
+        info!(target: "reth::cli", "Recomputable tables cleared");
         Ok(())
     }
 
-    /// Creates a compacted copy of the MDBX database to `<db_path>/../db_compact/`.
-    ///
-    /// Returns the path to the compacted copy. The caller must swap it with the
-    /// original after dropping the database handle.
-    pub fn compact_mdbx(db: &mdbx::DatabaseEnv) -> eyre::Result<PathBuf> {
+    /// Creates a compacted copy of the MDBX database.
+    fn compact_mdbx(db: &mdbx::DatabaseEnv) -> eyre::Result<()> {
         let db_path = db.path();
         let compact_path = db_path.with_file_name("db_compact");
 
@@ -355,6 +391,28 @@ impl Command {
         }
 
         info!(target: "reth::cli", "MDBX compaction complete");
-        Ok(compact_path)
+        Ok(())
+    }
+
+    /// Swaps the original MDBX database with a compacted copy.
+    fn swap_compacted_db(
+        db_path: &std::path::Path,
+        compact_path: &std::path::Path,
+    ) -> eyre::Result<()> {
+        let backup_path = db_path.with_file_name("db_pre_compact");
+
+        info!(target: "reth::cli", ?db_path, ?compact_path, "Swapping compacted database");
+
+        std::fs::rename(db_path, &backup_path)?;
+
+        if let Err(e) = std::fs::rename(compact_path, db_path) {
+            let _ = std::fs::rename(&backup_path, db_path);
+            return Err(e.into());
+        }
+
+        std::fs::remove_dir_all(&backup_path)?;
+
+        info!(target: "reth::cli", "Database compaction swap complete");
+        Ok(())
     }
 }
