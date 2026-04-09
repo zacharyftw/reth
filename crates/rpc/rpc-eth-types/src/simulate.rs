@@ -15,6 +15,7 @@ use alloy_rpc_types_eth::{
 };
 use jsonrpsee_types::ErrorObject;
 use reth_evm::{
+    block::TxResult,
     execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutor},
     Evm, HaltReasonFor,
 };
@@ -198,8 +199,9 @@ where
         // The effect for a layer-2 execution client is that it does not charge L1 cost.
         let tx = WithEncoded::new(Default::default(), tx);
 
-        builder
-            .execute_transaction_with_result_closure(tx, |result| results.push(result.clone()))?;
+        builder.execute_transaction_with_result_closure(tx, |result| {
+            results.push(result.result().result.clone())
+        })?;
     }
 
     // Pass noop provider to skip state root calculations.
