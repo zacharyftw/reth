@@ -348,11 +348,19 @@ impl Command {
 
         info!(target: "reth::cli", "Migrating Receipts → static files");
 
-        let start_block = existing.map_or(0, |b| b + 1);
-        let block_range = start_block..=tip;
-
-        // Use existing Segment implementation for receipts
+        // Find the first block that has receipts data (may be non-zero on pruned nodes)
         let provider = tool.provider_factory.provider()?.disable_long_read_transaction_safety();
+        let mut block_cursor = provider.tx_ref().cursor_read::<tables::BlockBodyIndices>()?;
+        let first_block = match block_cursor.first()? {
+            Some((block, _)) => block.max(existing.map_or(0, |b| b + 1)),
+            None => {
+                info!(target: "reth::cli", "No BlockBodyIndices found, skipping Receipts");
+                return Ok(());
+            }
+        };
+        drop(block_cursor);
+
+        let block_range = first_block..=tip;
 
         let segment = reth_static_file::segments::Receipts;
         reth_static_file::segments::Segment::copy_to_static_files(&segment, provider, block_range)?;
