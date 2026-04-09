@@ -37,19 +37,16 @@ use tracing::info;
 
 /// `reth db migrate-v2` command
 #[derive(Debug, Parser)]
-pub struct Command {
-    /// Prune migrated data from MDBX tables after successful migration.
-    #[arg(long)]
-    prune_mdbx: bool,
-}
+pub struct Command;
 
 impl Command {
     /// Execute the migration.
     ///
-    /// Returns `true` if MDBX tables were pruned and the database should be
-    /// compacted. The caller should run [`Self::compact_mdbx`] and
-    /// [`Self::swap_compacted_db`] after dropping the database handle.
-    pub fn execute<N: ProviderNodeTypes>(self, tool: &DbTool<N>) -> eyre::Result<bool>
+    /// Migrates all v1 data to v2 layout, prunes the now-redundant MDBX tables
+    /// (including plain state), and compacts the database. The caller must run
+    /// [`Self::compact_mdbx`] while the DB handle is still open, then
+    /// [`Self::swap_compacted_db`] after dropping it.
+    pub fn execute<N: ProviderNodeTypes>(self, tool: &DbTool<N>) -> eyre::Result<()>
     where
         N::Primitives: reth_primitives_traits::NodePrimitives<
             Receipt: reth_db_api::table::Value + reth_codecs::Compact,
@@ -63,7 +60,7 @@ impl Command {
 
         if current_settings.is_some_and(|s| s.is_v2()) {
             info!(target: "reth::cli", "Storage is already v2, nothing to do");
-            return Ok(false);
+            return Ok(());
         }
 
         let tip =
@@ -133,13 +130,11 @@ impl Command {
         provider_rw.commit()?;
         info!(target: "reth::cli", "Storage settings updated to v2");
 
-        // === Phase 10: Optional MDBX pruning ===
-        if self.prune_mdbx {
-            self.prune_migrated_tables(tool)?;
-        }
+        // === Phase 10: Prune migrated MDBX tables and plain state ===
+        self.prune_migrated_tables(tool)?;
 
         info!(target: "reth::cli", "Migration complete!");
-        Ok(self.prune_mdbx)
+        Ok(())
     }
 
     /// Swaps the original MDBX database with a compacted copy.
@@ -333,6 +328,16 @@ impl Command {
             Receipt: reth_db_api::table::Value + reth_codecs::Compact,
         >,
     {
+        // If receipt log filter pruning is enabled, receipts must stay in MDBX
+        // (v2 doesn't support static file receipts with log filter pruning yet).
+        let provider = tool.provider_factory.provider()?;
+        if !provider.prune_modes_ref().receipts_log_filter.is_empty() {
+            info!(target: "reth::cli", "Receipt log filter pruning is enabled, keeping receipts in MDBX");
+            drop(provider);
+            return Ok(());
+        }
+        drop(provider);
+
         let sf_provider = tool.provider_factory.static_file_provider();
         let existing = sf_provider.get_highest_static_file_block(StaticFileSegment::Receipts);
 
