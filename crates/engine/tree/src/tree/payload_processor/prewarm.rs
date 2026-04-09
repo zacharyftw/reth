@@ -351,7 +351,7 @@ where
         let executor = &self.executor;
         let parent_span = Span::current();
         let prefetch_parent_span = parent_span.clone();
-        let stream_parent_span = parent_span.clone();
+        let stream_parent_span = parent_span;
         let prefetch_bal = Arc::clone(&bal);
         let stream_bal = Arc::clone(&bal);
 
@@ -714,7 +714,8 @@ where
 
     /// Prefetches storage slots for a single BAL account into the cache.
     ///
-    /// Account reads are handled separately by [`send_bal_hashed_state`], so this method only
+    /// Account reads are handled separately by [`Self::send_bal_hashed_state`], so this method
+    /// only
     /// warms storage.
     ///
     /// The `provider` is lazily initialized on first call and reused across accounts on the same
