@@ -178,13 +178,24 @@ impl Command {
         info!(target: "reth::cli", "Migrating TransactionSenders → static files");
         let provider = tool.provider_factory.provider()?;
         let sf_provider = tool.provider_factory.static_file_provider();
-        let mut writer = sf_provider.latest_writer(StaticFileSegment::TransactionSenders)?;
 
         let mut sender_cursor = provider.tx_ref().cursor_read::<tables::TransactionSenders>()?;
         let mut block_cursor = provider.tx_ref().cursor_read::<tables::BlockBodyIndices>()?;
 
+        // Find the first available block (may be non-zero on pruned nodes)
+        let first_block = match block_cursor.first()? {
+            Some((block, _)) => block,
+            None => {
+                info!(target: "reth::cli", "No BlockBodyIndices found, skipping TransactionSenders");
+                return Ok(());
+            }
+        };
+
+        let mut writer =
+            sf_provider.get_writer(first_block, StaticFileSegment::TransactionSenders)?;
+
         let mut count = 0u64;
-        let block_walker = block_cursor.walk(Some(0))?;
+        let block_walker = block_cursor.walk(Some(first_block))?;
         for result in block_walker {
             let (block_number, body_indices) = result?;
             if block_number > tip {
@@ -205,6 +216,8 @@ impl Command {
             }
         }
 
+        // Fill trailing empty blocks up to tip
+        writer.ensure_at_block(tip)?;
         writer.commit()?;
         drop(provider);
 
@@ -220,19 +233,28 @@ impl Command {
         info!(target: "reth::cli", "Migrating AccountChangeSets → static files");
         let provider = tool.provider_factory.provider()?;
         let sf_provider = tool.provider_factory.static_file_provider();
-        let mut writer = sf_provider.latest_writer(StaticFileSegment::AccountChangeSets)?;
 
         let mut cursor = provider.tx_ref().cursor_read::<tables::AccountChangeSets>()?;
 
-        let mut count = 0u64;
-        // Use a peekable walker so we can look ahead without consuming
-        let mut walker = cursor.walk(Some(0))?.peekable();
+        // Find the first available block
+        let first_block = match cursor.first()? {
+            Some((block, _)) => block,
+            None => {
+                info!(target: "reth::cli", "No AccountChangeSets found, skipping");
+                return Ok(());
+            }
+        };
 
-        // Iterate ALL blocks from 0..=tip, appending empty changesets for blocks with no entries
-        for block in 0..=tip {
+        let mut writer =
+            sf_provider.get_writer(first_block, StaticFileSegment::AccountChangeSets)?;
+
+        let mut count = 0u64;
+        let mut walker = cursor.walk(Some(first_block))?.peekable();
+
+        // Iterate all blocks from first_block..=tip, including empty ones
+        for block in first_block..=tip {
             let mut entries = Vec::new();
 
-            // Collect all entries for this block
             while let Some(Ok((block_number, _))) = walker.peek() {
                 if *block_number != block {
                     break;
@@ -260,18 +282,28 @@ impl Command {
         info!(target: "reth::cli", "Migrating StorageChangeSets → static files");
         let provider = tool.provider_factory.provider()?;
         let sf_provider = tool.provider_factory.static_file_provider();
-        let mut writer = sf_provider.latest_writer(StaticFileSegment::StorageChangeSets)?;
 
         let mut cursor = provider.tx_ref().cursor_read::<tables::StorageChangeSets>()?;
+
+        // Find the first available block
+        let first_block = match cursor.first()? {
+            Some((key, _)) => key.block_number(),
+            None => {
+                info!(target: "reth::cli", "No StorageChangeSets found, skipping");
+                return Ok(());
+            }
+        };
+
+        let mut writer =
+            sf_provider.get_writer(first_block, StaticFileSegment::StorageChangeSets)?;
 
         let mut count = 0u64;
         let mut walker = cursor.walk(Some(Default::default()))?.peekable();
 
-        // Iterate ALL blocks from 0..=tip, appending empty changesets for blocks with no entries
-        for block in 0..=tip {
+        // Iterate all blocks from first_block..=tip, including empty ones
+        for block in first_block..=tip {
             let mut entries = Vec::new();
 
-            // Collect all entries for this block
             while let Some(Ok((key, _))) = walker.peek() {
                 if key.block_number() != block {
                     break;
