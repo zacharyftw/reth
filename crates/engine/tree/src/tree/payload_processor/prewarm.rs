@@ -396,38 +396,68 @@ where
     /// Converts the BAL to [`HashedPostState`](reth_trie::HashedPostState) and sends it to the
     /// multiproof task.
     fn send_bal_hashed_state(&self, bal: &BlockAccessList) {
+        let _span = debug_span!(
+            target: "engine::tree::payload_processor::prewarm",
+            "send_bal_hashed_state",
+            bal_accounts = bal.len(),
+        )
+        .entered();
+
         let Some(to_multi_proof) = self.to_multi_proof.as_ref() else { return };
 
-        let provider = match self.ctx.provider.build() {
-            Ok(provider) => provider,
-            Err(err) => {
-                warn!(
-                    target: "engine::tree::payload_processor::prewarm",
-                    ?err,
-                    "Failed to build provider for BAL hashed state conversion"
-                );
-                return;
+        let provider = {
+            let _span = debug_span!(
+                target: "engine::tree::payload_processor::prewarm",
+                "send_bal_hashed_state::build_provider",
+            )
+            .entered();
+            match self.ctx.provider.build() {
+                Ok(provider) => provider,
+                Err(err) => {
+                    warn!(
+                        target: "engine::tree::payload_processor::prewarm",
+                        ?err,
+                        "Failed to build provider for BAL hashed state conversion"
+                    );
+                    return;
+                }
             }
         };
 
-        match bal::bal_to_hashed_post_state(bal, &provider) {
-            Ok(hashed_state) => {
-                debug!(
-                    target: "engine::tree::payload_processor::prewarm",
-                    accounts = hashed_state.accounts.len(),
-                    storages = hashed_state.storages.len(),
-                    "Converted BAL to hashed post state"
-                );
-                let _ = to_multi_proof.send(StateRootMessage::HashedStateUpdate(hashed_state));
-                let _ = to_multi_proof.send(StateRootMessage::FinishedStateUpdates);
+        let hashed_state = {
+            let _span = debug_span!(
+                target: "engine::tree::payload_processor::prewarm",
+                "send_bal_hashed_state::bal_to_hashed_post_state",
+            )
+            .entered();
+            match bal::bal_to_hashed_post_state(bal, &provider) {
+                Ok(state) => state,
+                Err(err) => {
+                    warn!(
+                        target: "engine::tree::payload_processor::prewarm",
+                        ?err,
+                        "Failed to convert BAL to hashed state"
+                    );
+                    return;
+                }
             }
-            Err(err) => {
-                warn!(
-                    target: "engine::tree::payload_processor::prewarm",
-                    ?err,
-                    "Failed to convert BAL to hashed state"
-                );
-            }
+        };
+
+        debug!(
+            target: "engine::tree::payload_processor::prewarm",
+            accounts = hashed_state.accounts.len(),
+            storages = hashed_state.storages.len(),
+            "Converted BAL to hashed post state"
+        );
+
+        {
+            let _span = debug_span!(
+                target: "engine::tree::payload_processor::prewarm",
+                "send_bal_hashed_state::send",
+            )
+            .entered();
+            let _ = to_multi_proof.send(StateRootMessage::HashedStateUpdate(hashed_state));
+            let _ = to_multi_proof.send(StateRootMessage::FinishedStateUpdates);
         }
     }
 
