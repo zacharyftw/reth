@@ -243,6 +243,9 @@ impl<N: ProviderNodeTypes> Pipeline<N> {
         self.move_to_static_files()?;
 
         let mut previous_stage = None;
+        let mut pass_made_progress = false;
+        let mut last_block_number = None;
+
         for stage_index in 0..self.stages.len() {
             let stage = &self.stages[stage_index];
             let stage_id = stage.id();
@@ -255,10 +258,15 @@ impl<N: ProviderNodeTypes> Pipeline<N> {
             match next {
                 ControlFlow::NoProgress { block_number } => {
                     if let Some(block_number) = block_number {
+                        last_block_number = Some(block_number);
                         self.progress.update(block_number);
                     }
                 }
-                ControlFlow::Continue { block_number } => self.progress.update(block_number),
+                ControlFlow::Continue { block_number } => {
+                    pass_made_progress = true;
+                    last_block_number = Some(block_number);
+                    self.progress.update(block_number);
+                }
                 ControlFlow::Unwind { target, bad_block } => {
                     self.unwind(target, Some(bad_block.block.number))?;
                     return Ok(ControlFlow::Unwind { target, bad_block })
@@ -274,7 +282,11 @@ impl<N: ProviderNodeTypes> Pipeline<N> {
             );
         }
 
-        Ok(self.progress.next_ctrl())
+        Ok(if pass_made_progress {
+            ControlFlow::Continue { block_number: last_block_number.unwrap_or_default() }
+        } else {
+            ControlFlow::NoProgress { block_number: last_block_number }
+        })
     }
 
     /// Run [static file producer](StaticFileProducer) and [pruner](reth_prune::Pruner) to **move**
