@@ -1,6 +1,9 @@
 use alloy_primitives::{Address, B256, U256};
 use reth_primitives_traits::{Account, Bytecode};
-use revm::database::{states::BundleState, states::CacheState, BundleAccount};
+use revm::database::{
+    states::{BundleState, CacheState},
+    BundleAccount,
+};
 
 pub use alloy_evm::block::BlockExecutionResult;
 

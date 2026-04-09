@@ -954,7 +954,7 @@ mod tests {
     use rand::Rng;
     use reth_chainspec::ChainSpec;
     use reth_db_common::init::init_genesis;
-    use reth_ethereum_primitives::TransactionSigned;
+    use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
     use reth_evm::OnStateHook;
     use reth_evm_ethereum::EthEvmConfig;
     use reth_primitives_traits::{Account, Recovered, StorageEntry};
@@ -963,7 +963,7 @@ mod tests {
         test_utils::create_test_provider_factory_with_chain_spec,
         BlockExecutionOutput, ChainSpecProvider, HashingWriter,
     };
-    use reth_revm::db::BundleState;
+
     use reth_testing_utils::generators;
     use reth_trie::{test_utils::state_root, HashedPostState};
     use reth_trie_db::ChangesetCache;
@@ -1067,7 +1067,7 @@ mod tests {
             block: BlockNumHash { hash: block_hash, number: 1 },
             parent: parent_hash,
         };
-        let output = BlockExecutionOutput::default();
+        let output = BlockExecutionOutput::<EthPrimitives>::default();
 
         // Cache should be empty initially
         assert!(payload_processor.execution_cache.get_cache_for(block_hash).is_none());
@@ -1103,7 +1103,7 @@ mod tests {
             block: BlockNumHash { hash: block3_hash, number: 3 },
             parent: wrong_parent,
         };
-        let output = BlockExecutionOutput::default();
+        let output = BlockExecutionOutput::<EthPrimitives>::default();
 
         payload_processor.on_inserted_executed_block(block_with_parent, &output);
 
