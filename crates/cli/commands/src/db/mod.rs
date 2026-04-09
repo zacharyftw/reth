@@ -16,6 +16,7 @@ mod copy;
 mod diff;
 mod get;
 mod list;
+mod migrate_v2;
 mod prune_checkpoints;
 mod repair_trie;
 mod settings;
@@ -77,6 +78,9 @@ pub enum Subcommands {
     AccountStorage(account_storage::Command),
     /// Gets account state and storage at a specific block
     State(state::Command),
+    /// Migrate storage layout from v1 (MDBX-only) to v2 (static files + RocksDB)
+    #[command(name = "migrate-v2")]
+    MigrateV2(migrate_v2::Command),
 }
 
 impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C> {
@@ -228,6 +232,11 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
             }
             Subcommands::State(command) => {
                 db_exec!(self.env, tool, N, AccessRights::RO, {
+                    command.execute(&tool)?;
+                });
+            }
+            Subcommands::MigrateV2(command) => {
+                db_exec!(self.env, tool, N, AccessRights::RW, {
                     command.execute(&tool)?;
                 });
             }
