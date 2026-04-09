@@ -171,14 +171,6 @@ impl ArenaCursor {
         logical_branch_path_len(arena, self.stack.last().expect("cursor is non-empty"))
     }
 
-    /// Returns the absolute path of a child at `child_nibble` under the branch at the top of
-    /// the stack. The result is `stack_head.path + branch.short_key + child_nibble`.
-    pub(super) fn child_path(&self, arena: &NodeArena, child_nibble: u8) -> Nibbles {
-        let mut path = logical_branch_path(arena, self.stack.last().expect("cursor is non-empty"));
-        path.push_unchecked(child_nibble);
-        path
-    }
-
     /// Returns the logical path of the parent branch entry (second from top of the stack).
     /// Panics if the stack has fewer than 2 entries.
     pub(super) fn parent_logical_branch_path(&self, arena: &NodeArena) -> Nibbles {
@@ -248,10 +240,11 @@ impl ArenaCursor {
         }
 
         loop {
-            let Some(head) = self.stack.last_mut() else {
+            let Some((head_idx, head_path, start)) =
+                self.stack.last_mut().map(|head| (head.index, head.path, head.next_dense_idx))
+            else {
                 return NextResult::Done;
             };
-            let head_idx = head.index;
 
             let ArenaSparseNode::Branch(branch) = &arena[head_idx] else {
                 self.needs_pop = true;
@@ -259,7 +252,6 @@ impl ArenaCursor {
             };
 
             let state_mask = branch.state_mask;
-            let start = head.next_dense_idx;
             let child_depth = self.stack.len();
 
             let mut descended = false;
@@ -277,7 +269,7 @@ impl ArenaCursor {
                     // Record where to resume iteration when we return to this entry.
                     self.stack.last_mut().expect("head exists").next_dense_idx =
                         branch_child_idx.get() + 1;
-                    let path = self.child_path(arena, nibble);
+                    let path = child_path(head_path, &branch.short_key, nibble);
                     self.push(arena, child_idx, path);
                     descended = true;
                     break;
@@ -306,15 +298,17 @@ impl ArenaCursor {
         }
 
         loop {
-            let head = self.stack.last().expect("cursor has root");
-            let head_idx = head.index;
+            let (head_idx, head_path) = {
+                let head = self.stack.last().expect("cursor has root");
+                (head.index, head.path)
+            };
 
             let head_branch = match &arena[head_idx] {
                 ArenaSparseNode::EmptyRoot => {
                     return SeekResult::EmptyRoot;
                 }
                 ArenaSparseNode::Leaf { key, .. } => {
-                    let mut leaf_full_path = head.path;
+                    let mut leaf_full_path = head_path;
                     leaf_full_path.extend(key);
                     return if &leaf_full_path == full_path {
                         SeekResult::RevealedLeaf
@@ -329,17 +323,15 @@ impl ArenaCursor {
                 _ => unreachable!("unexpected node type on stack: {:?}", arena[head_idx]),
             };
 
-            let head_branch_logical_path = logical_branch_path(arena, head);
-
             // If full_path doesn't extend past the branch's logical path, the target is at or
             // within the branch's short_key — treat as diverged.
-            if full_path.len() <= head_branch_logical_path.len() ||
-                !full_path.starts_with(&head_branch_logical_path)
-            {
+            let Some(head_branch_logical_len) =
+                logical_branch_path_len_if_descends(head_path, &head_branch.short_key, full_path)
+            else {
                 return SeekResult::Diverged;
-            }
+            };
 
-            let child_nibble = full_path.get_unchecked(head_branch_logical_path.len());
+            let child_nibble = full_path.get_unchecked(head_branch_logical_len);
             let Some(branch_child_idx) = BranchChildIdx::new(head_branch.state_mask, child_nibble)
             else {
                 return SeekResult::NoChild { child_nibble };
@@ -351,12 +343,47 @@ impl ArenaCursor {
                 }
                 ArenaSparseNodeBranchChild::Revealed(child_idx) => {
                     let child_idx = *child_idx;
-                    let path = self.child_path(arena, child_nibble);
+                    let path = child_path(head_path, &head_branch.short_key, child_nibble);
                     self.push(arena, child_idx, path);
                 }
             }
         }
     }
+}
+
+/// Returns the absolute path of a child under a branch entry.
+#[inline]
+fn child_path(entry_path: Nibbles, short_key: &Nibbles, child_nibble: u8) -> Nibbles {
+    let mut path = entry_path;
+    path.extend(short_key);
+    path.push_unchecked(child_nibble);
+    path
+}
+
+/// Returns the branch's logical path length if `full_path` descends into one of its children.
+#[inline]
+fn logical_branch_path_len_if_descends(
+    entry_path: Nibbles,
+    short_key: &Nibbles,
+    full_path: &Nibbles,
+) -> Option<usize> {
+    let logical_path_len = entry_path.len() + short_key.len();
+    if full_path.len() <= logical_path_len {
+        return None;
+    }
+
+    debug_assert!(
+        full_path.starts_with(&entry_path),
+        "full path must already match the stacked cursor path",
+    );
+
+    for (offset, nibble) in short_key.iter().enumerate() {
+        if full_path.get_unchecked(entry_path.len() + offset) != nibble {
+            return None;
+        }
+    }
+
+    Some(logical_path_len)
 }
 
 /// Returns the logical path of a branch stack entry. The logical path is
