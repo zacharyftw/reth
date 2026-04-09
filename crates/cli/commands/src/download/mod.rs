@@ -14,7 +14,11 @@ use manifest::{
     ArchiveDescriptor, ComponentSelection, OutputFileChecksum, SnapshotComponentType,
     SnapshotManifest,
 };
-use reqwest::{blocking::Client as BlockingClient, header::RANGE, Client, StatusCode};
+use reqwest::{
+    blocking::Client as BlockingClient,
+    header::{CONTENT_RANGE, RANGE},
+    Client, StatusCode,
+};
 use reth_chainspec::{EthChainSpec, EthereumHardfork, EthereumHardforks};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_util::cancellation::CancellationToken;
@@ -1086,6 +1090,123 @@ fn extract_from_file(path: &Path, format: CompressionFormat, target_dir: &Path) 
 const MAX_DOWNLOAD_RETRIES: u32 = 10;
 const RETRY_BACKOFF_SECS: u64 = 5;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentRangeHeader {
+    start: u64,
+    end: u64,
+    total_size: u64,
+}
+
+impl ContentRangeHeader {
+    fn parse(value: &str) -> Result<Self> {
+        let Some(value) = value.trim().strip_prefix("bytes ") else {
+            eyre::bail!("invalid Content-Range unit: {value}");
+        };
+
+        let Some((range, total_size)) = value.split_once('/') else {
+            eyre::bail!("invalid Content-Range format: {value}");
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            eyre::bail!("invalid Content-Range bounds: {value}");
+        };
+
+        let start = start
+            .parse::<u64>()
+            .wrap_err_with(|| format!("invalid Content-Range start: {value}"))?;
+        let end =
+            end.parse::<u64>().wrap_err_with(|| format!("invalid Content-Range end: {value}"))?;
+        let total_size = total_size
+            .parse::<u64>()
+            .wrap_err_with(|| format!("invalid Content-Range total size: {value}"))?;
+
+        if start > end {
+            eyre::bail!("invalid Content-Range with start > end: {value}");
+        }
+        if end >= total_size {
+            eyre::bail!("invalid Content-Range ending past total size: {value}");
+        }
+
+        Ok(Self { start, end, total_size })
+    }
+
+    const fn content_length(self) -> u64 {
+        self.end - self.start + 1
+    }
+}
+
+fn parse_response_content_range(
+    response: &reqwest::blocking::Response,
+) -> Result<ContentRangeHeader> {
+    let value = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .ok_or_else(|| eyre::eyre!("server returned 206 without Content-Range header"))?
+        .to_str()
+        .wrap_err("server returned non-UTF8 Content-Range header")?;
+    ContentRangeHeader::parse(value)
+}
+
+fn validate_content_range(
+    content_range: ContentRangeHeader,
+    expected_start: u64,
+    expected_total_size: Option<u64>,
+    actual_content_length: Option<u64>,
+) -> Result<()> {
+    if content_range.start != expected_start {
+        eyre::bail!(
+            "server returned Content-Range starting at {} but {} was requested",
+            content_range.start,
+            expected_start
+        );
+    }
+
+    if content_range.end + 1 != content_range.total_size {
+        eyre::bail!(
+            "server returned partial tail {}-{} of {} for an open-ended range request",
+            content_range.start,
+            content_range.end,
+            content_range.total_size
+        );
+    }
+
+    if let Some(expected_total_size) = expected_total_size &&
+        content_range.total_size != expected_total_size
+    {
+        eyre::bail!(
+            "server returned total size {} but {} was expected",
+            content_range.total_size,
+            expected_total_size
+        );
+    }
+
+    if let Some(actual_content_length) = actual_content_length &&
+        content_range.content_length() != actual_content_length
+    {
+        eyre::bail!(
+            "server returned Content-Range length {} but Content-Length was {}",
+            content_range.content_length(),
+            actual_content_length
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_partial_content_response(
+    response: &reqwest::blocking::Response,
+    expected_start: u64,
+    expected_total_size: Option<u64>,
+) -> Result<ContentRangeHeader> {
+    let content_range = parse_response_content_range(response)?;
+    validate_content_range(
+        content_range,
+        expected_start,
+        expected_total_size,
+        response.content_length(),
+    )?;
+    Ok(content_range)
+}
+
 /// Wrapper that tracks download progress while writing data.
 /// Used with [`io::copy`] to display progress during downloads.
 struct ProgressWriter<W> {
@@ -1229,16 +1350,14 @@ fn resumable_download(
 
         let is_partial = response.status() == StatusCode::PARTIAL_CONTENT;
 
-        let size = if is_partial {
-            response
-                .headers()
-                .get("Content-Range")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.split('/').next_back())
-                .and_then(|v| v.parse().ok())
+        let content_range = if is_partial {
+            Some(validate_partial_content_response(&response, existing_size, total_size)?)
         } else {
-            response.content_length()
+            None
         };
+
+        let size =
+            content_range.map(|range| range.total_size).or_else(|| response.content_length());
 
         if total_size.is_none() {
             total_size = size;
@@ -1299,6 +1418,23 @@ fn resumable_download(
                 info!(target: "reth::cli",
                     file = %file_name,
                     "Download interrupted, retrying in {RETRY_BACKOFF_SECS}s..."
+                );
+                std::thread::sleep(Duration::from_secs(RETRY_BACKOFF_SECS));
+            }
+            continue;
+        }
+
+        let downloaded_size = fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+        if downloaded_size != current_total {
+            last_error = Some(eyre::eyre!(
+                "download ended with {} bytes but expected {}",
+                downloaded_size,
+                current_total
+            ));
+            if attempt < MAX_DOWNLOAD_RETRIES {
+                info!(target: "reth::cli",
+                    file = %file_name,
+                    "Download ended early, retrying in {RETRY_BACKOFF_SECS}s..."
                 );
                 std::thread::sleep(Duration::from_secs(RETRY_BACKOFF_SECS));
             }
@@ -2159,5 +2295,51 @@ mod tests {
         assert_eq!(planned[0].ty, SnapshotComponentType::State);
         assert_eq!(planned[1].ty, SnapshotComponentType::RocksdbIndices);
         assert_eq!(planned[2].ty, SnapshotComponentType::Transactions);
+    }
+
+    #[test]
+    fn content_range_header_parses_valid_range() {
+        let parsed = ContentRangeHeader::parse("bytes 5-9/10").unwrap();
+        assert_eq!(parsed, ContentRangeHeader { start: 5, end: 9, total_size: 10 });
+        assert_eq!(parsed.content_length(), 5);
+    }
+
+    #[test]
+    fn validate_content_range_rejects_wrong_start() {
+        let err = validate_content_range(
+            ContentRangeHeader { start: 0, end: 99, total_size: 100 },
+            10,
+            Some(100),
+            Some(100),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("starting at 0 but 10 was requested"));
+    }
+
+    #[test]
+    fn validate_content_range_rejects_open_ended_range_that_does_not_reach_eof() {
+        let err = validate_content_range(
+            ContentRangeHeader { start: 50, end: 74, total_size: 100 },
+            50,
+            Some(100),
+            Some(25),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("open-ended range request"));
+    }
+
+    #[test]
+    fn validate_content_range_rejects_content_length_mismatch() {
+        let err = validate_content_range(
+            ContentRangeHeader { start: 10, end: 99, total_size: 100 },
+            10,
+            Some(100),
+            Some(89),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("Content-Range length 90 but Content-Length was 89"));
     }
 }
