@@ -126,9 +126,23 @@ jobs:
         with:
           toolchain: "1.93" # MSRV
       - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install dust
+        run: |
+          curl -sSfLO https://github.com/bootandy/dust/releases/download/v1.2.4/du-dust_1.2.4-1_amd64.deb
+          sudo dpkg -i du-dust_1.2.4-1_amd64.deb
+      - name: Show disk usage before cache restore
+        run: dust -d 3 -z 100M /
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
+        continue-on-error: true
         with:
           cache-on-failure: true
+      - name: Show disk usage after cache restore
+        if: always()
+        run: dust -d 3 -z 100M /
+      - name: Fail if cache restore failed
+        if: steps.rust-cache.outcome == 'failure'
+        run: exit 1
       - run: cargo build --bin reth --workspace
         env:
           RUSTFLAGS: -D warnings
