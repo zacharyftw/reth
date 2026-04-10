@@ -69,11 +69,19 @@ where
     where
         C: ChainSpecParser<ChainSpec = ChainSpec>,
     {
-        let components = |spec: Arc<ChainSpec>| {
-            let evm_config = EthEvmConfig::new_with_evm_factory(
-                spec.clone(),
-                reth_node_ethereum::evm::factory::RethEvmFactory::disabled(),
-            );
+        // Extract JIT args from re-execute command, otherwise use defaults (disabled).
+        let jit_args = match &self.cli.command {
+            Commands::ReExecute(cmd) => cmd.jit.clone(),
+            _ => Default::default(),
+        };
+
+        let components = move |spec: Arc<ChainSpec>| {
+            use reth_node_ethereum::evm::factory::{JitBackend, RethEvmFactory};
+
+            let config = reth_node_ethereum::node::jit_runtime_config(&jit_args);
+            let backend = JitBackend::new(config).expect("failed to start revmc JIT backend");
+            let factory = RethEvmFactory::new(backend);
+            let evm_config = EthEvmConfig::new_with_evm_factory(spec.clone(), factory);
             (evm_config, Arc::new(EthBeaconConsensus::new(spec)))
         };
 

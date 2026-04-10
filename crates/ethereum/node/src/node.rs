@@ -32,6 +32,7 @@ use reth_node_builder::{
     },
     BuilderContext, DebugNode, Node, NodeAdapter,
 };
+use reth_node_core::args::JitArgs;
 use reth_payload_primitives::PayloadTypes;
 use reth_provider::{providers::ProviderFactoryBuilder, EthStorage};
 use reth_rpc::{
@@ -420,6 +421,42 @@ impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for EthereumNode {
     }
 }
 
+/// Builds a [`RuntimeConfig`] from CLI [`JitArgs`].
+///
+/// This is the shared setup used by both `reth node` and `reth re-execute`.
+pub fn jit_runtime_config(jit: &JitArgs) -> RuntimeConfig {
+    let default_tuning = RuntimeTuning::default();
+    let tuning = RuntimeTuning {
+        lookup_event_channel_capacity: jit.channel_capacity,
+        jit_hot_threshold: jit.hot_threshold,
+        max_pending_jit_jobs: jit.max_pending_jobs,
+        jit_worker_count: jit.worker_count.unwrap_or(default_tuning.jit_worker_count),
+        resident_code_cache_bytes: jit.code_cache_bytes,
+        idle_evict_duration: (jit.idle_evict_secs > 0)
+            .then(|| Duration::from_secs(jit.idle_evict_secs)),
+
+        shutdown_timeout: default_tuning.shutdown_timeout,
+        jit_max_bytecode_len: default_tuning.jit_max_bytecode_len,
+        jit_worker_queue_capacity: default_tuning.jit_worker_queue_capacity,
+        jit_opt_level: default_tuning.jit_opt_level,
+        aot_opt_level: default_tuning.aot_opt_level,
+        eviction_sweep_interval: default_tuning.eviction_sweep_interval,
+        compiler_recycle_threshold: default_tuning.compiler_recycle_threshold,
+    };
+
+    let default_config = RuntimeConfig::default();
+    RuntimeConfig {
+        enabled: jit.enabled || jit.blocking,
+        thread_name: default_config.thread_name,
+        store: default_config.store,
+        tuning,
+        dump_dir: None,
+        debug_assertions: jit.debug,
+        blocking: jit.blocking,
+        on_compilation: None,
+    }
+}
+
 /// A regular ethereum evm and executor builder.
 ///
 /// When `--jit` is passed, starts the revmc JIT backend and uses [`RethEvmFactory`] to
@@ -443,47 +480,25 @@ where
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
         let jit = &ctx.config().jit;
-        let default_tuning = RuntimeTuning::default();
-        let tuning = RuntimeTuning {
-            lookup_event_channel_capacity: jit.channel_capacity,
-            jit_hot_threshold: jit.hot_threshold,
-            max_pending_jit_jobs: jit.max_pending_jobs,
-            jit_worker_count: jit.worker_count.unwrap_or(default_tuning.jit_worker_count),
-            resident_code_cache_bytes: jit.code_cache_bytes,
-            idle_evict_duration: (jit.idle_evict_secs > 0)
-                .then(|| Duration::from_secs(jit.idle_evict_secs)),
+        let mut config = jit_runtime_config(jit);
 
-            shutdown_timeout: default_tuning.shutdown_timeout,
-            jit_max_bytecode_len: default_tuning.jit_max_bytecode_len,
-            jit_worker_queue_capacity: default_tuning.jit_worker_queue_capacity,
-            jit_opt_level: default_tuning.jit_opt_level,
-            aot_opt_level: default_tuning.aot_opt_level,
-            eviction_sweep_interval: default_tuning.eviction_sweep_interval,
-            compiler_recycle_threshold: default_tuning.compiler_recycle_threshold,
-        };
+        // Node-specific: dump dir and compilation metrics.
+        config.dump_dir = jit.debug.then(|| ctx.config().datadir().data_dir().join("jit"));
 
         let revmc_metrics = Arc::new(RevmcMetrics::default());
         let compilation_metrics = revmc_metrics.clone();
-        let dump_dir = jit.debug.then(|| ctx.config().datadir().data_dir().join("jit"));
-        let default_config = RuntimeConfig::default();
-        let config = RuntimeConfig {
-            enabled: jit.enabled || jit.blocking,
-            thread_name: default_config.thread_name,
-            store: default_config.store,
-            tuning,
-            dump_dir,
-            debug_assertions: jit.debug,
-            blocking: jit.blocking,
-            on_compilation: Some(Arc::new(move |event| {
-                compilation_metrics.record_compilation(&event);
-            })),
-        };
+        config.on_compilation = Some(Arc::new(move |event| {
+            compilation_metrics.record_compilation(&event);
+        }));
+
+        let tuning = config.tuning;
         let backend = JitBackend::new(config)?;
 
-        if jit.enabled {
+        if jit.enabled || jit.blocking {
             info!(target: "reth::cli",
                 hot_threshold = tuning.jit_hot_threshold,
                 workers = tuning.jit_worker_count,
+                blocking = jit.blocking,
                 "Started revmc JIT backend",
             );
         }
