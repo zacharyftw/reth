@@ -459,6 +459,7 @@ where
             jit_opt_level: default_tuning.jit_opt_level,
             aot_opt_level: default_tuning.aot_opt_level,
             eviction_sweep_interval: default_tuning.eviction_sweep_interval,
+            compiler_recycle_threshold: default_tuning.compiler_recycle_threshold,
         };
 
         let revmc_metrics = Arc::new(RevmcMetrics::default());
