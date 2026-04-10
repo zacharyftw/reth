@@ -72,7 +72,7 @@ enum DeferredState {
     /// Wrapped in `Option` to allow taking ownership during computation.
     Pending(Option<PendingInputs>),
     /// Data has been computed and is ready.
-    Ready(ComputedTrieData),
+    Ready(Arc<ComputedTrieData>),
 }
 
 /// Inputs kept while a deferred trie computation is pending.
@@ -134,7 +134,7 @@ impl DeferredTrieData {
     /// Useful when trie data is available immediately.
     /// [`Self::wait_cloned`] will return without any computation.
     pub fn ready(bundle: ComputedTrieData) -> Self {
-        Self { state: Arc::new(Mutex::new(DeferredState::Ready(bundle))) }
+        Self { state: Arc::new(Mutex::new(DeferredState::Ready(Arc::new(bundle)))) }
     }
 
     /// Sort block execution outputs and build a [`TrieInputSorted`] overlay.
@@ -198,9 +198,9 @@ impl DeferredTrieData {
         // persisted anchor. If the anchor has changed (e.g., due to persistence),
         // the parent's overlay is relative to an old state and cannot be used.
         let overlay = if let Some(parent) = ancestors.last() {
-            let parent_data = parent.wait_cloned();
+            let parent_data = parent.wait_arc();
 
-            match &parent_data.anchored_trie_input {
+            match parent_data.anchored_trie_input.as_ref() {
                 // Case 1: Parent has cached overlay AND anchors match.
                 Some(AnchoredTrieInput { anchor_hash: parent_anchor, trie_input })
                     if *parent_anchor == anchor_hash =>
@@ -288,7 +288,7 @@ impl DeferredTrieData {
         let nodes_mut = Arc::make_mut(&mut overlay.nodes);
 
         for ancestor in ancestors {
-            let ancestor_data = ancestor.wait_cloned();
+            let ancestor_data = ancestor.wait_arc();
             state_mut.extend_ref_and_sort(ancestor_data.hashed_state.as_ref());
             nodes_mut.extend_ref_and_sort(ancestor_data.trie_updates.as_ref());
         }
@@ -321,13 +321,13 @@ impl DeferredTrieData {
     ///
     /// Given that invariant, circular wait dependencies are impossible.
     #[instrument(level = "debug", target = "engine::tree::deferred_trie", skip_all)]
-    pub fn wait_cloned(&self) -> ComputedTrieData {
+    pub fn wait_arc(&self) -> Arc<ComputedTrieData> {
         let mut state = self.state.lock();
         match &mut *state {
             // If the deferred trie data is ready, return the cached result.
             DeferredState::Ready(bundle) => {
                 DEFERRED_TRIE_METRICS.deferred_trie_async_ready.increment(1);
-                bundle.clone()
+                Arc::clone(bundle)
             }
             // If the deferred trie data is pending, compute the trie data synchronously and return
             // the result. This is the fallback path if the async task hasn't completed.
@@ -342,7 +342,8 @@ impl DeferredTrieData {
                     inputs.anchor_hash,
                     &inputs.ancestors,
                 );
-                *state = DeferredState::Ready(computed.clone());
+                let computed = Arc::new(computed);
+                *state = DeferredState::Ready(Arc::clone(&computed));
 
                 // Release lock before inputs (and its ancestors) drop to avoid holding it
                 // while their potential last Arc refs drop (which could trigger recursive locking)
@@ -351,6 +352,16 @@ impl DeferredTrieData {
                 computed
             }
         }
+    }
+
+    /// Returns trie data, cloning the cached fields if the async task already completed.
+    ///
+    /// This preserves the existing by-value API for callers that need an owned
+    /// [`ComputedTrieData`] while letting hot read-only paths reuse the shared `Arc` via
+    /// [`Self::wait_arc`].
+    #[instrument(level = "debug", target = "engine::tree::deferred_trie", skip_all)]
+    pub fn wait_cloned(&self) -> ComputedTrieData {
+        self.wait_arc().as_ref().clone()
     }
 }
 

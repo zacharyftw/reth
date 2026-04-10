@@ -33,7 +33,7 @@ struct LazyOverlayInputs {
 #[derive(Clone)]
 pub struct LazyOverlay {
     /// Computed result, cached after first access.
-    inner: Arc<OnceLock<TrieInputSorted>>,
+    inner: Arc<OnceLock<Arc<TrieInputSorted>>>,
     /// Inputs for lazy computation.
     inputs: LazyOverlayInputs,
 }
@@ -79,7 +79,7 @@ impl LazyOverlay {
     /// The first call triggers computation (which may block waiting for deferred data).
     /// Subsequent calls return the cached result immediately.
     pub fn get(&self) -> &TrieInputSorted {
-        self.inner.get_or_init(|| self.compute())
+        self.inner.get_or_init(|| self.compute()).as_ref()
     }
 
     /// Returns the overlay as (nodes, state) tuple for use with `OverlayStateProviderFactory`.
@@ -89,23 +89,23 @@ impl LazyOverlay {
     }
 
     /// Compute the trie input overlay.
-    fn compute(&self) -> TrieInputSorted {
+    fn compute(&self) -> Arc<TrieInputSorted> {
         let anchor_hash = self.inputs.anchor_hash;
         let blocks = &self.inputs.blocks;
 
         if blocks.is_empty() {
             debug!(target: "chain_state::lazy_overlay", "No in-memory blocks, returning empty overlay");
-            return TrieInputSorted::default();
+            return Arc::new(TrieInputSorted::default());
         }
 
         // Fast path: Check if tip block's overlay is ready and anchor matches.
         // The tip block (first in list) has the cumulative overlay from all ancestors.
         if let Some(tip) = blocks.first() {
-            let data = tip.wait_cloned();
-            if let Some(anchored) = &data.anchored_trie_input {
+            let data = tip.wait_arc();
+            if let Some(anchored) = data.anchored_trie_input.as_ref() {
                 if anchored.anchor_hash == anchor_hash {
                     trace!(target: "chain_state::lazy_overlay", %anchor_hash, "Reusing tip block's cached overlay (fast path)");
-                    return (*anchored.trie_input).clone();
+                    return Arc::clone(&anchored.trie_input);
                 }
                 debug!(
                     target: "chain_state::lazy_overlay",
@@ -118,7 +118,7 @@ impl LazyOverlay {
 
         // Slow path: Merge all blocks' trie data into a new overlay.
         debug!(target: "chain_state::lazy_overlay", num_blocks = blocks.len(), "Merging blocks (slow path)");
-        Self::merge_blocks(blocks)
+        Arc::new(Self::merge_blocks(blocks))
     }
 
     /// Merge all blocks' trie data into a single [`TrieInputSorted`].
@@ -129,10 +129,13 @@ impl LazyOverlay {
             return TrieInputSorted::default();
         }
 
-        let state =
-            HashedPostStateSorted::merge_batch(blocks.iter().map(|b| b.wait_cloned().hashed_state));
-        let nodes =
-            TrieUpdatesSorted::merge_batch(blocks.iter().map(|b| b.wait_cloned().trie_updates));
+        let computed: Vec<_> = blocks.iter().map(DeferredTrieData::wait_arc).collect();
+        let state = HashedPostStateSorted::merge_batch(
+            computed.iter().map(|data| Arc::clone(&data.hashed_state)),
+        );
+        let nodes = TrieUpdatesSorted::merge_batch(
+            computed.iter().map(|data| Arc::clone(&data.trie_updates)),
+        );
 
         TrieInputSorted { state, nodes, prefix_sets: Default::default() }
     }
