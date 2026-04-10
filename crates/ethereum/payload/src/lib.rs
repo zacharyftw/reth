@@ -172,7 +172,6 @@ where
         state_provider = Box::new(CachedStateProvider::new(
             state_provider,
             execution_cache.cache().clone(),
-            execution_cache.metrics().clone(),
         ));
     }
     let state = StateProviderDatabase::new(state_provider.as_ref());
