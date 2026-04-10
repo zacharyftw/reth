@@ -484,7 +484,7 @@ impl<N: ProviderNodeTypes> Pipeline<N> {
             let current_checkpoint = self.provider_factory.get_stage_checkpoint(stage_id)?;
             let current = current_checkpoint.map(|c| c.block_number).unwrap_or(0);
             let capped = current + max_blocks_per_run;
-            target.map(|t| t.min(capped))
+            Some(target.map_or(capped, |t| t.min(capped)))
         } else {
             target
         };
