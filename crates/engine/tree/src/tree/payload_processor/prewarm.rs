@@ -624,8 +624,11 @@ where
         account_changes: &alloy_eip7928::AccountChanges,
         to_sparse_trie_task: &CrossbeamSender<StateRootMessage>,
     ) {
+        let address = account_changes.address;
+        let mut hashed_address = None;
+
         if !account_changes.storage_changes.is_empty() {
-            let hashed_address = keccak256(account_changes.address);
+            let hashed_address = *hashed_address.get_or_insert_with(|| keccak256(address));
             let mut storage_map = reth_trie::HashedStorage::new(false);
 
             for slot_changes in &account_changes.storage_changes {
@@ -671,7 +674,6 @@ where
         }
         let account_reader = provider.as_ref().expect("provider just initialized");
 
-        let address = account_changes.address;
         let existing_account = account_reader.basic_account(&address).ok().flatten();
 
         let balance = account_changes.balance_changes.last().map(|change| change.post_balance);
@@ -710,7 +712,7 @@ where
             }),
         };
 
-        let hashed_address = keccak256(address);
+        let hashed_address = hashed_address.unwrap_or_else(|| keccak256(address));
         let mut hashed_state = reth_trie::HashedPostState::default();
         hashed_state.accounts.insert(hashed_address, Some(account));
 
