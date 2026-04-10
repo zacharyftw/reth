@@ -38,6 +38,7 @@ use std::sync::{
     mpsc::{self, channel, Receiver, Sender},
     Arc,
 };
+use tokio::sync::oneshot;
 use tracing::{debug, debug_span, instrument, trace, trace_span, warn, Span};
 
 /// Determines the prewarming mode: transaction-based, BAL-based, or skipped.
@@ -321,7 +322,7 @@ where
 
     /// Runs BAL-based prewarming and sparse-trie work inline.
     ///
-    /// Uses `rayon::join` to run two halves concurrently on separate pools:
+    /// Spawns two halves concurrently on separate pools, then waits for both to complete:
     /// 1. Storage prefetch on the prewarming pool to populate the execution cache.
     /// 2. Hashed state streaming on the BAL streaming pool so storage updates can reach the sparse
     ///    trie before account reads finish.
@@ -346,17 +347,20 @@ where
             "Starting BAL prewarm"
         );
 
-        let ctx = &self.ctx;
-        let to_sparse_trie_task = self.to_sparse_trie_task.as_ref();
-        let executor = &self.executor;
+        let ctx = self.ctx.clone();
+        let to_sparse_trie_task = self.to_sparse_trie_task.clone();
+        let executor = self.executor.clone();
         let parent_span = Span::current();
         let prefetch_parent_span = parent_span.clone();
-        let stream_parent_span = parent_span.clone();
+        let stream_parent_span = parent_span;
         let prefetch_bal = Arc::clone(&bal);
         let stream_bal = Arc::clone(&bal);
+        let (prefetch_tx, prefetch_rx) = oneshot::channel();
+        let (stream_tx, stream_rx) = oneshot::channel();
 
-        rayon::join(
-            move || {
+        if ctx.saved_cache.is_some() {
+            let prefetch_ctx = ctx.clone();
+            executor.prewarming_pool().spawn(move || {
                 let branch_span = debug_span!(
                     target: "engine::tree::payload_processor::prewarm",
                     parent: &prefetch_parent_span,
@@ -366,29 +370,30 @@ where
                 let provider_parent_span = branch_span.clone();
                 let _span = branch_span.entered();
 
-                if ctx.saved_cache.is_none() {
-                    return;
-                }
+                prefetch_bal.par_iter().for_each_init(
+                    || {
+                        (
+                            prefetch_ctx.clone(),
+                            None::<CachedStateProvider<reth_provider::StateProviderBox, true>>,
+                            provider_parent_span.clone(),
+                        )
+                    },
+                    |(ctx, provider, parent_span), account| {
+                        if ctx.should_stop() {
+                            return;
+                        }
+                        ctx.prefetch_bal_storage(parent_span, provider, account);
+                    },
+                );
 
-                executor.prewarming_pool().install_fn(move || {
-                    prefetch_bal.par_iter().for_each_init(
-                        || {
-                            (
-                                ctx.clone(),
-                                None::<CachedStateProvider<reth_provider::StateProviderBox, true>>,
-                                provider_parent_span.clone(),
-                            )
-                        },
-                        |(ctx, provider, parent_span), account| {
-                            if ctx.should_stop() {
-                                return;
-                            }
-                            ctx.prefetch_bal_storage(parent_span, provider, account);
-                        },
-                    );
-                });
-            },
-            move || {
+                let _ = prefetch_tx.send(());
+            });
+        } else {
+            let _ = prefetch_tx.send(());
+        }
+
+        if let Some(to_sparse_trie_task) = to_sparse_trie_task {
+            executor.bal_streaming_pool().spawn(move || {
                 let branch_span = debug_span!(
                     target: "engine::tree::payload_processor::prewarm",
                     parent: &stream_parent_span,
@@ -398,31 +403,31 @@ where
                 let provider_parent_span = branch_span.clone();
                 let _span = branch_span.entered();
 
-                let Some(to_sparse_trie_task) = to_sparse_trie_task else { return };
-
-                executor.bal_streaming_pool().install_fn(move || {
-                    stream_bal.par_iter().for_each_init(
-                        || {
-                            (
-                                ctx.clone(),
-                                None::<Box<dyn AccountReader>>,
-                                provider_parent_span.clone(),
-                            )
-                        },
-                        |(ctx, provider, parent_span), account_changes| {
-                            ctx.send_bal_hashed_state(
-                                parent_span,
-                                provider,
-                                account_changes,
-                                to_sparse_trie_task,
-                            );
-                        },
-                    );
-                });
+                stream_bal.par_iter().for_each_init(
+                    || (ctx.clone(), None::<Box<dyn AccountReader>>, provider_parent_span.clone()),
+                    |(ctx, provider, parent_span), account_changes| {
+                        ctx.send_bal_hashed_state(
+                            parent_span,
+                            provider,
+                            account_changes,
+                            &to_sparse_trie_task,
+                        );
+                    },
+                );
 
                 let _ = to_sparse_trie_task.send(StateRootMessage::FinishedStateUpdates);
-            },
-        );
+                let _ = stream_tx.send(());
+            });
+        } else {
+            let _ = stream_tx.send(());
+        }
+
+        prefetch_rx
+            .blocking_recv()
+            .expect("BAL prefetch task dropped without signaling completion");
+        stream_rx
+            .blocking_recv()
+            .expect("BAL hashed-state streaming task dropped without signaling completion");
 
         let _ = actions_tx.send(PrewarmTaskEvent::FinishedTxExecution { executed_transactions: 0 });
     }
@@ -619,8 +624,11 @@ where
         account_changes: &alloy_eip7928::AccountChanges,
         to_sparse_trie_task: &CrossbeamSender<StateRootMessage>,
     ) {
+        let address = account_changes.address;
+        let mut hashed_address = None;
+
         if !account_changes.storage_changes.is_empty() {
-            let hashed_address = keccak256(account_changes.address);
+            let hashed_address = *hashed_address.get_or_insert_with(|| keccak256(address));
             let mut storage_map = reth_trie::HashedStorage::new(false);
 
             for slot_changes in &account_changes.storage_changes {
@@ -666,7 +674,6 @@ where
         }
         let account_reader = provider.as_ref().expect("provider just initialized");
 
-        let address = account_changes.address;
         let existing_account = account_reader.basic_account(&address).ok().flatten();
 
         let balance = account_changes.balance_changes.last().map(|change| change.post_balance);
@@ -705,7 +712,7 @@ where
             }),
         };
 
-        let hashed_address = keccak256(address);
+        let hashed_address = hashed_address.unwrap_or_else(|| keccak256(address));
         let mut hashed_state = reth_trie::HashedPostState::default();
         hashed_state.accounts.insert(hashed_address, Some(account));
 
@@ -714,7 +721,8 @@ where
 
     /// Prefetches storage slots for a single BAL account into the cache.
     ///
-    /// Account reads are handled separately by [`send_bal_hashed_state`], so this method only
+    /// Account reads are handled separately by [`Self::send_bal_hashed_state`], so this method
+    /// only
     /// warms storage.
     ///
     /// The `provider` is lazily initialized on first call and reused across accounts on the same
