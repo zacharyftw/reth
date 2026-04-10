@@ -10728,8 +10728,7 @@ dependencies = [
 [[package]]
 name = "revm-interpreter"
 version = "34.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf22f80612bb8f58fd1f578750281f2afadb6c93835b14ae6a4d6b75ca26f445"
+source = "git+https://github.com/pepyakin/revm?branch=pep%2Frevm-bench#d87f800b240a9c00db68dcecc175988cdeab87af"
 dependencies = [
  "revm-bytecode",
  "revm-context-interface",
