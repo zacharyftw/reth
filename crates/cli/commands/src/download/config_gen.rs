@@ -1,6 +1,6 @@
 use crate::download::{
     manifest::{ComponentManifest, ComponentSelection, SnapshotComponentType, SnapshotManifest},
-    SelectionPreset,
+    FullReceiptsOverride, SelectionPreset,
 };
 use reth_chainspec::{EthereumHardfork, EthereumHardforks};
 use reth_config::config::{BlocksPerFileConfig, Config, PruneConfig, StaticFilesConfig};
@@ -148,6 +148,7 @@ pub(crate) fn config_for_selections(
     selections: &BTreeMap<SnapshotComponentType, ComponentSelection>,
     manifest: &SnapshotManifest,
     preset: Option<SelectionPreset>,
+    full_receipts_override: Option<FullReceiptsOverride>,
     chain_spec: Option<&impl EthereumHardforks>,
 ) -> Config {
     let selection_for = |ty| selections.get(&ty).copied().unwrap_or(ComponentSelection::None);
@@ -196,6 +197,10 @@ pub(crate) fn config_for_selections(
                     .block_number()
                     .map(PruneMode::Before)
             });
+        }
+
+        if let Some(receipts_override) = full_receipts_override {
+            segments.receipts = receipts_override.prune_mode(chain_spec);
         }
 
         return Config {
@@ -307,6 +312,7 @@ mod tests {
             &selections,
             &empty_manifest(),
             None,
+            None,
             None::<&reth_chainspec::ChainSpec>,
         );
         let snapshot_block = 21_000_000;
@@ -351,6 +357,7 @@ mod tests {
             &selections,
             &empty_manifest(),
             None,
+            None,
             None::<&reth_chainspec::ChainSpec>,
         );
 
@@ -379,6 +386,7 @@ mod tests {
             &selections,
             &empty_manifest(),
             None,
+            None,
             None::<&reth_chainspec::ChainSpec>,
         );
         // Archive node — nothing pruned
@@ -398,6 +406,7 @@ mod tests {
         let config = config_for_selections(
             &selections,
             &empty_manifest(),
+            None,
             None,
             None::<&reth_chainspec::ChainSpec>,
         );
@@ -438,6 +447,7 @@ mod tests {
             &selections,
             &empty_manifest(),
             None,
+            None,
             None::<&reth_chainspec::ChainSpec>,
         );
 
@@ -467,6 +477,7 @@ mod tests {
             &selections,
             &empty_manifest(),
             Some(SelectionPreset::Full),
+            None,
             Some(chain_spec.as_ref()),
         );
 
@@ -502,6 +513,7 @@ mod tests {
             &selections,
             &empty_manifest(),
             None,
+            None,
             None::<&reth_chainspec::ChainSpec>,
         );
         let desc = describe_prune_config(&config);
@@ -521,6 +533,7 @@ mod tests {
             &selections,
             &empty_manifest(),
             None,
+            None,
             None::<&reth_chainspec::ChainSpec>,
         );
         let desc = describe_prune_config(&config);
@@ -528,6 +541,84 @@ mod tests {
         // Bodies follows tx selection
         assert!(desc.contains(&"bodies_history={ distance = 10064 }".to_string()));
         assert!(desc.contains(&"receipts={ distance = 64 }".to_string()));
+    }
+
+    #[test]
+    fn full_preset_receipts_all_override_keeps_all_receipts() {
+        let mut selections = BTreeMap::new();
+        selections.insert(SnapshotComponentType::State, ComponentSelection::All);
+        selections.insert(SnapshotComponentType::Headers, ComponentSelection::All);
+        selections
+            .insert(SnapshotComponentType::Transactions, ComponentSelection::Distance(500_000));
+        selections.insert(SnapshotComponentType::Receipts, ComponentSelection::All);
+
+        let chain_spec = reth_chainspec::MAINNET.clone();
+        let config = config_for_selections(
+            &selections,
+            &empty_manifest(),
+            Some(SelectionPreset::Full),
+            Some(FullReceiptsOverride::All),
+            Some(chain_spec.as_ref()),
+        );
+
+        assert_eq!(config.prune.segments.transaction_lookup, None);
+        assert_eq!(config.prune.segments.receipts, None);
+        assert_eq!(
+            config.prune.segments.account_history,
+            Some(PruneMode::Distance(MINIMUM_HISTORY_DISTANCE))
+        );
+    }
+
+    #[test]
+    fn full_preset_receipts_pre_merge_override_keeps_post_merge_receipts() {
+        let mut selections = BTreeMap::new();
+        selections.insert(SnapshotComponentType::State, ComponentSelection::All);
+        selections.insert(SnapshotComponentType::Headers, ComponentSelection::All);
+        selections
+            .insert(SnapshotComponentType::Transactions, ComponentSelection::Distance(500_000));
+        selections.insert(SnapshotComponentType::Receipts, ComponentSelection::Distance(500_000));
+
+        let chain_spec = reth_chainspec::MAINNET.clone();
+        let config = config_for_selections(
+            &selections,
+            &empty_manifest(),
+            Some(SelectionPreset::Full),
+            Some(FullReceiptsOverride::PreMerge),
+            Some(chain_spec.as_ref()),
+        );
+
+        let paris_block = chain_spec
+            .ethereum_fork_activation(EthereumHardfork::Paris)
+            .block_number()
+            .expect("mainnet Paris block should be known");
+        assert_eq!(config.prune.segments.receipts, Some(PruneMode::Before(paris_block)));
+        assert_eq!(config.prune.segments.transaction_lookup, None);
+    }
+
+    #[test]
+    fn full_preset_receipts_distance_override_only_changes_receipts() {
+        let mut selections = BTreeMap::new();
+        selections.insert(SnapshotComponentType::State, ComponentSelection::All);
+        selections.insert(SnapshotComponentType::Headers, ComponentSelection::All);
+        selections
+            .insert(SnapshotComponentType::Transactions, ComponentSelection::Distance(500_000));
+        selections.insert(SnapshotComponentType::Receipts, ComponentSelection::Distance(250_000));
+
+        let chain_spec = reth_chainspec::MAINNET.clone();
+        let config = config_for_selections(
+            &selections,
+            &empty_manifest(),
+            Some(SelectionPreset::Full),
+            Some(FullReceiptsOverride::Distance(250_000)),
+            Some(chain_spec.as_ref()),
+        );
+
+        assert_eq!(config.prune.segments.transaction_lookup, None);
+        assert_eq!(config.prune.segments.receipts, Some(PruneMode::Distance(250_000)));
+        assert_eq!(
+            config.prune.segments.account_history,
+            Some(PruneMode::Distance(MINIMUM_HISTORY_DISTANCE))
+        );
     }
 
     #[test]

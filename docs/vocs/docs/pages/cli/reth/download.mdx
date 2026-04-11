@@ -149,6 +149,21 @@ Storage:
       --with-receipts
           Include receipt static files
 
+      --receipts-all
+          Override `--full` to keep all receipts instead of the default tail window.
+
+          Requires `--full`.
+
+      --receipts-distance <BLOCKS>
+          Override `--full` to keep only the last N blocks of receipts.
+
+          Requires `--full`.
+
+      --receipts-pre-merge
+          Override `--full` to keep all post-merge receipts.
+
+          Requires `--full`.
+
       --with-state-history
           Include account and storage history static files
 

@@ -59,6 +59,38 @@ pub(crate) enum SelectionPreset {
     Archive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FullReceiptsOverride {
+    All,
+    Distance(u64),
+    PreMerge,
+}
+
+impl FullReceiptsOverride {
+    fn prune_mode<ChainSpec>(self, chain_spec: Option<&ChainSpec>) -> Option<PruneMode>
+    where
+        ChainSpec: EthereumHardforks,
+    {
+        match self {
+            Self::All => None,
+            Self::Distance(distance) => Some(PruneMode::Distance(distance)),
+            Self::PreMerge => chain_spec.and_then(|chain_spec| {
+                chain_spec
+                    .ethereum_fork_activation(EthereumHardfork::Paris)
+                    .block_number()
+                    .map(PruneMode::Before)
+            }),
+        }
+    }
+
+    fn selection<ChainSpec>(self, chain_spec: &ChainSpec, snapshot_block: u64) -> ComponentSelection
+    where
+        ChainSpec: EthereumHardforks,
+    {
+        selection_from_prune_mode(self.prune_mode(Some(chain_spec)), snapshot_block)
+    }
+}
+
 struct ResolvedComponents {
     selections: BTreeMap<SnapshotComponentType, ComponentSelection>,
     preset: Option<SelectionPreset>,
@@ -225,6 +257,24 @@ pub struct DownloadCommand<C: ChainSpecParser> {
     /// Include receipt static files.
     #[arg(long, conflicts_with_all = ["minimal", "full", "archive"])]
     with_receipts: bool,
+
+    /// Override `--full` to keep all receipts instead of the default tail window.
+    ///
+    /// Requires `--full`.
+    #[arg(long, requires = "full", conflicts_with_all = ["receipts_pre_merge", "receipts_distance"])]
+    receipts_all: bool,
+
+    /// Override `--full` to keep only the last N blocks of receipts.
+    ///
+    /// Requires `--full`.
+    #[arg(long, value_name = "BLOCKS", requires = "full", conflicts_with_all = ["receipts_pre_merge", "receipts_all"])]
+    receipts_distance: Option<u64>,
+
+    /// Override `--full` to keep all post-merge receipts.
+    ///
+    /// Requires `--full`.
+    #[arg(long, requires = "full", conflicts_with_all = ["receipts_all", "receipts_distance"])]
+    receipts_pre_merge: bool,
 
     /// Include account and storage history static files.
     #[arg(long, alias = "with-changesets", conflicts_with_all = ["minimal", "full", "archive"])]
@@ -454,8 +504,13 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> DownloadCo
         }
 
         // Generate reth.toml and set prune checkpoints
-        let config =
-            config_for_selections(&selections, &manifest, preset, Some(self.env.chain.as_ref()));
+        let config = config_for_selections(
+            &selections,
+            &manifest,
+            preset,
+            self.full_receipts_override(),
+            Some(self.env.chain.as_ref()),
+        );
         if write_config(&config, target_dir)? {
             let desc = config_gen::describe_prune_config(&config);
             info!(target: "reth::cli", "{}", desc.join(", "));
@@ -655,6 +710,14 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> DownloadCo
                 }
             }
             SnapshotComponentType::Receipts => {
+                if let Some(override_selection) =
+                    self.full_receipts_override().map(|override_mode| {
+                        override_mode.selection(self.env.chain.as_ref(), snapshot_block)
+                    })
+                {
+                    return override_selection
+                }
+
                 selection_from_prune_mode(defaults.full_prune_modes.receipts, snapshot_block)
             }
             SnapshotComponentType::AccountChangesets => {
@@ -679,6 +742,18 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> DownloadCo
         match &self.manifest_url {
             Some(url) => Ok(url.clone()),
             None => discover_manifest_url(chain_id).await,
+        }
+    }
+
+    fn full_receipts_override(&self) -> Option<FullReceiptsOverride> {
+        if self.receipts_all {
+            Some(FullReceiptsOverride::All)
+        } else if let Some(distance) = self.receipts_distance {
+            Some(FullReceiptsOverride::Distance(distance))
+        } else if self.receipts_pre_merge {
+            Some(FullReceiptsOverride::PreMerge)
+        } else {
+            None
         }
     }
 }
@@ -1903,11 +1978,11 @@ fn resolve_manifest_base_url(manifest: &SnapshotManifest, source: &str) -> Resul
 mod tests {
     use super::*;
     use clap::{Args, Parser};
-    use manifest::{ComponentManifest, SingleArchive};
+    use manifest::{ChunkedArchive, ComponentManifest, SingleArchive};
     use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
     use tempfile::tempdir;
 
-    #[derive(Parser)]
+    #[derive(Debug, Parser)]
     struct CommandParser<T: Args> {
         #[command(flatten)]
         args: T,
@@ -1935,6 +2010,47 @@ mod tests {
         );
         SnapshotManifest {
             block: 0,
+            chain_id: 1,
+            storage_version: 2,
+            timestamp: 0,
+            base_url: Some("https://example.com".to_string()),
+            reth_version: None,
+            components,
+        }
+    }
+
+    fn manifest_with_receipts_component(block: u64) -> SnapshotManifest {
+        let mut components = BTreeMap::new();
+        components.insert(
+            SnapshotComponentType::State.key().to_string(),
+            ComponentManifest::Single(SingleArchive {
+                file: "state.tar.zst".to_string(),
+                size: 1,
+                blake3: None,
+                output_files: vec![],
+            }),
+        );
+        components.insert(
+            SnapshotComponentType::Headers.key().to_string(),
+            ComponentManifest::Chunked(ChunkedArchive {
+                blocks_per_file: 500_000,
+                total_blocks: block + 1,
+                chunk_sizes: vec![],
+                chunk_output_files: vec![],
+            }),
+        );
+        components.insert(
+            SnapshotComponentType::Receipts.key().to_string(),
+            ComponentManifest::Chunked(ChunkedArchive {
+                blocks_per_file: 500_000,
+                total_blocks: block + 1,
+                chunk_sizes: vec![],
+                chunk_output_files: vec![],
+            }),
+        );
+
+        SnapshotManifest {
+            block,
             chain_id: 1,
             storage_version: 2,
             timestamp: 0,
@@ -2027,6 +2143,75 @@ mod tests {
         .args;
 
         assert!(!args.resumable);
+    }
+
+    #[test]
+    fn test_receipts_distance_requires_full() {
+        let err = CommandParser::<DownloadCommand<EthereumChainSpecParser>>::try_parse_from([
+            "reth",
+            "--receipts-distance",
+            "12345",
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn test_receipts_overrides_parse_with_full() {
+        let args = CommandParser::<DownloadCommand<EthereumChainSpecParser>>::parse_from([
+            "reth",
+            "--full",
+            "--receipts-distance",
+            "12345",
+        ])
+        .args;
+
+        assert!(args.full);
+        assert_eq!(args.receipts_distance, Some(12_345));
+        assert_eq!(args.full_receipts_override(), Some(FullReceiptsOverride::Distance(12_345)));
+    }
+
+    #[test]
+    fn full_preset_receipts_all_override_downloads_all_receipts() {
+        let args = CommandParser::<DownloadCommand<EthereumChainSpecParser>>::parse_from([
+            "reth",
+            "--full",
+            "--receipts-all",
+        ])
+        .args;
+        let manifest = manifest_with_receipts_component(21_000_000);
+
+        let selections = args.full_preset_selections(&manifest);
+
+        assert_eq!(
+            selections.get(&SnapshotComponentType::Receipts),
+            Some(&ComponentSelection::All)
+        );
+    }
+
+    #[test]
+    fn full_preset_receipts_pre_merge_override_downloads_post_merge_receipts() {
+        let args = CommandParser::<DownloadCommand<EthereumChainSpecParser>>::parse_from([
+            "reth",
+            "--full",
+            "--receipts-pre-merge",
+        ])
+        .args;
+        let manifest = manifest_with_receipts_component(21_000_000);
+        let paris_block = args
+            .env
+            .chain
+            .ethereum_fork_activation(EthereumHardfork::Paris)
+            .block_number()
+            .expect("mainnet Paris block should be known");
+
+        let selections = args.full_preset_selections(&manifest);
+
+        assert_eq!(
+            selections.get(&SnapshotComponentType::Receipts),
+            Some(&ComponentSelection::Distance(manifest.block - paris_block + 1))
+        );
     }
 
     #[test]
