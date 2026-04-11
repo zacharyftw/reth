@@ -579,6 +579,7 @@ jobs:
         env:
           DEREK_TOKEN: ${{ secrets.DEREK_TOKEN }}
         run: |
+          set -x
           mkdir -p "$HOME/.local/bin"
 
           # apt packages
@@ -624,6 +625,7 @@ jobs:
       # Verify all required tools are available
       - name: Check dependencies
         run: |
+          set -x
           export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -708,7 +710,7 @@ jobs:
         if: env.BENCH_BIG_BLOCKS == 'true'
         id: big-blocks-check
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           MC="mc --config-dir /home/ubuntu/.mc"
           MANIFEST="minio/reth-snapshots/reth-1-minimal-stable-big-blocks.json"
           HASH_FILE="$HOME/.reth-bench-big-blocks-hash"
@@ -740,6 +742,7 @@ jobs:
       - name: Check if snapshot needs update
         id: snapshot-check
         run: |
+          set -x
           set +e
           .github/scripts/bench-reth-snapshot.sh --check
           rc=$?
@@ -762,6 +765,7 @@ jobs:
 
       - name: Prepare source dirs
         run: |
+          set -x
           BASELINE_REF="${{ steps.refs.outputs.baseline-ref }}"
           if [ -d ../reth-baseline ]; then
             git -C ../reth-baseline fetch origin "$BASELINE_REF"
@@ -784,6 +788,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BENCH_REPO: ${{ github.repository }}
         run: |
+          set -x
           BASELINE_DIR="$(cd ../reth-baseline && pwd)"
           FEATURE_DIR="$(cd ../reth-feature && pwd)"
 
@@ -812,6 +817,7 @@ jobs:
       # System tuning for reproducible benchmarks
       - name: System setup
         run: |
+          set -x
           # Switch amd-pstate to passive mode so the kernel governor
           # controls frequency directly (EPP is ignored in passive).
           echo passive | sudo tee /sys/devices/system/cpu/amd_pstate/status 2>/dev/null || true
@@ -870,6 +876,7 @@ jobs:
       # Clean up any leftover state
       - name: Pre-flight cleanup
         run: |
+          set -x
           sudo systemctl stop "$RETH_SCOPE" 2>/dev/null || true
           sudo systemctl reset-failed "$RETH_SCOPE" 2>/dev/null || true
           sudo schelk recover -y --kill || sudo schelk full-recover -y || true
@@ -879,7 +886,7 @@ jobs:
       - name: Download big blocks
         if: env.BENCH_BIG_BLOCKS == 'true'
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           BIG_BLOCKS_DIR="$HOME/.reth-bench-big-blocks"
           echo "BENCH_BIG_BLOCKS_DIR=${BIG_BLOCKS_DIR}" >> "$GITHUB_ENV"
           if [ "${{ steps.big-blocks-check.outputs.needed }}" = "false" ]; then
@@ -917,6 +924,7 @@ jobs:
 
       - name: Start metrics proxy
         run: |
+          set -x
           BENCH_ID="ci-${{ github.run_id }}"
           BENCH_REFERENCE_EPOCH=$(date +%s)
           echo "BENCH_ID=${BENCH_ID}" >> "$GITHUB_ENV"
@@ -952,6 +960,7 @@ jobs:
           BASELINE_REF: ${{ steps.refs.outputs.baseline-ref }}
           OTEL_RESOURCE_ATTRIBUTES: "benchmark_id=${{ env.BENCH_ID }},benchmark_run=baseline-1,run_type=baseline,git_ref=${{ steps.refs.outputs.baseline-ref }}"
         run: |
+          set -x
           LAST_RUN_START=$(date +%s)
           echo "BENCH_LAST_RUN_START=${LAST_RUN_START}" >> "$GITHUB_ENV"
           cat > "$BENCH_LABELS_FILE" <<LABELS
@@ -965,6 +974,7 @@ jobs:
           FEATURE_REF: ${{ steps.refs.outputs.feature-ref }}
           OTEL_RESOURCE_ATTRIBUTES: "benchmark_id=${{ env.BENCH_ID }},benchmark_run=feature-1,run_type=feature,git_ref=${{ steps.refs.outputs.feature-ref }}"
         run: |
+          set -x
           LAST_RUN_START=$(date +%s)
           echo "BENCH_LAST_RUN_START=${LAST_RUN_START}" >> "$GITHUB_ENV"
           cat > "$BENCH_LABELS_FILE" <<LABELS
@@ -979,6 +989,7 @@ jobs:
           FEATURE_REF: ${{ steps.refs.outputs.feature-ref }}
           OTEL_RESOURCE_ATTRIBUTES: "benchmark_id=${{ env.BENCH_ID }},benchmark_run=feature-2,run_type=feature,git_ref=${{ steps.refs.outputs.feature-ref }}"
         run: |
+          set -x
           LAST_RUN_START=$(date +%s)
           echo "BENCH_LAST_RUN_START=${LAST_RUN_START}" >> "$GITHUB_ENV"
           cat > "$BENCH_LABELS_FILE" <<LABELS
@@ -993,6 +1004,7 @@ jobs:
           BASELINE_REF: ${{ steps.refs.outputs.baseline-ref }}
           OTEL_RESOURCE_ATTRIBUTES: "benchmark_id=${{ env.BENCH_ID }},benchmark_run=baseline-2,run_type=baseline,git_ref=${{ steps.refs.outputs.baseline-ref }}"
         run: |
+          set -x
           LAST_RUN_START=$(date +%s)
           echo "BENCH_LAST_RUN_START=${LAST_RUN_START}" >> "$GITHUB_ENV"
           cat > "$BENCH_LABELS_FILE" <<LABELS
@@ -1004,6 +1016,7 @@ jobs:
         id: metrics
         if: "!cancelled()"
         run: |
+          set -x
           kill "$BENCH_METRICS_PROXY_PID" 2>/dev/null || true
 
           LAST_RUN_DURATION=$(( $(date +%s) - BENCH_LAST_RUN_START ))
@@ -1016,6 +1029,7 @@ jobs:
       - name: Scan logs for errors
         if: "!cancelled()"
         run: |
+          set -x
           ERRORS_FILE="$BENCH_WORK_DIR/errors.md"
           found=false
           for run_dir in baseline-1 feature-1 feature-2 baseline-2; do
@@ -1048,6 +1062,7 @@ jobs:
       - name: Upload samply profiles
         if: success() && env.BENCH_SAMPLY == 'true'
         run: |
+          set -x
           PROFILER_API="https://api.profiler.firefox.com"
           PROFILER_ACCEPT="Accept: application/vnd.firefox-profiler+json;version=1.0"
 
@@ -1099,6 +1114,7 @@ jobs:
           FEATURE_NAME: ${{ steps.refs.outputs.feature-name }}
           FEATURE_REF: ${{ steps.refs.outputs.feature-ref }}
         run: |
+          set -x
           git fetch origin "${BASELINE_NAME}" --quiet 2>/dev/null || true
           BASELINE_HEAD=$(git rev-parse "origin/${BASELINE_NAME}" 2>/dev/null || echo "")
           BEHIND_BASELINE=0
@@ -1147,6 +1163,7 @@ jobs:
           BASELINE_NAME: ${{ steps.refs.outputs.baseline-name }}
           FEATURE_NAME: ${{ steps.refs.outputs.feature-name }}
         run: |
+          set -x
           CHART_ARGS="--output-dir $BENCH_WORK_DIR/charts"
           FEATURE_CSVS="$BENCH_WORK_DIR/feature-1/combined_latency.csv"
           BASELINE_CSVS="$BENCH_WORK_DIR/baseline-1/combined_latency.csv"
@@ -1172,6 +1189,7 @@ jobs:
         id: push-charts
         if: success()
         run: |
+          set -x
           PR_NUMBER="${BENCH_PR:-0}"
           RUN_ID=${{ github.run_id }}
           CHART_DIR="pr/${PR_NUMBER}/${RUN_ID}"
@@ -1371,6 +1389,7 @@ jobs:
       - name: Restore system settings
         if: always()
         run: |
+          set -x
           # Restore frequency scaling to full range
           for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_min_freq; do
             cat "$(dirname "$f")/cpuinfo_min_freq" | sudo tee "$f" > /dev/null 2>&1 || true

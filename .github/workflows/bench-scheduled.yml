@@ -80,6 +80,7 @@ jobs:
       - name: Detect mode
         id: mode
         run: |
+          set -x
           # Maps cron schedules to modes (must match the schedule entries above)
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             MODE="${{ inputs.mode || 'nightly' }}"
@@ -101,6 +102,7 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
+          set -x
           FORCE="${{ inputs.force || 'false' }}"
           MODE="${{ steps.mode.outputs.mode }}"
           .github/scripts/bench-scheduled-refs.sh "$FORCE" "$MODE"
@@ -224,6 +226,7 @@ jobs:
       - name: Fail on stale nightly
         if: steps.mode.outputs.mode == 'nightly' && steps.refs.outputs.is-stale == 'true'
         run: |
+          set -x
           echo "::error::Nightly build is stale (>24h old). Aborting."
           exit 1
 
@@ -293,6 +296,7 @@ jobs:
         env:
           DEREK_TOKEN: ${{ secrets.DEREK_TOKEN }}
         run: |
+          set -x
           mkdir -p "$HOME/.local/bin"
 
           # apt packages
@@ -331,6 +335,7 @@ jobs:
 
       - name: Check dependencies
         run: |
+          set -x
           export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -349,6 +354,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.resolve-refs.outputs.release-tag }}
         run: |
+          set -x
           FEATURE_SHORT=$(echo "$FEATURE_REF" | cut -c1-8)
           if [ "$BENCH_MODE" = "release" ] && [ -n "$RELEASE_TAG" ]; then
             echo "baseline-name=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
@@ -364,6 +370,7 @@ jobs:
       - name: Check if snapshot needs update
         id: snapshot-check
         run: |
+          set -x
           set +e
           .github/scripts/bench-reth-snapshot.sh --check
           rc=$?
@@ -377,6 +384,7 @@ jobs:
 
       - name: Prepare source dirs
         run: |
+          set -x
           if [ -d ../reth-baseline ]; then
             git -C ../reth-baseline fetch origin "$BASELINE_REF"
           else
@@ -397,6 +405,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BENCH_REPO: ${{ github.repository }}
         run: |
+          set -x
           BASELINE_DIR="$(cd ../reth-baseline && pwd)"
           FEATURE_DIR="$(cd ../reth-feature && pwd)"
 
@@ -425,6 +434,7 @@ jobs:
       # System tuning for reproducible benchmarks
       - name: System setup
         run: |
+          set -x
           sudo cpupower frequency-set -g performance || true
           # Disable turbo boost (Intel and AMD paths)
           echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || true
@@ -462,6 +472,7 @@ jobs:
 
       - name: Pre-flight cleanup
         run: |
+          set -x
           sudo systemctl stop "$RETH_SCOPE" 2>/dev/null || true
           sudo systemctl reset-failed "$RETH_SCOPE" 2>/dev/null || true
           sudo schelk recover -y --kill || sudo schelk full-recover -y || true
@@ -470,6 +481,7 @@ jobs:
 
       - name: Start metrics proxy
         run: |
+          set -x
           BENCH_ID="${BENCH_MODE}-${{ github.run_id }}"
           BENCH_REFERENCE_EPOCH=$(date +%s)
           echo "BENCH_ID=${BENCH_ID}" >> "$GITHUB_ENV"
@@ -492,6 +504,7 @@ jobs:
       - name: "Run benchmark: baseline (1/2)"
         id: run-baseline-1
         run: |
+          set -x
           cat > "$BENCH_LABELS_FILE" <<LABELS
           {"benchmark_run":"baseline-1","run_type":"baseline","git_ref":"${BASELINE_REF}","bench_sha":"${BASELINE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"$(date +%s)","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
           LABELS
@@ -500,6 +513,7 @@ jobs:
       - name: "Run benchmark: feature (1/2)"
         id: run-feature-1
         run: |
+          set -x
           cat > "$BENCH_LABELS_FILE" <<LABELS
           {"benchmark_run":"feature-1","run_type":"feature","git_ref":"${FEATURE_REF}","bench_sha":"${FEATURE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"$(date +%s)","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
           LABELS
@@ -508,6 +522,7 @@ jobs:
       - name: "Run benchmark: feature (2/2)"
         id: run-feature-2
         run: |
+          set -x
           cat > "$BENCH_LABELS_FILE" <<LABELS
           {"benchmark_run":"feature-2","run_type":"feature","git_ref":"${FEATURE_REF}","bench_sha":"${FEATURE_REF}","benchmark_id":"${BENCH_ID}","run_start_epoch":"$(date +%s)","reference_epoch":"${BENCH_REFERENCE_EPOCH}"}
           LABELS
@@ -516,6 +531,7 @@ jobs:
       - name: "Run benchmark: baseline (2/2)"
         id: run-baseline-2
         run: |
+          set -x
           LAST_RUN_START=$(date +%s)
           echo "BENCH_LAST_RUN_START=${LAST_RUN_START}" >> "$GITHUB_ENV"
           cat > "$BENCH_LABELS_FILE" <<LABELS
@@ -527,6 +543,7 @@ jobs:
         id: metrics
         if: "!cancelled()"
         run: |
+          set -x
           kill "$BENCH_METRICS_PROXY_PID" 2>/dev/null || true
 
           LAST_RUN_DURATION=$(( $(date +%s) - BENCH_LAST_RUN_START ))
@@ -539,6 +556,7 @@ jobs:
       - name: Scan logs for errors
         if: "!cancelled()"
         run: |
+          set -x
           ERRORS_FILE="$BENCH_WORK_DIR/errors.md"
           found=false
           for run_dir in baseline-1 feature-1 feature-2 baseline-2; do
@@ -576,6 +594,7 @@ jobs:
           FEATURE_NAME: ${{ steps.refs.outputs.feature-name }}
           BASELINE_REF_DISPLAY: ${{ steps.refs.outputs.baseline-ref }}
         run: |
+          set -x
           SUMMARY_ARGS="--output-summary $BENCH_WORK_DIR/summary.json"
           SUMMARY_ARGS="$SUMMARY_ARGS --output-markdown $BENCH_WORK_DIR/comment.md"
           SUMMARY_ARGS="$SUMMARY_ARGS --repo ${{ github.repository }}"
@@ -606,6 +625,7 @@ jobs:
           CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
           CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
         run: |
+          set -x
           if [ "$BENCH_MODE" = "release" ]; then
             WORKFLOW_NAME="workflows-release-regression-${{ github.run_id }}"
           else
@@ -629,6 +649,7 @@ jobs:
           BASELINE_NAME: ${{ steps.refs.outputs.baseline-name }}
           FEATURE_NAME: ${{ steps.refs.outputs.feature-name }}
         run: |
+          set -x
           CHART_ARGS="--output-dir $BENCH_WORK_DIR/charts"
           FEATURE_CSVS="$BENCH_WORK_DIR/feature-1/combined_latency.csv"
           BASELINE_CSVS="$BENCH_WORK_DIR/baseline-1/combined_latency.csv"
@@ -652,6 +673,7 @@ jobs:
         id: push-charts
         if: success() && env.BENCH_MODE != 'hourly'
         run: |
+          set -x
           RUN_ID=${{ github.run_id }}
           CHART_DIR="${BENCH_MODE}/${RUN_ID}"
           CHARTS_REPO="https://x-access-token:${{ secrets.DEREK_TOKEN }}@github.com/decofe/reth-bench-charts.git"
@@ -965,6 +987,7 @@ jobs:
       - name: Restore system settings
         if: always()
         run: |
+          set -x
           sudo systemctl start irqbalance cron atd 2>/dev/null || true
 
   # ---------------------------------------------------------------------------
@@ -980,6 +1003,7 @@ jobs:
         env:
           DEREK_TOKEN: ${{ secrets.DEREK_TOKEN }}
         run: |
+          set -x
           MODE="${{ needs.resolve-refs.outputs.mode }}"
           FEATURE_REF="${{ needs.resolve-refs.outputs.feature-ref }}"
           CHARTS_REPO="https://x-access-token:${DEREK_TOKEN}@github.com/decofe/reth-bench-charts.git"
