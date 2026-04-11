@@ -66,8 +66,12 @@ if [ -n "$SNAPSHOT_BLOCK" ]; then
     RPC_HEAD=$(printf '%d' "$RPC_HEAD_HEX")
     NEEDED=$((SNAPSHOT_BLOCK + HEADROOM))
     if [ "$NEEDED" -gt "$RPC_HEAD" ]; then
-      echo "Snapshot too new: block ${SNAPSHOT_BLOCK} + ${HEADROOM} headroom = ${NEEDED} > RPC head ${RPC_HEAD}. Keeping current snapshot."
-      exit 0
+      if [ -n "$LOCAL_HASH" ] && [ -d "$DATADIR/db" ]; then
+        echo "Snapshot too new: block ${SNAPSHOT_BLOCK} + ${HEADROOM} headroom = ${NEEDED} > RPC head ${RPC_HEAD}. Keeping current snapshot."
+        exit 0
+      else
+        echo "::warning::Snapshot too new (block ${SNAPSHOT_BLOCK} + ${HEADROOM} = ${NEEDED} > RPC head ${RPC_HEAD}), but no existing snapshot to fall back to. Downloading anyway."
+      fi
     fi
     echo "Snapshot headroom OK: block ${SNAPSHOT_BLOCK} + ${HEADROOM} = ${NEEDED} <= RPC head ${RPC_HEAD}"
   else
