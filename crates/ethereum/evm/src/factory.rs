@@ -36,6 +36,7 @@ pub struct RethEvmFactory {
     inner: Inner,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for RethEvmFactory {
     fn default() -> Self {
         #[cfg(feature = "std")]
