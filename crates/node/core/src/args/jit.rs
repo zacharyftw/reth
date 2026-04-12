@@ -1,6 +1,8 @@
 //! clap [Args](clap::Args) for revmc JIT configuration.
 
 use clap::Args;
+use humantime::parse_duration;
+use std::time::Duration;
 
 /// Parameters for JIT compilation of EVM bytecode via revmc.
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -12,7 +14,7 @@ pub struct JitArgs {
 
     /// Number of observed misses before a bytecode is promoted to JIT compilation.
     #[arg(long = "jit.hot-threshold", default_value_t = Self::DEFAULT_HOT_THRESHOLD, help_heading = "JIT")]
-    pub hot_threshold: u32,
+    pub hot_threshold: usize,
 
     /// Number of JIT compilation worker threads.
     #[arg(long = "jit.worker-count", help_heading = "JIT")]
@@ -33,28 +35,36 @@ pub struct JitArgs {
     #[arg(long = "jit.code-cache-bytes", default_value_t = Self::DEFAULT_CODE_CACHE_BYTES, help_heading = "JIT")]
     pub code_cache_bytes: usize,
 
-    /// Duration in seconds after which a compiled program with no lookup hits is evicted.
-    /// 0 means idle eviction is disabled.
-    #[arg(long = "jit.idle-evict-secs", default_value_t = Self::DEFAULT_IDLE_EVICT_SECS, help_heading = "JIT")]
-    pub idle_evict_secs: u64,
+    /// Duration after which a compiled program with no lookup hits is evicted.
+    #[arg(
+        long = "jit.idle-evict-duration",
+        default_value = humantime::format_duration(Self::DEFAULT_IDLE_EVICT_DURATION).to_string(),
+        help_heading = "JIT",
+        value_parser = parse_duration,
+    )]
+    pub idle_evict_duration: Duration,
 
-    /// Enable compiler debug dumps. IR, assembly, and bytecode are written to
-    /// `<datadir>/jit/<spec_id>/<code_hash>/` for each compiled contract.
+    /// Enable compiler debug dumps.
+    ///
+    /// IR, assembly, and bytecode are written to `<datadir>/jit/<spec_id>/<code_hash>/` for each
+    /// compiled contract.
+    /// Note that this is not ever cleaned up, and has a non negligible performance overhead.
     #[arg(long = "jit.debug", default_value_t = false, help_heading = "JIT")]
     pub debug: bool,
 
     /// Blocking mode: synchronously JIT-compile every contract on first encounter.
-    /// Implies --jit. Intended for debugging only.
-    #[arg(long = "jit.blocking", default_value_t = false, help_heading = "JIT")]
+    /// Intended for debugging only.
+    #[doc(hidden)]
+    #[arg(long = "jit.blocking", default_value_t = false, help_heading = "JIT", hide = true)]
     pub blocking: bool,
 }
 
 impl JitArgs {
-    const DEFAULT_HOT_THRESHOLD: u32 = 8;
+    const DEFAULT_HOT_THRESHOLD: usize = 8;
     const DEFAULT_CHANNEL_CAPACITY: usize = 4096;
     const DEFAULT_MAX_PENDING_JOBS: usize = 2048;
     const DEFAULT_CODE_CACHE_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
-    const DEFAULT_IDLE_EVICT_SECS: u64 = 3600;
+    const DEFAULT_IDLE_EVICT_DURATION: Duration = Duration::from_hours(1);
 }
 
 impl Default for JitArgs {
@@ -66,7 +76,7 @@ impl Default for JitArgs {
             channel_capacity: Self::DEFAULT_CHANNEL_CAPACITY,
             max_pending_jobs: Self::DEFAULT_MAX_PENDING_JOBS,
             code_cache_bytes: Self::DEFAULT_CODE_CACHE_BYTES,
-            idle_evict_secs: Self::DEFAULT_IDLE_EVICT_SECS,
+            idle_evict_duration: Self::DEFAULT_IDLE_EVICT_DURATION,
             debug: false,
             blocking: false,
         }

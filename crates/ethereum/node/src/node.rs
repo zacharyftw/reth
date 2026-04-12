@@ -426,7 +426,7 @@ fn jit_runtime_config(jit: &JitArgs) -> RuntimeConfig {
         max_pending_jit_jobs: jit.max_pending_jobs,
         jit_worker_count: jit.worker_count.unwrap_or(default_tuning.jit_worker_count),
         resident_code_cache_bytes: jit.code_cache_bytes,
-        idle_evict_duration: jit.idle_evict_duration,
+        idle_evict_duration: Some(jit.idle_evict_duration),
 
         shutdown_timeout: default_tuning.shutdown_timeout,
         jit_max_bytecode_len: default_tuning.jit_max_bytecode_len,
