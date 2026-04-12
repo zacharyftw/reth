@@ -25,7 +25,6 @@ jobs:
           - cargo run --bin reth --features "dev"
     steps:
       - uses: rui314/setup-mold@v1
-      - run: sudo .github/scripts/install_llvm_ubuntu.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
@@ -36,6 +35,7 @@ jobs:
         with:
           ref: ${{ github.base_ref || 'main' }}
       # On `main` branch, generates test vectors and serializes them to disk using `Compact`.
+      - run: sudo .github/scripts/install_llvm_ubuntu.sh
       - name: Generate compact vectors
         run: |
           ${{ matrix.bin }} -- test-vectors compact --write
