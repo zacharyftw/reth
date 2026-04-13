@@ -1,33 +1,21 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-v=22
+v=${1:-22}
 bins=(clang llvm-config lld ld.lld FileCheck)
 
-# Detect distro codename.
-. /etc/os-release
-distro="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
-case "$distro" in
-    bullseye|bookworm|trixie|noble|jammy|focal) ;;
-    *) distro="unstable" ;;
-esac
-
-# Add LLVM apt source.
+# Install prerequisites for llvm.sh.
 apt-get update -qq
-apt-get install -y --no-install-recommends wget gnupg ca-certificates
-wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
-    | gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+apt-get install -y --no-install-recommends \
+    lsb-release wget software-properties-common gnupg ca-certificates
 
-if [ "$distro" = "unstable" ]; then
-    repo="llvm-toolchain-$v"
-else
-    repo="llvm-toolchain-$distro-$v"
-fi
-echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/$distro/ $repo main" \
-    > /etc/apt/sources.list.d/llvm-$v.list
-
-apt-get update -qq
-apt-get install -y --no-install-recommends clang-$v llvm-$v-dev lld-$v
+# Use the official LLVM install script which handles distro detection,
+# GPG key import, and apt source configuration for all Debian/Ubuntu versions.
+llvm_sh=$(mktemp)
+wget -qO "$llvm_sh" https://apt.llvm.org/llvm.sh
+chmod +x "$llvm_sh"
+"$llvm_sh" "$v" all
+rm -f "$llvm_sh"
 
 for bin in "${bins[@]}"; do
     if ! command -v "$bin-$v" &>/dev/null; then
