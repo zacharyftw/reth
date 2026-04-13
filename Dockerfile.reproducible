@@ -1,5 +1,5 @@
 ARG RUST_TOOLCHAIN=1.89.0
-FROM docker.io/rust:$RUST_TOOLCHAIN-bookworm AS builder
+FROM docker.io/rust:$RUST_TOOLCHAIN-trixie AS builder
 
 ARG PROFILE
 ARG VERSION

@@ -5,9 +5,12 @@ v=${1:-22}
 bins=(clang llvm-config lld ld.lld FileCheck)
 
 # Install prerequisites for llvm.sh.
+# software-properties-common is needed on older distros (bookworm) for add-apt-repository
+# but not on newer ones (trixie, forky) where llvm.sh uses a different method.
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-    lsb-release wget software-properties-common gnupg ca-certificates
+    lsb-release wget gnupg ca-certificates
+apt-get install -y --no-install-recommends software-properties-common 2>/dev/null || true
 
 # Use the official LLVM install script which handles distro detection,
 # GPG key import, and apt source configuration for all Debian/Ubuntu versions.
