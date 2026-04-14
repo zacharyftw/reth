@@ -1158,8 +1158,14 @@ impl SparseTrie for ParallelSparseTrie {
         #[cfg(feature = "trie-debug")]
         self.debug_recorder.reset();
 
-        let mut retained_leaves = retained_leaves.to_vec();
-        retained_leaves.sort_unstable();
+        let retained_leaves = if retained_leaves.windows(2).all(|w| w[0] <= w[1]) {
+            Cow::Borrowed(retained_leaves)
+        } else {
+            let mut retained = retained_leaves.to_vec();
+            retained.sort_unstable();
+            retained.dedup();
+            Cow::Owned(retained)
+        };
 
         let mut effective_pruned_roots = Vec::<Nibbles>::new();
         let mut stack: SmallVec<[Nibbles; 32]> = SmallVec::new();
