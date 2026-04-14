@@ -205,9 +205,7 @@ impl reth_codecs::Compact for PackedStoredNibbles {
     }
 
     fn from_compact(buf: &[u8], _len: usize) -> (Self, &[u8]) {
-        let nibble_count = buf[32] as usize;
-        let packed_len = nibble_count.div_ceil(2);
-        (Self(Nibbles::unpack(&buf[..packed_len]).slice(..nibble_count)), &buf[33..])
+        (Self(unpack_packed_nibbles(buf)), &buf[33..])
     }
 }
 
@@ -289,14 +287,29 @@ impl reth_codecs::Compact for PackedStoredNibblesSubKey {
     }
 
     fn from_compact(buf: &[u8], _len: usize) -> (Self, &[u8]) {
-        let nibble_count = buf[32] as usize;
-        let packed_len = nibble_count.div_ceil(2);
-        (Self(Nibbles::unpack(&buf[..packed_len]).slice(..nibble_count)), &buf[33..])
+        (Self(unpack_packed_nibbles(buf)), &buf[33..])
     }
 }
 
 #[cfg(any(test, feature = "reth-codec"))]
 reth_codecs::impl_compression_for_compact!(PackedStoredNibblesSubKey);
+
+#[cfg(any(test, feature = "reth-codec"))]
+#[inline]
+fn unpack_packed_nibbles(buf: &[u8]) -> Nibbles {
+    let nibble_count = buf[32] as usize;
+    assert!(nibble_count <= 64);
+
+    match nibble_count {
+        0 => Nibbles::default(),
+        64 => Nibbles::unpack_array(buf[..32].try_into().expect("slice has fixed width")),
+        _ => {
+            let packed_len = nibble_count.div_ceil(2);
+            let unpacked = unsafe { Nibbles::unpack_unchecked(&buf[..packed_len]) };
+            if nibble_count & 1 == 0 { unpacked } else { unpacked.slice(..nibble_count) }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

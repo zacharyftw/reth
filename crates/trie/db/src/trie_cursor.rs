@@ -222,10 +222,7 @@ where
         &mut self,
         key: Nibbles,
     ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
-        Ok(self
-            .0
-            .seek_exact(A::AccountKey::from(key))?
-            .map(|value| (A::account_key_to_nibbles(&value.0), value.1)))
+        Ok(self.0.seek_exact(A::AccountKey::from(key))?.map(|(_, node)| (key, node)))
     }
 
     fn seek(
@@ -322,14 +319,10 @@ where
         key: Nibbles,
     ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
         let subkey = A::StorageSubKey::from(key);
-        Ok(self
-            .cursor
-            .seek_by_key_subkey(self.hashed_address, subkey.clone())?
-            .filter(|e| *e.nibbles() == subkey)
-            .map(|value| {
-                let (subkey, node) = value.into_parts();
-                (A::subkey_to_nibbles(&subkey), node)
-            }))
+        Ok(match self.cursor.seek_by_key_subkey(self.hashed_address, subkey.clone())? {
+            Some(value) if value.nibbles() == &subkey => Some((key, value.into_parts().1)),
+            _ => None,
+        })
     }
 
     fn seek(
@@ -439,6 +432,40 @@ mod tests {
             let trie_factory = DatabaseTrieCursorFactory::<_, A>::new(provider.tx_ref());
             let mut cursor = trie_factory.storage_trie_cursor(hashed_address).unwrap();
             assert_eq!(cursor.seek(key.into()).unwrap().unwrap().1, value);
+        });
+    }
+
+    #[test]
+    fn test_storage_cursor_seek_exact_requires_exact_subkey() {
+        use reth_storage_api::StorageSettingsCache;
+        use reth_trie::trie_cursor::{TrieCursor, TrieCursorFactory};
+
+        let factory = create_test_provider_factory();
+        let provider = factory.provider_rw().unwrap();
+        let mut cursor = provider.tx_ref().cursor_dup_write::<tables::StoragesTrie>().unwrap();
+
+        let hashed_address = B256::random();
+        let existing = StoredNibblesSubKey::from(vec![0x2, 0x3]);
+        let missing = Nibbles::from_nibbles_unchecked(vec![0x2, 0x4]);
+        let value = BranchNodeCompact::new(1, 1, 1, vec![B256::random()], None);
+
+        cursor
+            .upsert(
+                hashed_address,
+                &StorageTrieEntry { nibbles: existing.clone(), node: value.clone() },
+            )
+            .unwrap();
+
+        crate::with_adapter!(provider, |A| {
+            let trie_factory = DatabaseTrieCursorFactory::<_, A>::new(provider.tx_ref());
+            let mut trie_cursor = trie_factory.storage_trie_cursor(hashed_address).unwrap();
+            let exact_key: Nibbles = existing.clone().into();
+
+            let exact = trie_cursor.seek_exact(exact_key).unwrap().unwrap();
+            assert_eq!(exact.0, exact_key);
+            assert_eq!(exact.1, value);
+
+            assert!(trie_cursor.seek_exact(missing).unwrap().is_none());
         });
     }
 }
