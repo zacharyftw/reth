@@ -693,10 +693,14 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 timings.update_history_indices = start.elapsed();
             }
 
-            // Update pipeline progress
-            let start = Instant::now();
-            self.update_pipeline_stages(last_block_number, false)?;
-            timings.update_pipeline_stages = start.elapsed();
+            // Advancing the finish stage implies the block's state is fully persisted.
+            // Partial `BlocksOnly` saves intentionally leave `best_block_number` anchored at the
+            // last fully persisted checkpoint.
+            if save_mode.with_state() {
+                let start = Instant::now();
+                self.update_pipeline_stages(last_block_number, false)?;
+                timings.update_pipeline_stages = start.elapsed();
+            }
 
             timings.mdbx = mdbx_start.elapsed();
 

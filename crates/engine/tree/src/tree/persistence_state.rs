@@ -6,13 +6,13 @@
 //!
 //! ## Background Persistence
 //!
-//! The execution engine maintains an in-memory cache of state changes that need
-//! to be persisted to disk. Rather than writing synchronously (which would slow
+//! The execution engine maintains an in-memory cache of canonical blocks and
+//! their state changes. Rather than writing synchronously (which would slow
 //! down block processing), persistence happens in background tasks.
 //!
 //! ## Persistence Actions
 //!
-//! - **Saving Blocks**: Persist newly executed blocks and their state changes
+//! - **Advancing db_tip**: Persist newly executed block structure to disk
 //! - **Removing Blocks**: Remove invalid blocks during chain reorganizations
 //!
 //! ## Coordination
@@ -30,10 +30,14 @@ use tracing::trace;
 /// The state of the persistence task.
 #[derive(Debug)]
 pub struct PersistenceState {
-    /// Hash and number of the last block persisted.
+    /// Hash and number of the last block whose block structure was persisted.
     ///
-    /// This tracks the chain height that is persisted on disk
-    pub(crate) last_persisted_block: BlockNumHash,
+    /// This tracks the on-disk block frontier (`B_db_tip`).
+    pub(crate) db_tip: BlockNumHash,
+    /// Hash and number of the last block whose state/trie are fully persisted.
+    ///
+    /// This tracks the fully persisted state frontier (`B_db_checkpoint`).
+    pub(crate) db_checkpoint: BlockNumHash,
     /// Receiver end of channel where the result of the persistence task will be
     /// sent when done. A None value means there's no persistence task in progress.
     pub(crate) rx:
@@ -41,6 +45,11 @@ pub struct PersistenceState {
 }
 
 impl PersistenceState {
+    /// Create a new persistence state with `db_tip == db_checkpoint`.
+    pub(crate) const fn new(persisted: BlockNumHash) -> Self {
+        Self { db_tip: persisted, db_checkpoint: persisted, rx: None }
+    }
+
     /// Determines if there is a persistence task in progress by checking if the
     /// receiver is set.
     pub(crate) const fn in_progress(&self) -> bool {
@@ -57,13 +66,13 @@ impl PersistenceState {
             Some((rx, Instant::now(), CurrentPersistenceAction::RemovingBlocks { new_tip_num }));
     }
 
-    /// Sets the state for a block save operation.
-    pub(crate) fn start_save(
+    /// Sets the state for a block save operation that advances `db_tip`.
+    pub(crate) fn start_save_db_tip(
         &mut self,
         highest: BlockNumHash,
         rx: CrossbeamReceiver<PersistenceResult>,
     ) {
-        self.rx = Some((rx, Instant::now(), CurrentPersistenceAction::SavingBlocks { highest }));
+        self.rx = Some((rx, Instant::now(), CurrentPersistenceAction::SavingDbTip { highest }));
     }
 
     /// Returns the current persistence action. If there is no persistence task in progress, then
@@ -73,25 +82,40 @@ impl PersistenceState {
         self.rx.as_ref().map(|rx| &rx.2)
     }
 
-    /// Sets state for a finished persistence task.
-    pub(crate) fn finish(
-        &mut self,
-        last_persisted_block_hash: B256,
-        last_persisted_block_number: u64,
-    ) {
-        trace!(target: "engine::tree", block= %last_persisted_block_number, hash=%last_persisted_block_hash, "updating persistence state");
+    /// Sets state for a finished `db_tip` persistence task.
+    pub(crate) fn finish_db_tip(&mut self, persisted_hash: B256, persisted_number: u64) {
+        trace!(target: "engine::tree", block= %persisted_number, hash=%persisted_hash, "updating db_tip persistence state");
         self.rx = None;
-        self.last_persisted_block =
-            BlockNumHash::new(last_persisted_block_number, last_persisted_block_hash);
+        self.db_tip = BlockNumHash::new(persisted_number, persisted_hash);
+    }
+
+    /// Sets state for a finished block removal task.
+    pub(crate) fn finish_remove(&mut self, persisted_hash: B256, persisted_number: u64) {
+        trace!(target: "engine::tree", block= %persisted_number, hash=%persisted_hash, "updating persistence state after disk removal");
+        self.rx = None;
+        let persisted = BlockNumHash::new(persisted_number, persisted_hash);
+        self.db_tip = persisted;
+        if self.db_checkpoint.number > persisted_number {
+            self.db_checkpoint = persisted;
+        }
+    }
+
+    /// Sets both frontiers to the same fully persisted head.
+    pub(crate) fn finish_full(&mut self, persisted_hash: B256, persisted_number: u64) {
+        trace!(target: "engine::tree", block= %persisted_number, hash=%persisted_hash, "updating full persistence state");
+        self.rx = None;
+        let persisted = BlockNumHash::new(persisted_number, persisted_hash);
+        self.db_tip = persisted;
+        self.db_checkpoint = persisted;
     }
 }
 
 /// The currently running persistence action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CurrentPersistenceAction {
-    /// The persistence task is saving blocks.
-    SavingBlocks {
-        /// The highest block being saved.
+    /// The persistence task is saving block structure to advance `db_tip`.
+    SavingDbTip {
+        /// The highest block being saved to `db_tip`.
         highest: BlockNumHash,
     },
     /// The persistence task is removing blocks.

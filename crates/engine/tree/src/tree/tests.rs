@@ -27,7 +27,7 @@ use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_evm_ethereum::MockEvmConfig;
 use reth_primitives_traits::Block as _;
-use reth_provider::test_utils::MockEthProvider;
+use reth_provider::{test_utils::MockEthProvider, SaveBlocksMode};
 use reth_tasks::spawn_os_thread;
 use std::{
     collections::BTreeMap,
@@ -215,7 +215,7 @@ impl TestHarness {
             engine_api_tree_state,
             canonical_in_memory_state,
             persistence_handle,
-            PersistenceState { last_persisted_block: BlockNumHash::default(), rx: None },
+            PersistenceState::new(BlockNumHash::default()),
             payload_builder,
             // always assume enough parallelism for tests
             TreeConfig::default().with_legacy_state_root(false).with_has_enough_parallelism(true),
@@ -415,9 +415,9 @@ impl ValidatorTestHarness {
     /// Configure `PersistenceState` for specific persistence scenarios
     fn start_persistence_operation(&mut self, action: CurrentPersistenceAction) {
         match action {
-            CurrentPersistenceAction::SavingBlocks { highest } => {
+            CurrentPersistenceAction::SavingDbTip { highest } => {
                 let (_tx, rx) = crossbeam_channel::bounded(1);
-                self.harness.tree.persistence_state.start_save(highest, rx);
+                self.harness.tree.persistence_state.start_save_db_tip(highest, rx);
             }
             CurrentPersistenceAction::RemovingBlocks { new_tip_num } => {
                 let (_tx, rx) = crossbeam_channel::bounded(1);
@@ -530,13 +530,13 @@ fn test_tree_persist_block_batch() {
 }
 
 #[tokio::test]
-async fn test_tree_does_not_background_persist_blocks() {
+async fn test_tree_persists_blocks_to_db_tip_in_background() {
     let tree_config = TreeConfig::default();
     let chain_spec = MAINNET.clone();
     let mut test_block_builder = TestBlockBuilder::eth().with_chain_spec((*chain_spec).clone());
 
-    // This is enough blocks to exceed the persistence threshold on main, but the bench prototype
-    // keeps the range fully in memory during steady-state execution.
+    // This is enough blocks to exceed the persistence threshold on main and trigger a background
+    // `db_tip` persistence task.
     let blocks: Vec<_> = test_block_builder
         .get_executed_blocks(1..tree_config.persistence_threshold() + 2)
         .collect();
@@ -546,10 +546,13 @@ async fn test_tree_does_not_background_persist_blocks() {
     // send a message to the tree to enter the main loop.
     test_harness.to_tree_tx.send(FromEngine::DownloadedBlocks(vec![])).unwrap();
 
-    assert!(
-        test_harness.action_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-        "steady-state execution should not trigger background persistence"
-    );
+    let received_action =
+        test_harness.action_rx.recv().expect("Failed to receive save blocks action");
+    let PersistenceAction::SaveBlocks { blocks: saved_blocks, mode, .. } = received_action else {
+        panic!("unexpected action received {received_action:?}");
+    };
+    assert_eq!(mode, SaveBlocksMode::BlocksOnly);
+    assert_eq!(saved_blocks, blocks);
 }
 
 #[tokio::test]
@@ -696,7 +699,7 @@ fn test_backpressure_waits_for_persistence_before_reading_incoming() {
 
     let (persist_tx, persist_rx) = crossbeam_channel::bounded(1);
     let persisted = blocks.last().unwrap().recovered_block().num_hash();
-    test_harness.tree.persistence_state.start_save(persisted, persist_rx);
+    test_harness.tree.persistence_state.start_save_db_tip(persisted, persist_rx);
     assert!(test_harness.tree.should_backpressure());
 
     let (tx, mut rx) = oneshot::channel();
@@ -732,10 +735,10 @@ fn test_backpressure_waits_for_persistence_before_reading_incoming() {
     assert!(matches!(event, super::LoopEvent::PersistenceComplete { .. }));
     assert_eq!(test_harness.tree.incoming.len(), 2);
 
-    let super::LoopEvent::PersistenceComplete { result, start_time } = event else {
+    let super::LoopEvent::PersistenceComplete { result, start_time, action } = event else {
         unreachable!()
     };
-    test_harness.tree.on_persistence_complete(result, start_time).unwrap();
+    test_harness.tree.on_persistence_complete(result, start_time, action).unwrap();
 
     let super::LoopEvent::EngineMessage(message) = test_harness.tree.wait_for_event() else {
         panic!("expected queued engine message")
@@ -796,10 +799,33 @@ async fn test_tree_state_on_new_head_reorg() {
     let current_action = test_harness.tree.persistence_state.current_action();
     assert_eq!(current_action, None);
 
-    // Background persistence is disabled for the bench prototype, so this remains idle.
+    // Advancing persistence should persist the current canonical chain to `db_tip`.
     test_harness.tree.advance_persistence().unwrap();
     let current_action = test_harness.tree.persistence_state.current_action().cloned();
-    assert_eq!(current_action, None);
+    assert_eq!(
+        current_action,
+        Some(CurrentPersistenceAction::SavingDbTip {
+            highest: blocks[2].recovered_block().num_hash()
+        })
+    );
+
+    let received_action = test_harness.action_rx.recv().unwrap();
+    let PersistenceAction::SaveBlocks { blocks: saved_blocks, sender, mode } = received_action
+    else {
+        panic!("received wrong action");
+    };
+    assert_eq!(mode, SaveBlocksMode::BlocksOnly);
+    assert_eq!(saved_blocks, vec![blocks[0].clone(), blocks[1].clone(), blocks[2].clone()]);
+
+    sender
+        .send(PersistenceResult {
+            last_block: Some(blocks[2].recovered_block().num_hash()),
+            commit_duration: Some(Duration::ZERO),
+        })
+        .unwrap();
+
+    test_harness.tree.try_poll_persistence().unwrap();
+    assert_eq!(test_harness.tree.persistence_state.current_action().cloned(), None);
 
     // reorg case
     let result = test_harness.tree.on_new_head(fork_block_5.recovered_block().hash()).unwrap();
@@ -815,7 +841,7 @@ async fn test_tree_state_on_new_head_reorg() {
         assert_eq!(old[0].recovered_block().hash(), blocks[2].recovered_block().hash());
     }
 
-    // The canonical block has not changed, so we will not get any active persistence action
+    // The canonical head has not changed yet, so there is no new persistence action to run.
     test_harness.tree.advance_persistence().unwrap();
     let current_action = test_harness.tree.persistence_state.current_action().cloned();
     assert_eq!(current_action, None);
@@ -827,10 +853,15 @@ async fn test_tree_state_on_new_head_reorg() {
         .tree_state
         .set_canonical_head(fork_block_5.recovered_block().num_hash());
 
-    // Even after the head changes, the benchmark prototype keeps background persistence disabled.
+    // Once the canonical head is switched to the fork, the old on-disk suffix must be removed.
     test_harness.tree.advance_persistence().unwrap();
     let current_action = test_harness.tree.persistence_state.current_action().cloned();
-    assert_eq!(current_action, None);
+    assert_eq!(
+        current_action,
+        Some(CurrentPersistenceAction::RemovingBlocks {
+            new_tip_num: blocks[1].recovered_block().number()
+        })
+    );
 }
 
 #[test]
@@ -912,8 +943,9 @@ async fn test_get_canonical_blocks_to_persist() {
     test_harness = test_harness.with_blocks(blocks.clone());
 
     let last_persisted_block_number = 3;
-    test_harness.tree.persistence_state.last_persisted_block =
-        blocks[last_persisted_block_number as usize].recovered_block.num_hash();
+    let persisted = blocks[last_persisted_block_number as usize].recovered_block.num_hash();
+    test_harness.tree.persistence_state.db_checkpoint = persisted;
+    test_harness.tree.persistence_state.db_tip = persisted;
 
     let persistence_threshold = 4;
     let memory_block_buffer_target = 3;
@@ -952,9 +984,14 @@ async fn test_get_canonical_blocks_to_persist() {
     assert!(blocks_to_persist.iter().any(|b| b.recovered_block().number == 4 &&
         b.recovered_block().hash() == blocks[4].recovered_block().hash()));
 
-    // Advancing persistence is a no-op in the benchmark prototype.
+    // Advancing persistence should schedule a `db_tip` save up to the canonical head.
     test_harness.tree.advance_persistence().expect("advancing persistence should succeed");
-    assert_eq!(test_harness.tree.persistence_state.current_action().cloned(), None);
+    assert_eq!(
+        test_harness.tree.persistence_state.current_action().cloned(),
+        Some(CurrentPersistenceAction::SavingDbTip {
+            highest: blocks.last().unwrap().recovered_block().num_hash()
+        })
+    );
 }
 
 #[tokio::test]
@@ -1412,7 +1449,7 @@ fn test_validate_block_synchronous_strategy_during_persistence() {
 
     // Set up persistence action to force `Synchronous` strategy
     use crate::tree::persistence_state::CurrentPersistenceAction;
-    let persistence_action = CurrentPersistenceAction::SavingBlocks {
+    let persistence_action = CurrentPersistenceAction::SavingDbTip {
         highest: alloy_eips::NumHash::new(1, B256::random()),
     };
     test_harness.start_persistence_operation(persistence_action);
@@ -2051,7 +2088,7 @@ mod forkchoice_updated_tests {
                 break;
             }
 
-            if let Ok(PersistenceAction::SaveBlocks(saved_blocks, sender)) =
+            if let Ok(PersistenceAction::SaveBlocks { blocks: saved_blocks, sender, .. }) =
                 action_rx.recv_timeout(std::time::Duration::from_millis(100))
             {
                 if let Some(last) = saved_blocks.last() {

@@ -102,8 +102,8 @@ where
                         self.sync_metrics_tx.send(MetricEvent::SyncHeight { height: new_tip_num });
                     let _ = sender.send(PersistenceResult { last_block, commit_duration: None });
                 }
-                PersistenceAction::SaveBlocks(blocks, sender) => {
-                    let result = self.on_save_blocks(blocks)?;
+                PersistenceAction::SaveBlocks { blocks, mode, sender } => {
+                    let result = self.on_save_blocks(blocks, mode)?;
                     let result_number = result.last_block.map(|b| b.number);
 
                     let _ = sender.send(result);
@@ -148,21 +148,23 @@ where
     fn on_save_blocks(
         &mut self,
         blocks: Vec<ExecutedBlock<N::Primitives>>,
+        mode: SaveBlocksMode,
     ) -> Result<PersistenceResult, PersistenceError> {
         let first_block = blocks.first().map(|b| b.recovered_block.num_hash());
         let last_block = blocks.last().map(|b| b.recovered_block.num_hash());
         let block_count = blocks.len();
 
-        let pending_finalized = self.pending_finalized_block.take();
-        let pending_safe = self.pending_safe_block.take();
+        let pending_finalized =
+            mode.with_state().then(|| self.pending_finalized_block.take()).flatten();
+        let pending_safe = mode.with_state().then(|| self.pending_safe_block.take()).flatten();
 
-        debug!(target: "engine::persistence", ?block_count, first=?first_block, last=?last_block, "Saving range of blocks");
+        debug!(target: "engine::persistence", ?block_count, ?mode, first=?first_block, last=?last_block, "Saving range of blocks");
 
         let start_time = Instant::now();
 
         if let Some(last) = last_block {
             let provider_rw = self.provider.database_provider_rw()?;
-            provider_rw.save_blocks(blocks, SaveBlocksMode::Full)?;
+            provider_rw.save_blocks(blocks, mode)?;
 
             if let Some(finalized) = pending_finalized {
                 provider_rw.save_finalized_block_number(finalized.min(last.number))?;
@@ -185,7 +187,7 @@ where
             //
             // The pruner reads the indices from rocksdb, filters it, and writes to indices, so it
             // must be able to read anything written by save_blocks.
-            if self.pruner.is_pruning_needed(last.number) {
+            if mode.with_state() && self.pruner.is_pruning_needed(last.number) {
                 debug!(target: "engine::persistence", block_num=?last.number, "Running pruner");
                 let prune_start = Instant::now();
                 let provider_rw = self.provider.database_provider_rw()?;
@@ -224,7 +226,14 @@ pub enum PersistenceAction<N: NodePrimitives = EthPrimitives> {
     ///
     /// First, header, transaction, and receipt-related data should be written to static files.
     /// Then the execution history-related data will be written to the database.
-    SaveBlocks(Vec<ExecutedBlock<N>>, CrossbeamSender<PersistenceResult>),
+    SaveBlocks {
+        /// Blocks to persist.
+        blocks: Vec<ExecutedBlock<N>>,
+        /// How much of each block should be written.
+        mode: SaveBlocksMode,
+        /// Channel used to return the result.
+        sender: CrossbeamSender<PersistenceResult>,
+    },
 
     /// Removes block data above the given block number from the database.
     ///
@@ -311,7 +320,17 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
         blocks: Vec<ExecutedBlock<T>>,
         tx: CrossbeamSender<PersistenceResult>,
     ) -> Result<(), SendError<PersistenceAction<T>>> {
-        self.send_action(PersistenceAction::SaveBlocks(blocks, tx))
+        self.save_blocks_with_mode(blocks, SaveBlocksMode::Full, tx)
+    }
+
+    /// Persists the given blocks with the requested save mode.
+    pub fn save_blocks_with_mode(
+        &self,
+        blocks: Vec<ExecutedBlock<T>>,
+        mode: SaveBlocksMode,
+        tx: CrossbeamSender<PersistenceResult>,
+    ) -> Result<(), SendError<PersistenceAction<T>>> {
+        self.send_action(PersistenceAction::SaveBlocks { blocks, mode, sender: tx })
     }
 
     /// Queues the finalized block number to be persisted on disk.

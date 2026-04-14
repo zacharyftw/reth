@@ -109,6 +109,7 @@ impl<N: NodePrimitives> TreeState<N> {
     /// Returns a clone of the [`LazyOverlay`] so the caller can spawn a background
     /// task to trigger computation via [`LazyOverlay::get`]. This ensures the overlay
     /// is actually computed before the next payload arrives.
+    #[allow(dead_code)]
     pub(crate) fn prepare_canonical_overlay(&mut self) -> Option<LazyOverlay> {
         let canonical_hash = self.current_canonical_head.hash;
 

@@ -30,9 +30,9 @@ use reth_primitives_traits::{
 };
 use reth_provider::{
     BlockExecutionOutput, BlockExecutionResult, BlockReader, ChangeSetReader,
-    DatabaseProviderFactory, HashedPostStateProvider, ProviderError, StageCheckpointReader,
-    StateProviderBox, StateProviderFactory, StateReader, StorageChangeSetReader,
-    StorageSettingsCache, TransactionVariant,
+    DatabaseProviderFactory, HashedPostStateProvider, ProviderError, SaveBlocksMode,
+    StageCheckpointReader, StateProviderBox, StateProviderFactory, StateReader,
+    StorageChangeSetReader, StorageSettingsCache, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages_api::ControlFlow;
@@ -68,6 +68,7 @@ pub use invalid_headers::InvalidHeaderCache;
 pub use metrics::EngineApiMetrics;
 pub use payload_processor::*;
 pub use payload_validator::{BasicEngineValidator, EngineValidator};
+use persistence_state::CurrentPersistenceAction;
 pub use persistence_state::PersistenceState;
 pub use reth_engine_primitives::TreeConfig;
 pub use reth_execution_cache::{
@@ -86,12 +87,6 @@ pub mod state;
 /// an epoch has slots), then this exceeds the threshold at which the pipeline should be used to
 /// backfill this gap.
 pub(crate) const MIN_BLOCKS_FOR_PIPELINE_RUN: u64 = EPOCH_SLOTS;
-
-/// The minimum number of blocks to retain in the changeset cache after eviction.
-///
-/// This ensures that recent trie changesets are kept in memory for potential reorgs,
-/// even when the finalized block is not set (e.g., on L2s like Optimism).
-const CHANGESET_CACHE_RETENTION_BLOCKS: u64 = 64;
 
 /// A builder for creating state providers that can be used across threads.
 #[derive(Clone, Debug)]
@@ -422,10 +417,8 @@ where
         let best_block_number = provider.best_block_number().unwrap_or(0);
         let header = provider.sealed_header(best_block_number).ok().flatten().unwrap_or_default();
 
-        let persistence_state = PersistenceState {
-            last_persisted_block: BlockNumHash::new(best_block_number, header.hash()),
-            rx: None,
-        };
+        let persistence_state =
+            PersistenceState::new(BlockNumHash::new(best_block_number, header.hash()));
 
         let (tx, outgoing) = unbounded_channel();
         let state = EngineApiTreeState::new(
@@ -478,7 +471,7 @@ where
         self.state
             .tree_state
             .canonical_block_number()
-            .saturating_sub(self.persistence_state.last_persisted_block.number)
+            .saturating_sub(self.persistence_state.db_tip.number)
     }
 
     /// Returns `true` when the main loop should stop draining the tree input channel.
@@ -556,8 +549,8 @@ where
                         }
                     }
                 }
-                LoopEvent::PersistenceComplete { result, start_time } => {
-                    if let Err(err) = self.on_persistence_complete(result, start_time) {
+                LoopEvent::PersistenceComplete { result, start_time, action } => {
+                    if let Err(err) = self.on_persistence_complete(result, start_time, action) {
                         error!(target: "engine::tree", %err, "Persistence complete handling failed");
                         return
                     }
@@ -587,9 +580,9 @@ where
     fn wait_for_persistence_event(&mut self) -> LoopEvent<T, N> {
         let maybe_persistence = self.persistence_state.rx.take();
 
-        if let Some((persistence_rx, start_time, _action)) = maybe_persistence {
+        if let Some((persistence_rx, start_time, action)) = maybe_persistence {
             match persistence_rx.recv() {
-                Ok(result) => LoopEvent::PersistenceComplete { result, start_time },
+                Ok(result) => LoopEvent::PersistenceComplete { result, start_time, action },
                 Err(_) => LoopEvent::Disconnected,
             }
         } else {
@@ -616,6 +609,7 @@ where
                         Ok(result) => LoopEvent::PersistenceComplete {
                             result,
                             start_time,
+                            action,
                         },
                         Err(_) => LoopEvent::Disconnected,
                     }
@@ -1338,8 +1332,8 @@ where
     /// Helper method to remove blocks and set the persistence state. This ensures we keep track of
     /// the current persistence action while we're removing blocks.
     fn remove_blocks(&mut self, new_tip_num: u64) {
-        debug!(target: "engine::tree", ?new_tip_num, last_persisted_block_number=?self.persistence_state.last_persisted_block.number, "Removing blocks using persistence task");
-        if new_tip_num < self.persistence_state.last_persisted_block.number {
+        debug!(target: "engine::tree", ?new_tip_num, db_tip_number=?self.persistence_state.db_tip.number, "Removing blocks using persistence task");
+        if new_tip_num < self.persistence_state.db_tip.number {
             debug!(target: "engine::tree", ?new_tip_num, "Starting remove blocks job");
             let (tx, rx) = crossbeam_channel::bounded(1);
             let _ = self.persistence.remove_blocks_above(new_tip_num, tx);
@@ -1347,8 +1341,7 @@ where
         }
     }
 
-    /// Helper method to save blocks and set the persistence state. This ensures we keep track of
-    /// the current persistence action while we're saving blocks.
+    /// Helper method to persist block structure and advance `db_tip`.
     fn persist_blocks(&mut self, blocks_to_persist: Vec<ExecutedBlock<N>>) {
         if blocks_to_persist.is_empty() {
             debug!(target: "engine::tree", "Returned empty set of blocks to persist");
@@ -1362,11 +1355,15 @@ where
             .map(|b| b.recovered_block().num_hash())
             .expect("Checked non-empty persisting blocks");
 
-        debug!(target: "engine::tree", count=blocks_to_persist.len(), blocks = ?blocks_to_persist.iter().map(|block| block.recovered_block().num_hash()).collect::<Vec<_>>(), "Persisting blocks");
+        debug!(target: "engine::tree", count=blocks_to_persist.len(), blocks = ?blocks_to_persist.iter().map(|block| block.recovered_block().num_hash()).collect::<Vec<_>>(), "Persisting blocks to db_tip");
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let _ = self.persistence.save_blocks(blocks_to_persist, tx);
+        let _ = self.persistence.save_blocks_with_mode(
+            blocks_to_persist,
+            SaveBlocksMode::BlocksOnly,
+            tx,
+        );
 
-        self.persistence_state.start_save(highest_num_hash, rx);
+        self.persistence_state.start_save_db_tip(highest_num_hash, rx);
     }
 
     /// Triggers new persistence actions if no persistence task is currently in progress.
@@ -1377,10 +1374,12 @@ where
         if !self.persistence_state.in_progress() {
             if let Some(new_tip_num) = self.find_disk_reorg()? {
                 self.remove_blocks(new_tip_num)
-            } else {
-                // Keep payload validation fully in-memory during normal operation so we can bench
-                // execution without background MDBX persistence in the critical path. Remaining
-                // blocks are still flushed during termination via `persist_until_complete`.
+            } else if self.should_persist() {
+                let blocks_to_persist = self.get_canonical_blocks_to_persist_from(
+                    self.persistence_state.db_tip,
+                    PersistTarget::Head,
+                )?;
+                self.persist_blocks(blocks_to_persist);
             }
         }
 
@@ -1408,10 +1407,13 @@ where
             if let Some((rx, start_time, action)) = self.persistence_state.rx.take() {
                 debug!(target: "engine::tree", ?action, "waiting for in-flight persistence");
                 let result = rx.recv().map_err(|_| AdvancePersistenceError::ChannelClosed)?;
-                self.on_persistence_complete(result, start_time)?;
+                self.on_persistence_complete(result, start_time, action)?;
             }
 
-            let blocks_to_persist = self.get_canonical_blocks_to_persist(PersistTarget::Head)?;
+            let blocks_to_persist = self.get_canonical_blocks_to_persist_from(
+                self.persistence_state.db_tip,
+                PersistTarget::Head,
+            )?;
 
             if blocks_to_persist.is_empty() {
                 debug!(target: "engine::tree", "persistence complete, signaling termination");
@@ -1433,7 +1435,7 @@ where
 
         match rx.try_recv() {
             Ok(result) => {
-                self.on_persistence_complete(result, start_time)?;
+                self.on_persistence_complete(result, start_time, action)?;
                 Ok(true)
             }
             Err(crossbeam_channel::TryRecvError::Empty) => {
@@ -1452,60 +1454,29 @@ where
         &mut self,
         result: PersistenceResult,
         start_time: Instant,
+        action: CurrentPersistenceAction,
     ) -> Result<(), AdvancePersistenceError> {
         self.metrics.engine.persistence_duration.record(start_time.elapsed());
 
-        let commit_duration = result.commit_duration;
-        let Some(BlockNumHash {
-            hash: last_persisted_block_hash,
-            number: last_persisted_block_number,
-        }) = result.last_block
+        let Some(BlockNumHash { hash: persisted_hash, number: persisted_number }) =
+            result.last_block
         else {
             // if this happened, then we persisted no blocks because we sent an empty vec of blocks
             warn!(target: "engine::tree", "Persistence task completed but did not persist any blocks");
             return Ok(())
         };
 
-        debug!(target: "engine::tree", ?last_persisted_block_hash, ?last_persisted_block_number, elapsed=?start_time.elapsed(), "Finished persisting, calling finish");
-        self.persistence_state.finish(last_persisted_block_hash, last_persisted_block_number);
+        debug!(target: "engine::tree", ?action, ?persisted_hash, ?persisted_number, elapsed=?start_time.elapsed(), "Finished persistence action");
 
-        // Evict trie changesets for blocks below the eviction threshold.
-        // Keep at least CHANGESET_CACHE_RETENTION_BLOCKS from the persisted tip, and also respect
-        // the finalized block if set.
-        let min_threshold =
-            last_persisted_block_number.saturating_sub(CHANGESET_CACHE_RETENTION_BLOCKS);
-        let eviction_threshold =
-            if let Some(finalized) = self.canonical_in_memory_state.get_finalized_num_hash() {
-                // Use the minimum of finalized block and retention threshold to be conservative
-                finalized.number.min(min_threshold)
-            } else {
-                // When finalized is not set (e.g., on L2s), use the retention threshold
-                min_threshold
-            };
-        debug!(
-            target: "engine::tree",
-            last_persisted = last_persisted_block_number,
-            finalized_number = ?self.canonical_in_memory_state.get_finalized_num_hash().map(|f| f.number),
-            eviction_threshold,
-            "Evicting changesets below threshold"
-        );
-        self.changeset_cache.evict(eviction_threshold);
-
-        // Invalidate cached overlay since the anchor has changed
-        self.state.tree_state.invalidate_cached_overlay();
-
-        self.on_new_persisted_block()?;
-
-        // Re-prepare overlay for the current canonical head with the new anchor.
-        // Spawn a background task to trigger computation so it's ready when the next payload
-        // arrives.
-        if let Some(overlay) = self.state.tree_state.prepare_canonical_overlay() {
-            self.runtime.spawn_blocking_named("prepare-overlay", move || {
-                let _ = overlay.get();
-            });
+        match action {
+            CurrentPersistenceAction::SavingDbTip { .. } => {
+                self.persistence_state.finish_db_tip(persisted_hash, persisted_number);
+            }
+            CurrentPersistenceAction::RemovingBlocks { .. } => {
+                self.persistence_state.finish_remove(persisted_hash, persisted_number);
+                self.state.tree_state.invalidate_cached_overlay();
+            }
         }
-
-        self.purge_timing_stats(last_persisted_block_number, commit_duration);
 
         Ok(())
     }
@@ -1656,7 +1627,7 @@ where
 
                                 let explicit_persistence_wait = if wait_for_persistence {
                                     let pending_persistence = self.persistence_state.rx.take();
-                                    if let Some((rx, start_time, _action)) = pending_persistence {
+                                    if let Some((rx, start_time, action)) = pending_persistence {
                                         let (persistence_tx, persistence_rx) =
                                             std::sync::mpsc::channel();
                                         self.runtime.spawn_blocking_named(
@@ -1669,14 +1640,17 @@ where
                                                 let _ = persistence_tx.send((
                                                     result,
                                                     start_time,
+                                                    action,
                                                     start.elapsed(),
                                                 ));
                                             },
                                         );
-                                        let (result, start_time, wait_duration) = persistence_rx
-                                            .recv()
-                                            .expect("persistence result channel closed");
-                                        let _ = self.on_persistence_complete(result, start_time);
+                                        let (result, start_time, action, wait_duration) =
+                                            persistence_rx
+                                                .recv()
+                                                .expect("persistence result channel closed");
+                                        let _ = self
+                                            .on_persistence_complete(result, start_time, action);
                                         wait_duration
                                     } else {
                                         Duration::ZERO
@@ -1794,7 +1768,7 @@ where
         } else {
             self.state.tree_state.remove_until(
                 backfill_num_hash,
-                self.persistence_state.last_persisted_block.hash,
+                self.persistence_state.db_checkpoint.hash,
                 Some(backfill_num_hash),
             );
         }
@@ -1813,7 +1787,7 @@ where
             // update the tracked chain height, after backfill sync both the canonical height and
             // persisted height are the same
             self.state.tree_state.set_canonical_head(new_head.num_hash());
-            self.persistence_state.finish(new_head.hash(), new_head.number());
+            self.persistence_state.finish_full(new_head.hash(), new_head.number());
 
             // update the tracked canonical head
             self.canonical_in_memory_state.set_canonical_head(new_head);
@@ -2012,15 +1986,16 @@ where
             return false
         }
 
-        let min_block = self.persistence_state.last_persisted_block.number;
+        let min_block = self.persistence_state.db_tip.number;
         self.state.tree_state.canonical_block_number().saturating_sub(min_block) >
             self.config.persistence_threshold()
     }
 
     /// Returns a batch of consecutive canonical blocks to persist in the range
     /// `(last_persisted_number .. target]`. The expected order is oldest -> newest.
-    fn get_canonical_blocks_to_persist(
+    fn get_canonical_blocks_to_persist_from(
         &self,
+        persisted: BlockNumHash,
         target: PersistTarget,
     ) -> Result<Vec<ExecutedBlock<N>>, AdvancePersistenceError> {
         // We will calculate the state root using the database, so we need to be sure there are no
@@ -2029,7 +2004,7 @@ where
 
         let mut blocks_to_persist = Vec::new();
         let mut current_hash = self.state.tree_state.canonical_block_hash();
-        let last_persisted_number = self.persistence_state.last_persisted_block.number;
+        let last_persisted_number = persisted.number;
         let canonical_head_number = self.state.tree_state.canonical_block_number();
 
         let target_number = match target {
@@ -2065,6 +2040,15 @@ where
         Ok(blocks_to_persist)
     }
 
+    /// Returns a batch of consecutive canonical blocks that would advance `db_checkpoint`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn get_canonical_blocks_to_persist(
+        &self,
+        target: PersistTarget,
+    ) -> Result<Vec<ExecutedBlock<N>>, AdvancePersistenceError> {
+        self.get_canonical_blocks_to_persist_from(self.persistence_state.db_checkpoint, target)
+    }
+
     /// This clears the blocks from the in-memory tree state that have been persisted to the
     /// database.
     ///
@@ -2072,6 +2056,7 @@ where
     /// height.
     ///
     /// Assumes that `finish` has been called on the `persistence_state` at least once
+    #[allow(dead_code)]
     fn on_new_persisted_block(&mut self) -> ProviderResult<()> {
         // If we have an on-disk reorg, we need to handle it first before touching the in-memory
         // state.
@@ -2081,10 +2066,10 @@ where
         }
 
         let finalized = self.state.forkchoice_state_tracker.last_valid_finalized();
-        self.remove_before(self.persistence_state.last_persisted_block, finalized)?;
+        self.remove_before(self.persistence_state.db_checkpoint, finalized)?;
         self.canonical_in_memory_state.remove_persisted_blocks(BlockNumHash {
-            number: self.persistence_state.last_persisted_block.number,
-            hash: self.persistence_state.last_persisted_block.hash,
+            number: self.persistence_state.db_checkpoint.number,
+            hash: self.persistence_state.db_checkpoint.hash,
         });
         Ok(())
     }
@@ -2553,7 +2538,7 @@ where
     /// happen if a reorg is happening while we are persisting a block.
     fn find_disk_reorg(&self) -> ProviderResult<Option<u64>> {
         let mut canonical = self.state.tree_state.current_canonical_head;
-        let mut persisted = self.persistence_state.last_persisted_block;
+        let mut persisted = self.persistence_state.db_tip;
 
         let parent_num_hash = |num_hash: NumHash| -> ProviderResult<NumHash> {
             Ok(self
@@ -2884,7 +2869,7 @@ where
 
         // Only query DB if block could be persisted (number <= last persisted block).
         // New blocks from CL always have number > last persisted, so skip DB lookup for them.
-        if block_num_hash.number <= self.persistence_state.last_persisted_block.number {
+        if block_num_hash.number <= self.persistence_state.db_tip.number {
             match self.provider.sealed_header_by_hash(block_num_hash.hash) {
                 Err(err) => {
                     let block = convert_to_block(self, input)?;
@@ -3230,6 +3215,7 @@ where
     /// those which have a fork point at or below the finalized hash.
     ///
     /// Canonical blocks below the upper bound will still be removed.
+    #[allow(dead_code)]
     pub(crate) fn remove_before(
         &mut self,
         upper_bound: BlockNumHash,
@@ -3245,7 +3231,7 @@ where
 
         self.state.tree_state.remove_until(
             upper_bound,
-            self.persistence_state.last_persisted_block.hash,
+            self.persistence_state.db_checkpoint.hash,
             num,
         );
         Ok(())
@@ -3300,6 +3286,8 @@ where
         result: PersistenceResult,
         /// When the persistence operation started.
         start_time: Instant,
+        /// Which persistence action completed.
+        action: CurrentPersistenceAction,
     },
     /// A channel was disconnected.
     Disconnected,
