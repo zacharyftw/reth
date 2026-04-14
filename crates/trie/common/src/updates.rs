@@ -594,6 +594,11 @@ impl TrieUpdatesSorted {
         &self.storage_tries
     }
 
+    /// Removes storage tries for the given hashed addresses.
+    pub fn retain_storage_tries(&mut self, f: impl Fn(&B256) -> bool) {
+        self.storage_tries.retain(|addr, _| f(addr));
+    }
+
     /// Returns the total number of updates including account nodes and all storage updates.
     pub fn total_len(&self) -> usize {
         self.account_nodes.len() +
