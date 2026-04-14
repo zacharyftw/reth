@@ -1995,7 +1995,6 @@ const MAX_INCOMING_PACKETS_PER_MINUTE_BY_IP: usize = 60usize;
 pub(crate) async fn receive_loop(udp: Arc<UdpSocket>, tx: IngressSender, local_id: PeerId) {
     let handler = IngressHandler::new(tx.clone(), local_id);
     let mut buf = [0; MAX_PACKET_SIZE];
-
     loop {
         let res = udp.recv_from(&mut buf).await;
         match res {
@@ -2053,6 +2052,7 @@ impl IngressHandler {
             *last_tick = Instant::now();
         }
 
+        // rate limit incoming packets by IP
         if cache.inc_ip(src.ip()) > MAX_INCOMING_PACKETS_PER_MINUTE_BY_IP {
             trace!(target: "discv4", ?src, "Too many incoming packets from IP.");
             return Box::pin(async {})
