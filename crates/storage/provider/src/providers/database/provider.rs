@@ -642,6 +642,15 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
 
             // MDBX writes
             let mdbx_start = Instant::now();
+            let mut tx_senders_cursor =
+                (self.prune_modes.sender_recovery.is_none_or(|m| !m.is_full()) &&
+                    EitherWriterDestination::senders(self).is_database())
+                .then(|| self.tx.cursor_write::<tables::TransactionSenders>())
+                .transpose()?;
+            let mut block_body_indices_cursor =
+                self.tx.cursor_write::<tables::BlockBodyIndices>()?;
+            let mut transaction_blocks_cursor =
+                self.tx.cursor_write::<tables::TransactionBlocks>()?;
 
             // Collect all transaction hashes across all blocks, sort them, and write in batch
             if !self.cached_storage_settings().storage_v2 &&
@@ -681,7 +690,13 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 let recovered_block = block.recovered_block();
 
                 let start = Instant::now();
-                self.insert_block_mdbx_only(recovered_block, tx_nums[i])?;
+                self.insert_block_mdbx_only(
+                    recovered_block,
+                    tx_nums[i],
+                    tx_senders_cursor.as_mut(),
+                    &mut block_body_indices_cursor,
+                    &mut transaction_blocks_cursor,
+                )?;
                 timings.insert_block += start.elapsed();
 
                 if save_mode.with_state() {
@@ -773,15 +788,15 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         &self,
         block: &RecoveredBlock<BlockTy<N>>,
         first_tx_num: TxNumber,
+        mut tx_senders_cursor: Option<&mut impl DbCursorRW<tables::TransactionSenders>>,
+        block_body_indices_cursor: &mut impl DbCursorRW<tables::BlockBodyIndices>,
+        transaction_blocks_cursor: &mut impl DbCursorRW<tables::TransactionBlocks>,
     ) -> ProviderResult<StoredBlockBodyIndices> {
-        if self.prune_modes.sender_recovery.is_none_or(|m| !m.is_full()) &&
-            EitherWriterDestination::senders(self).is_database()
-        {
+        if let Some(cursor) = tx_senders_cursor.as_mut() {
             let start = Instant::now();
             let tx_nums_iter = std::iter::successors(Some(first_tx_num), |n| Some(n + 1));
-            let mut cursor = self.tx.cursor_write::<tables::TransactionSenders>()?;
             for (tx_num, sender) in tx_nums_iter.zip(block.senders_iter().copied()) {
-                cursor.append(tx_num, &sender)?;
+                (*cursor).append(tx_num, &sender)?;
             }
             self.metrics
                 .record_duration(metrics::Action::InsertTransactionSenders, start.elapsed());
@@ -794,7 +809,14 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         self.tx.put::<tables::HeaderNumbers>(block.hash(), block_number)?;
         self.metrics.record_duration(metrics::Action::InsertHeaderNumbers, start.elapsed());
 
-        self.write_block_body_indices(block_number, block.body(), first_tx_num, tx_count)?;
+        self.write_block_body_indices(
+            block_number,
+            block.body(),
+            first_tx_num,
+            tx_count,
+            block_body_indices_cursor,
+            transaction_blocks_cursor,
+        )?;
 
         Ok(StoredBlockBodyIndices { first_tx_num, tx_count })
     }
@@ -807,20 +829,19 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         body: &BodyTy<N>,
         first_tx_num: TxNumber,
         tx_count: u64,
+        block_body_indices_cursor: &mut impl DbCursorRW<tables::BlockBodyIndices>,
+        transaction_blocks_cursor: &mut impl DbCursorRW<tables::TransactionBlocks>,
     ) -> ProviderResult<()> {
         // MDBX: BlockBodyIndices
         let start = Instant::now();
-        self.tx
-            .cursor_write::<tables::BlockBodyIndices>()?
+        block_body_indices_cursor
             .append(block_number, &StoredBlockBodyIndices { first_tx_num, tx_count })?;
         self.metrics.record_duration(metrics::Action::InsertBlockBodyIndices, start.elapsed());
 
         // MDBX: TransactionBlocks (last tx -> block mapping)
         if tx_count > 0 {
             let start = Instant::now();
-            self.tx
-                .cursor_write::<tables::TransactionBlocks>()?
-                .append(first_tx_num + tx_count - 1, &block_number)?;
+            transaction_blocks_cursor.append(first_tx_num + tx_count - 1, &block_number)?;
             self.metrics.record_duration(metrics::Action::InsertTransactionBlocks, start.elapsed());
         }
 
