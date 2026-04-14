@@ -771,7 +771,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 let merged_trie = if !dirty_addresses.is_empty() {
                     let mut t =
                         Arc::try_unwrap(merged_trie).unwrap_or_else(|arc| (*arc).clone());
-                    t.retain_storage_tries(|addr| !dirty_addresses.contains(addr));
+                    t.filter_dirty_addresses(&dirty_addresses);
                     Arc::new(t)
                 } else {
                     merged_trie

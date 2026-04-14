@@ -594,9 +594,28 @@ impl TrieUpdatesSorted {
         &self.storage_tries
     }
 
-    /// Removes storage tries for the given hashed addresses.
-    pub fn retain_storage_tries(&mut self, f: impl Fn(&B256) -> bool) {
-        self.storage_tries.retain(|addr, _| f(addr));
+    /// Removes account trie nodes whose path is a prefix of any dirty address nibbles,
+    /// and removes storage tries for dirty addresses.
+    ///
+    /// Account trie nodes at path P cover all accounts whose hashed-address nibbles
+    /// start with P. If a dirty address exists under P, the node will be recomputed
+    /// when the in-memory blocks are persisted, so writing it now is redundant.
+    pub fn filter_dirty_addresses(&mut self, dirty_addresses: &B256Set) {
+        if dirty_addresses.is_empty() {
+            return;
+        }
+
+        // Precompute dirty nibbles once
+        let dirty_nibbles: Vec<Nibbles> =
+            dirty_addresses.iter().map(|addr| Nibbles::unpack(addr)).collect();
+
+        // Remove account trie nodes where the path is a prefix of any dirty address
+        self.account_nodes.retain(|(path, _)| {
+            !dirty_nibbles.iter().any(|dirty| dirty.starts_with(path))
+        });
+
+        // Remove storage tries for dirty addresses
+        self.storage_tries.retain(|addr, _| !dirty_addresses.contains(addr));
     }
 
     /// Returns the total number of updates including account nodes and all storage updates.
