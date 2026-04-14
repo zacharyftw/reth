@@ -228,6 +228,13 @@ where
             .map(|value| (A::account_key_to_nibbles(&value.0), value.1)))
     }
 
+    fn seek_exact_node(
+        &mut self,
+        key: Nibbles,
+    ) -> Result<Option<BranchNodeCompact>, DatabaseError> {
+        Ok(self.0.seek_exact(A::AccountKey::from(key))?.map(|(_, node)| node))
+    }
+
     fn seek(
         &mut self,
         key: Nibbles,
@@ -330,6 +337,18 @@ where
                 let (subkey, node) = value.into_parts();
                 (A::subkey_to_nibbles(&subkey), node)
             }))
+    }
+
+    fn seek_exact_node(
+        &mut self,
+        key: Nibbles,
+    ) -> Result<Option<BranchNodeCompact>, DatabaseError> {
+        let subkey = A::StorageSubKey::from(key);
+        Ok(self
+            .cursor
+            .seek_by_key_subkey(self.hashed_address, subkey.clone())?
+            .filter(|e| *e.nibbles() == subkey)
+            .map(|value| value.into_parts().1))
     }
 
     fn seek(
