@@ -250,9 +250,14 @@ where
             + Sync
             + 'static,
     {
+        let executed_tx_index = Arc::new(AtomicUsize::new(0));
+
         // start preparing transactions immediately
-        let (prewarm_rx, execution_rx) =
-            self.spawn_tx_iterator(transactions, env.transaction_count);
+        let (prewarm_rx, execution_rx) = self.spawn_tx_iterator(
+            transactions,
+            env.transaction_count,
+            Arc::clone(&executed_tx_index),
+        );
 
         let span = Span::current();
 
@@ -270,6 +275,7 @@ where
             provider_builder,
             Some(state_root_handle.updates_tx().clone()),
             bal,
+            executed_tx_index,
         );
 
         PayloadHandle {
@@ -295,9 +301,20 @@ where
     where
         P: BlockReader + StateProviderFactory + StateReader + Clone + 'static,
     {
-        let (prewarm_rx, execution_rx) =
-            self.spawn_tx_iterator(transactions, env.transaction_count);
-        let prewarm_handle = self.spawn_caching_with(env, prewarm_rx, provider_builder, None, bal);
+        let executed_tx_index = Arc::new(AtomicUsize::new(0));
+        let (prewarm_rx, execution_rx) = self.spawn_tx_iterator(
+            transactions,
+            env.transaction_count,
+            Arc::clone(&executed_tx_index),
+        );
+        let prewarm_handle = self.spawn_caching_with(
+            env,
+            prewarm_rx,
+            provider_builder,
+            None,
+            bal,
+            executed_tx_index,
+        );
         PayloadHandle {
             state_root_handle: None,
             install_state_hook: false,
@@ -387,6 +404,7 @@ where
         &self,
         transactions: I,
         transaction_count: usize,
+        executed_tx_index: Arc<AtomicUsize>,
     ) -> (
         mpsc::Receiver<(usize, WithTxEnv<TxEnvFor<Evm>, I::Recovered>)>,
         mpsc::Receiver<Result<WithTxEnv<TxEnvFor<Evm>, I::Recovered>, I::Error>>,
@@ -406,7 +424,13 @@ where
             );
             self.executor.spawn_blocking_named("tx-iterator", move || {
                 let (transactions, convert) = transactions.into_parts();
-                convert_serial(transactions.into_iter(), &convert, &prewarm_tx, &execute_tx);
+                convert_serial(
+                    transactions.into_iter(),
+                    &convert,
+                    &prewarm_tx,
+                    &execute_tx,
+                    &executed_tx_index,
+                );
             });
         } else {
             // Parallel path — recover signatures in parallel on rayon, stream results
@@ -424,7 +448,13 @@ where
 
                 // Convert the first few transactions sequentially so execution can
                 // start immediately without waiting for rayon work-stealing.
-                convert_serial(all.into_iter(), &convert, &prewarm_tx, &execute_tx);
+                convert_serial(
+                    all.into_iter(),
+                    &convert,
+                    &prewarm_tx,
+                    &execute_tx,
+                    &executed_tx_index,
+                );
 
                 // Convert the remaining transactions in parallel.
                 rest.into_par_iter()
@@ -438,7 +468,12 @@ where
                         let tx = tx.map(|tx| {
                             let (tx_env, tx) = tx.into_parts();
                             let tx = WithTxEnv { tx_env, tx: Arc::new(tx) };
-                            let _ = prewarm_tx.send((idx, tx.clone()));
+                            send_to_prewarm_if_fresh(
+                                idx,
+                                &tx,
+                                &prewarm_tx,
+                                &executed_tx_index,
+                            );
                             tx
                         });
                         let _ = execute_tx.send(tx);
@@ -464,6 +499,7 @@ where
         provider_builder: StateProviderBuilder<N, P>,
         to_sparse_trie_task: Option<CrossbeamSender<StateRootMessage>>,
         bal: Option<Arc<BlockAccessList>>,
+        executed_tx_index: Arc<AtomicUsize>,
     ) -> CacheTaskHandle<N::Receipt>
     where
         P: BlockReader + StateProviderFactory + StateReader + Clone + 'static,
@@ -472,8 +508,6 @@ where
             self.disable_transaction_prewarming || env.transaction_count < SMALL_BLOCK_TX_THRESHOLD;
 
         let saved_cache = self.disable_state_cache.not().then(|| self.cache_for(env.parent_hash));
-
-        let executed_tx_index = Arc::new(AtomicUsize::new(0));
 
         // configure prewarming
         let prewarm_ctx = PrewarmContext {
@@ -720,6 +754,7 @@ fn convert_serial<RawTx, Tx, TxEnv, InnerTx, Recovered, Err, C>(
     convert: &C,
     prewarm_tx: &mpsc::SyncSender<(usize, WithTxEnv<TxEnv, Recovered>)>,
     execute_tx: &mpsc::SyncSender<Result<WithTxEnv<TxEnv, Recovered>, Err>>,
+    executed_tx_index: &AtomicUsize,
 ) where
     Tx: ExecutableTxParts<TxEnv, InnerTx, Recovered = Recovered>,
     TxEnv: Clone,
@@ -732,10 +767,23 @@ fn convert_serial<RawTx, Tx, TxEnv, InnerTx, Recovered, Err, C>(
             WithTxEnv { tx_env, tx: Arc::new(tx) }
         });
         if let Ok(tx) = &tx {
-            let _ = prewarm_tx.send((idx, tx.clone()));
+            send_to_prewarm_if_fresh(idx, tx, prewarm_tx, executed_tx_index);
         }
         let _ = execute_tx.send(tx);
         trace!(target: "engine::tree::payload_processor", idx, "yielded transaction");
+    }
+}
+
+fn send_to_prewarm_if_fresh<TxEnv, Recovered>(
+    idx: usize,
+    tx: &WithTxEnv<TxEnv, Recovered>,
+    prewarm_tx: &mpsc::SyncSender<(usize, WithTxEnv<TxEnv, Recovered>)>,
+    executed_tx_index: &AtomicUsize,
+) where
+    TxEnv: Clone,
+{
+    if idx >= executed_tx_index.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = prewarm_tx.send((idx, tx.clone()));
     }
 }
 
