@@ -1988,6 +1988,29 @@ pub(crate) async fn send_loop(udp: Arc<UdpSocket>, rx: EgressReceiver) {
 /// Rate limits the number of incoming packets from individual IPs to 1 packet/second
 const MAX_INCOMING_PACKETS_PER_MINUTE_BY_IP: usize = 60usize;
 
+/// Continuously awaits new incoming messages and sends them back through the channel.
+///
+/// The receive loop enforces primitive rate limiting for IPs to prevent message spams from
+/// individual IPs.
+pub(crate) async fn receive_loop(udp: Arc<UdpSocket>, tx: IngressSender, local_id: PeerId) {
+    let handler = IngressHandler::new(tx.clone(), local_id);
+    let mut buf = [0; MAX_PACKET_SIZE];
+
+    loop {
+        match udp.recv_from(&mut buf).await {
+            Err(err) => {
+                debug!(target: "discv4", %err, "Failed to read datagram.");
+                let _ = tx.send(IngressEvent::RecvError(err)).await.map_err(|err| {
+                    debug!(target: "discv4", %err, "failed send incoming packet");
+                });
+            }
+            Ok((read, remote_addr)) => {
+                handler.handle_packet(&buf[..read], remote_addr).await;
+            }
+        }
+    }
+}
+
 /// Handles decoding, rate-limiting, and deduplication of incoming discv4 packets.
 ///
 /// Used by both the standalone [`receive_loop`] and the shared-port [`IngressCallback`]
@@ -2067,29 +2090,6 @@ impl discv5::OnDecodeFailure for IngressHandler {
         src: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         self.handle_packet(data, src)
-    }
-}
-
-/// Continuously awaits new incoming messages and sends them back through the channel.
-///
-/// The receive loop enforces primitive rate limiting for IPs to prevent message spams from
-/// individual IPs.
-pub(crate) async fn receive_loop(udp: Arc<UdpSocket>, tx: IngressSender, local_id: PeerId) {
-    let handler = IngressHandler::new(tx.clone(), local_id);
-    let mut buf = [0; MAX_PACKET_SIZE];
-
-    loop {
-        match udp.recv_from(&mut buf).await {
-            Err(err) => {
-                debug!(target: "discv4", %err, "Failed to read datagram.");
-                let _ = tx.send(IngressEvent::RecvError(err)).await.map_err(|err| {
-                    debug!(target: "discv4", %err, "failed send incoming packet");
-                });
-            }
-            Ok((read, remote_addr)) => {
-                handler.handle_packet(&buf[..read], remote_addr).await;
-            }
-        }
     }
 }
 
