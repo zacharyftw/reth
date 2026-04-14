@@ -274,9 +274,8 @@ impl RocksDBBuilder {
         cf_options.set_level_compaction_dynamic_level_bytes(true);
         cf_options.set_compression_type(DBCompressionType::None);
         cf_options.set_bottommost_compression_type(DBCompressionType::None);
-        // Small write buffer: trie CFs receive small incremental writes per block,
-        // so 128MB is wasteful. 16MB frees memory for the block cache.
-        cf_options.set_write_buffer_size(16 << 20);
+        cf_options.set_write_buffer_size(256 << 20);
+        cf_options.set_max_write_buffer_number(3);
 
         cf_options
     }
@@ -304,8 +303,8 @@ impl RocksDBBuilder {
         cf_options.set_level_compaction_dynamic_level_bytes(true);
         cf_options.set_compression_type(DBCompressionType::None);
         cf_options.set_bottommost_compression_type(DBCompressionType::None);
-        // Small write buffer: trie CFs receive small incremental writes per block.
-        cf_options.set_write_buffer_size(16 << 20);
+        cf_options.set_write_buffer_size(256 << 20);
+        cf_options.set_max_write_buffer_number(3);
         // Fixed 32-byte prefix extractor: compound keys are `B256 || subkey`.
         // Enables prefix-bounded iteration so RocksDB can prune internal
         // seek work when iterate_upper_bound constrains the prefix range.
