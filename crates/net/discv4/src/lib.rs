@@ -2018,6 +2018,14 @@ impl IngressHandler {
         data: &[u8],
         src: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let send = |event: IngressEvent| {
+            Box::pin(async {
+                let _ = self.tx.send(event).await.map_err(|err| {
+                    debug!(target: "discv4", %err, "failed send incoming packet");
+                });
+            })
+        };
+
         let (cache, last_tick) = &mut *self.state.lock();
 
         if last_tick.elapsed() >= self.tick_interval {
@@ -2029,14 +2037,6 @@ impl IngressHandler {
             trace!(target: "discv4", ?src, "Too many incoming packets from IP.");
             return Box::pin(async {})
         }
-
-        let send = |event: IngressEvent| {
-            Box::pin(async {
-                let _ = self.tx.send(event).await.map_err(|err| {
-                    debug!(target: "discv4", %err, "failed send incoming packet");
-                });
-            })
-        };
 
         match Message::decode(data) {
             Ok(packet) => {
