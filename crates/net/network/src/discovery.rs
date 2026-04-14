@@ -566,7 +566,7 @@ mod tests {
         let discv4_config = Discv4ConfigBuilder::default().external_ip_resolver(None).build();
 
         let discv5_listen_config = discv5::ListenConfig::from(disc_addr);
-        let discv5_config = reth_discv5::Config::builder(disc_addr)
+        let discv5_config = reth_discv5::Config::builder(tcp_addr)
             .discv5_config(discv5::ConfigBuilder::new(discv5_listen_config).build())
             .build();
 
@@ -593,6 +593,66 @@ mod tests {
         // Both protocols should be active
         assert!(node.discv4.is_some(), "discv4 should be running");
         assert!(node.discv5.is_some(), "discv5 should be running");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_shared_port_discv5_discovery() {
+        reth_tracing::init_test_tracing();
+
+        let mut node_1 = start_shared_port_node(0).await;
+        let mut node_2 = start_shared_port_node(0).await;
+
+        let discv5_enr_1 = node_1.discv5.as_ref().unwrap().with_discv5(|discv5| discv5.local_enr());
+        let discv5_enr_2 = node_2.discv5.as_ref().unwrap().with_discv5(|discv5| discv5.local_enr());
+
+        let peer_id_1 = enr_to_discv4_id(&discv5_enr_1).unwrap();
+        let peer_id_2 = enr_to_discv4_id(&discv5_enr_2).unwrap();
+
+        // Add node_2's ENR to node_1's discv5 kbuckets and trigger a ping to establish a session.
+        // send_ping awaits the PONG, so the handshake completes before we poll the Discovery
+        // stream. The discv5 service runs its own background task.
+        node_1.add_discv5_node(EnrCombinedKeyWrapper(discv5_enr_2.clone()).into()).unwrap();
+        node_1
+            .discv5
+            .as_ref()
+            .unwrap()
+            .with_discv5(|discv5| discv5.send_ping(discv5_enr_2))
+            .await
+            .unwrap();
+
+        // Both SessionEstablished events should now be buffered in the update channels.
+        // Drive both nodes concurrently to collect them.
+        let mut event_1 = None;
+        let mut event_2 = None;
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(5));
+        tokio::pin!(timeout);
+        loop {
+            tokio::select! {
+                ev = node_1.next(), if event_1.is_none() => {
+                    event_1 = ev;
+                }
+                ev = node_2.next(), if event_2.is_none() => {
+                    event_2 = ev;
+                }
+                _ = &mut timeout => {
+                    panic!("timed out waiting for discv5 discovery events");
+                }
+            }
+            if event_1.is_some() && event_2.is_some() {
+                break;
+            }
+        }
+
+        assert!(matches!(
+            event_1.unwrap(),
+            DiscoveryEvent::NewNode(DiscoveredEvent::EventQueued { peer_id, .. })
+                if peer_id == peer_id_2
+        ));
+        assert!(matches!(
+            event_2.unwrap(),
+            DiscoveryEvent::NewNode(DiscoveredEvent::EventQueued { peer_id, .. })
+                if peer_id == peer_id_1
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
