@@ -552,7 +552,10 @@ async fn test_tree_persists_blocks_to_db_tip_in_background() {
         panic!("unexpected action received {received_action:?}");
     };
     assert_eq!(mode, SaveBlocksMode::BlocksAndCheckpoint);
-    assert_eq!(saved_blocks, blocks);
+    // With memory_block_buffer_target, only blocks up to head - buffer_target are persisted
+    let buffer = tree_config.memory_block_buffer_target() as usize;
+    let expected = &blocks[..blocks.len().saturating_sub(buffer)];
+    assert_eq!(saved_blocks, expected);
 }
 
 #[tokio::test]
@@ -799,13 +802,14 @@ async fn test_tree_state_on_new_head_reorg() {
     let current_action = test_harness.tree.persistence_state.current_action();
     assert_eq!(current_action, None);
 
-    // Advancing persistence should persist the current canonical chain to `db_tip`.
+    // Advancing persistence should persist canonical blocks up to head - buffer_target.
+    // canonical head = block 3, buffer_target = 1, so persist up to block 2.
     test_harness.tree.advance_persistence().unwrap();
     let current_action = test_harness.tree.persistence_state.current_action().cloned();
     assert_eq!(
         current_action,
         Some(CurrentPersistenceAction::SavingDbTip {
-            highest: blocks[2].recovered_block().num_hash()
+            highest: blocks[1].recovered_block().num_hash()
         })
     );
 
@@ -815,7 +819,7 @@ async fn test_tree_state_on_new_head_reorg() {
         panic!("received wrong action");
     };
     assert_eq!(mode, SaveBlocksMode::BlocksAndCheckpoint);
-    assert_eq!(saved_blocks, vec![blocks[0].clone(), blocks[1].clone(), blocks[2].clone()]);
+    assert_eq!(saved_blocks, vec![blocks[0].clone(), blocks[1].clone()]);
 
     // reorg case
     let result = test_harness.tree.on_new_head(fork_block_5.recovered_block().hash()).unwrap();
@@ -831,7 +835,7 @@ async fn test_tree_state_on_new_head_reorg() {
         assert_eq!(old[0].recovered_block().hash(), blocks[2].recovered_block().hash());
     }
 
-    for block in &blocks[..=2] {
+    for block in &blocks[..=1] {
         test_harness.provider.add_block(
             block.recovered_block().hash(),
             Arc::unwrap_or_clone(block.recovered_block.clone()).into_block(),
@@ -840,17 +844,17 @@ async fn test_tree_state_on_new_head_reorg() {
 
     sender
         .send(PersistenceResult {
-            last_block: Some(blocks[2].recovered_block().num_hash()),
+            last_block: Some(blocks[1].recovered_block().num_hash()),
             commit_duration: Some(Duration::ZERO),
         })
         .unwrap();
 
     test_harness.tree.try_poll_persistence().unwrap();
     assert_eq!(test_harness.tree.persistence_state.current_action().cloned(), None);
-    assert_eq!(test_harness.tree.persistence_state.db_tip, blocks[2].recovered_block().num_hash());
+    assert_eq!(test_harness.tree.persistence_state.db_tip, blocks[1].recovered_block().num_hash());
     assert_eq!(
         test_harness.tree.persistence_state.db_checkpoint,
-        blocks[2].recovered_block().num_hash()
+        blocks[1].recovered_block().num_hash()
     );
 
     // The canonical head has not changed yet, so there is no new persistence action to run.
@@ -865,14 +869,14 @@ async fn test_tree_state_on_new_head_reorg() {
         .tree_state
         .set_canonical_head(fork_block_5.recovered_block().num_hash());
 
-    // Once the canonical head is switched to the fork, the old on-disk suffix must be removed.
+    // With the buffer target, we only persisted up to block 2 (blocks[1]).
+    // Since the fork starts from block 2 (which is on disk), no on-disk reorg is needed.
+    // Instead, the tree persists fork blocks 3-4 (up to head 5 minus buffer 1 = 4).
     test_harness.tree.advance_persistence().unwrap();
     let current_action = test_harness.tree.persistence_state.current_action().cloned();
-    assert_eq!(
-        current_action,
-        Some(CurrentPersistenceAction::RemovingBlocks {
-            new_tip_num: blocks[1].recovered_block().number()
-        })
+    assert!(
+        matches!(current_action, Some(CurrentPersistenceAction::SavingDbTip { .. })),
+        "expected SavingDbTip since fork point is on disk, got {current_action:?}"
     );
 }
 

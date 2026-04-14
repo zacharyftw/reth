@@ -1377,7 +1377,7 @@ where
             } else if self.should_persist() {
                 let blocks_to_persist = self.get_canonical_blocks_to_persist_from(
                     self.persistence_state.db_tip,
-                    PersistTarget::Head,
+                    PersistTarget::Threshold,
                 )?;
                 self.persist_blocks(blocks_to_persist);
             }
