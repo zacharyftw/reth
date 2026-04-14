@@ -1377,10 +1377,10 @@ where
         if !self.persistence_state.in_progress() {
             if let Some(new_tip_num) = self.find_disk_reorg()? {
                 self.remove_blocks(new_tip_num)
-            } else if self.should_persist() {
-                let blocks_to_persist =
-                    self.get_canonical_blocks_to_persist(PersistTarget::Threshold)?;
-                self.persist_blocks(blocks_to_persist);
+            } else {
+                // Keep payload validation fully in-memory during normal operation so we can bench
+                // execution without background MDBX persistence in the critical path. Remaining
+                // blocks are still flushed during termination via `persist_until_complete`.
             }
         }
 
@@ -3336,6 +3336,7 @@ pub enum InsertPayloadOk {
 }
 
 /// Target for block persistence.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 enum PersistTarget {
     /// Persist up to `canonical_head - memory_block_buffer_target`.
