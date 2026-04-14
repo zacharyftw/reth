@@ -613,7 +613,7 @@ impl RocksDBProviderInner {
             Self::ReadWrite { db, .. } => {
                 RocksDBRawIterEnum::ReadWrite(db.raw_iterator_cf_opt(cf, readopts))
             }
-            Self::ReadOnly { db, .. } => {
+            Self::Secondary { db, .. } => {
                 RocksDBRawIterEnum::ReadOnly(db.raw_iterator_cf_opt(cf, readopts))
             }
         }
@@ -874,7 +874,7 @@ impl RocksDBProvider {
                     }
                     pending
                 }
-                RocksDBProviderInner::ReadOnly { .. } => continue,
+                RocksDBProviderInner::Secondary { .. } => continue,
             };
             if pending > 0 {
                 tracing::info!(
@@ -1259,7 +1259,7 @@ impl RocksDBProvider {
             RocksDBProviderInner::ReadWrite { db, .. } => db
                 .cf_handle(name)
                 .ok_or_else(|| DatabaseError::Other(format!("CF '{}' not found", name)))?,
-            RocksDBProviderInner::ReadOnly { db, .. } => db
+            RocksDBProviderInner::Secondary { db, .. } => db
                 .cf_handle(name)
                 .ok_or_else(|| DatabaseError::Other(format!("CF '{}' not found", name)))?,
         };
@@ -1283,7 +1283,7 @@ impl RocksDBProvider {
             RocksDBProviderInner::ReadWrite { db, .. } => db
                 .cf_handle(name)
                 .ok_or_else(|| DatabaseError::Other(format!("CF '{}' not found", name)))?,
-            RocksDBProviderInner::ReadOnly { db, .. } => db
+            RocksDBProviderInner::Secondary { db, .. } => db
                 .cf_handle(name)
                 .ok_or_else(|| DatabaseError::Other(format!("CF '{}' not found", name)))?,
         };
@@ -1306,7 +1306,7 @@ impl RocksDBProvider {
             RocksDBProviderInner::ReadWrite { db, .. } => db
                 .cf_handle(name)
                 .ok_or_else(|| DatabaseError::Other(format!("CF '{}' not found", name)))?,
-            RocksDBProviderInner::ReadOnly { db, .. } => db
+            RocksDBProviderInner::Secondary { db, .. } => db
                 .cf_handle(name)
                 .ok_or_else(|| DatabaseError::Other(format!("CF '{}' not found", name)))?,
         };
@@ -1332,7 +1332,7 @@ impl RocksDBProvider {
             RocksDBProviderInner::ReadWrite { db, .. } => db
                 .cf_handle(name)
                 .ok_or_else(|| DatabaseError::Other(format!("CF '{}' not found", name)))?,
-            RocksDBProviderInner::ReadOnly { db, .. } => db
+            RocksDBProviderInner::Secondary { db, .. } => db
                 .cf_handle(name)
                 .ok_or_else(|| DatabaseError::Other(format!("CF '{}' not found", name)))?,
         };
