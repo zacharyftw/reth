@@ -558,19 +558,29 @@ mod tests {
     /// Starts a discovery node with discv4 and discv5 sharing the same UDP port.
     async fn start_shared_port_node(port: u16) -> Discovery {
         let secret_key = SecretKey::new(&mut rand_08::thread_rng());
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let disc_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        // Use a non-zero TCP port so the node record isn't filtered out by
+        // `on_node_record_update` (which drops peers with tcp port == 0).
+        let tcp_addr: SocketAddr = "127.0.0.1:30303".parse().unwrap();
 
         let discv4_config = Discv4ConfigBuilder::default().external_ip_resolver(None).build();
 
-        let discv5_listen_config = discv5::ListenConfig::from(addr);
-        let discv5_config = reth_discv5::Config::builder(addr)
+        let discv5_listen_config = discv5::ListenConfig::from(disc_addr);
+        let discv5_config = reth_discv5::Config::builder(disc_addr)
             .discv5_config(discv5::ConfigBuilder::new(discv5_listen_config).build())
             .build();
 
         // Both protocols use the same address, triggering shared-port mode
-        Discovery::new(addr, addr, secret_key, Some(discv4_config), Some(discv5_config), None)
-            .await
-            .expect("should start with shared port")
+        Discovery::new(
+            tcp_addr,
+            disc_addr,
+            secret_key,
+            Some(discv4_config),
+            Some(discv5_config),
+            None,
+        )
+        .await
+        .expect("should start with shared port")
     }
 
     #[tokio::test(flavor = "multi_thread")]
