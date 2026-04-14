@@ -599,17 +599,26 @@ where
                 hashed_state_provider.hashed_post_state(&hashed_state_output.state)
             });
 
+        const INLINE_PAYLOAD_TX_ROOT_THRESHOLD: usize = 128;
+
         let block = convert_to_block(input)?;
         let transaction_root = is_payload.then(|| {
-            let body = block.body().clone();
-            let parent_span = Span::current();
-            let num_hash = block.num_hash();
-            self.payload_processor.executor().spawn_blocking_named("payload-tx-root", move || {
-                let _span =
-                    debug_span!(target: "engine::tree::payload_validator", parent: parent_span, "payload_tx_root", block = ?num_hash)
-                        .entered();
-                body.calculate_tx_root()
-            })
+            if block.body().transactions().len() <= INLINE_PAYLOAD_TX_ROOT_THRESHOLD {
+                Either::Left(block.body().calculate_tx_root())
+            } else {
+                let body = block.body().clone();
+                let parent_span = Span::current();
+                let num_hash = block.num_hash();
+                Either::Right(self.payload_processor.executor().spawn_blocking_named(
+                    "payload-tx-root",
+                    move || {
+                        let _span =
+                            debug_span!(target: "engine::tree::payload_validator", parent: parent_span, "payload_tx_root", block = ?num_hash)
+                                .entered();
+                        body.calculate_tx_root()
+                    },
+                ))
+            }
         });
         let block = block.with_senders(senders);
 
@@ -631,11 +640,14 @@ where
                 })
                 .ok()
         };
-        let transaction_root = transaction_root.map(|handle| {
-            let _span =
-                debug_span!(target: "engine::tree::payload_validator", "wait_payload_tx_root")
-                    .entered();
-            handle.try_into_inner().expect("sole handle")
+        let transaction_root = transaction_root.map(|transaction_root| match transaction_root {
+            Either::Left(root) => root,
+            Either::Right(handle) => {
+                let _span =
+                    debug_span!(target: "engine::tree::payload_validator", "wait_payload_tx_root")
+                        .entered();
+                handle.try_into_inner().expect("sole handle")
+            }
         });
 
         let hashed_state = ensure_ok_post_block!(
