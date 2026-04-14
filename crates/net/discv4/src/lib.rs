@@ -2045,7 +2045,7 @@ impl IngressHandler {
                     return Box::pin(async {})
                 }
 
-                if self.state.lock().0.contains_packet(packet.hash) {
+                if cache.contains_packet(packet.hash) {
                     debug!(target: "discv4", ?src, "Received duplicate packet.");
                     return Box::pin(async {})
                 }
