@@ -53,11 +53,27 @@ fn prefix_range(
     // Advance past entries before `prefix`.
     let begin = start + sorted_keys[start..].partition_point(|p| p < prefix);
     // Find the end of entries that start with `prefix`.
-    let mut end = begin;
-    while end < sorted_keys.len() && sorted_keys[end].starts_with(prefix) {
-        end += 1;
-    }
+    let end = prefix_exclusive_upper_bound(prefix).map_or(sorted_keys.len(), |upper_bound| {
+        begin + sorted_keys[begin..].partition_point(|p| p < &upper_bound)
+    });
     begin..end
+}
+
+/// Returns the smallest nibble path that sorts strictly after all entries with `prefix`.
+///
+/// For example, `[0x1, 0x2, 0xF]` becomes `[0x1, 0x3]`. A prefix made entirely of `0xF`
+/// nibbles has no finite upper bound and returns `None`.
+fn prefix_exclusive_upper_bound(prefix: &Nibbles) -> Option<Nibbles> {
+    let mut upper = prefix.iter().collect::<Vec<_>>();
+
+    while let Some(last) = upper.pop() {
+        if last < 0xF {
+            upper.push(last + 1);
+            return Some(Nibbles::from_nibbles_unchecked(upper));
+        }
+    }
+
+    None
 }
 
 /// Returns the per-slot byte size used by `SlotMap<_, T>`. `SlotMap` wraps each value in a
@@ -3134,7 +3150,7 @@ impl SparseTrie for ArenaParallelSparseTrie {
 
 #[cfg(test)]
 mod tests {
-    use super::TRACE_TARGET;
+    use super::{prefix_range, TRACE_TARGET};
     use crate::{ArenaParallelSparseTrie, ArenaParallelismThresholds, LeafUpdate, SparseTrie};
     use alloy_primitives::{map::B256Map, B256, U256};
     use rand::{seq::SliceRandom, Rng, SeedableRng};
@@ -3276,6 +3292,23 @@ mod tests {
             changeset.entry(key).or_insert(value);
         }
         changeset
+    }
+
+    #[test]
+    fn prefix_range_uses_binary_upper_bound() {
+        let sorted_keys = [
+            Nibbles::from_nibbles([0x1, 0x2]),
+            Nibbles::from_nibbles([0x1, 0x2, 0x0]),
+            Nibbles::from_nibbles([0x1, 0x2, 0xF]),
+            Nibbles::from_nibbles([0x1, 0x3]),
+            Nibbles::from_nibbles([0xF, 0xF]),
+            Nibbles::from_nibbles([0xF, 0xF, 0x1]),
+        ];
+
+        assert_eq!(prefix_range(&sorted_keys, 0, &Nibbles::from_nibbles([0x1, 0x2])), 0..3);
+        assert_eq!(prefix_range(&sorted_keys, 0, &Nibbles::from_nibbles([0x1, 0x3])), 3..4);
+        assert_eq!(prefix_range(&sorted_keys, 0, &Nibbles::from_nibbles([0xF, 0xF])), 4..6);
+        assert_eq!(prefix_range(&sorted_keys, 4, &Nibbles::from_nibbles([0xF, 0xF])), 4..6);
     }
 
     proptest! {
