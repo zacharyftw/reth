@@ -114,6 +114,15 @@ impl LazyOverlay {
                     "Anchor mismatch, falling back to merge"
                 );
             }
+
+            if blocks.len() == 1 {
+                trace!(target: "chain_state::lazy_overlay", %anchor_hash, "Using single block overlay directly");
+                return TrieInputSorted {
+                    state: data.hashed_state,
+                    nodes: data.trie_updates,
+                    prefix_sets: Default::default(),
+                }
+            }
         }
 
         // Slow path: Merge all blocks' trie data into a new overlay.
