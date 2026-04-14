@@ -122,6 +122,8 @@ where
     disable_sparse_trie_cache_pruning: bool,
     /// Whether to disable cache metrics recording.
     disable_cache_metrics: bool,
+    /// Dedicated rayon pool for parallel sparse trie operations.
+    rayon_pool: Arc<rayon::ThreadPool>,
 }
 
 impl<N, Evm> PayloadProcessor<Evm>
@@ -141,6 +143,7 @@ where
         config: &TreeConfig,
         precompile_cache_map: PrecompileCacheMap<SpecFor<Evm>>,
     ) -> Self {
+        let rayon_pool = executor.sparse_trie_pool();
         Self {
             executor,
             execution_cache: Default::default(),
@@ -156,6 +159,7 @@ where
             sparse_trie_max_hot_accounts: config.sparse_trie_max_hot_accounts(),
             disable_sparse_trie_cache_pruning: config.disable_sparse_trie_cache_pruning(),
             disable_cache_metrics: config.disable_cache_metrics(),
+            rayon_pool,
         }
     }
 }
@@ -549,6 +553,7 @@ where
         let max_hot_accounts = self.sparse_trie_max_hot_accounts;
         let disable_cache_pruning = self.disable_sparse_trie_cache_pruning;
         let executor = self.executor.clone();
+        let rayon_pool = self.rayon_pool.clone();
 
         let parent_span = Span::current();
         self.executor.spawn_blocking_named("sparse-trie", move || {
@@ -591,6 +596,7 @@ where
                 trie_metrics.clone(),
                 sparse_state_trie,
                 chunk_size,
+                rayon_pool.clone(),
             );
 
             let result = task.run();

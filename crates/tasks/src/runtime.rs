@@ -116,6 +116,9 @@ pub struct RayonConfig {
     /// Number of threads for the BAL streaming pool (BAL hashed state streaming).
     /// If `None`, derived from available parallelism.
     pub bal_streaming_threads: Option<usize>,
+    /// Number of threads for the sparse trie pool (sparse trie parallel operations).
+    /// If `None`, derived from available parallelism.
+    pub sparse_trie_threads: Option<usize>,
 }
 
 #[cfg(feature = "rayon")]
@@ -131,6 +134,7 @@ impl Default for RayonConfig {
             proof_account_worker_threads: None,
             prewarming_threads: None,
             bal_streaming_threads: None,
+            sparse_trie_threads: None,
         }
     }
 }
@@ -304,6 +308,9 @@ struct RuntimeInner {
     /// BAL streaming pool (BAL hashed state streaming).
     #[cfg(feature = "rayon")]
     bal_streaming_pool: LazyWorkerPool,
+    /// Sparse trie pool (parallel reveal, storage root computation).
+    #[cfg(feature = "rayon")]
+    sparse_trie_pool: Arc<rayon::ThreadPool>,
     /// Named single-thread worker map. Each unique name gets a dedicated OS thread
     /// that is reused across all tasks submitted under that name.
     worker_map: WorkerMap,
@@ -394,6 +401,12 @@ impl Runtime {
     pub fn bal_streaming_pool(&self) -> &WorkerPool {
         self.0.bal_streaming_pool.get()
     }
+
+    /// Get the sparse trie pool.
+    #[cfg(feature = "rayon")]
+    pub fn sparse_trie_pool(&self) -> Arc<rayon::ThreadPool> {
+        self.0.sparse_trie_pool.clone()
+    }
 }
 
 // ── Test helpers ──────────────────────────────────────────────────────
@@ -429,6 +442,7 @@ impl Runtime {
                 proof_account_worker_threads: Some(2),
                 prewarming_threads: Some(2),
                 bal_streaming_threads: Some(2),
+                sparse_trie_threads: Some(2),
             },
         }
     }
@@ -808,6 +822,7 @@ impl RuntimeBuilder {
             proof_account_worker_pool,
             prewarming_pool,
             bal_streaming_pool,
+            sparse_trie_pool,
         ) = {
             let default_threads = config.rayon.default_thread_count();
             let rpc_threads = config.rayon.rpc_threads.unwrap_or(default_threads);
@@ -862,6 +877,14 @@ impl RuntimeBuilder {
                 config.rayon.bal_streaming_threads.unwrap_or(default_threads);
             let bal_streaming_pool = LazyWorkerPool::new(bal_streaming_threads, "bal-stream");
 
+            let sparse_trie_threads =
+                config.rayon.sparse_trie_threads.unwrap_or(default_threads);
+            let sparse_trie_pool = Arc::new(build_pool_with_panic_handler(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(sparse_trie_threads)
+                    .thread_name(|i| format!("sparse-trie-{i:02}")),
+            )?);
+
             debug!(
                 default_threads,
                 rpc_threads,
@@ -870,6 +893,7 @@ impl RuntimeBuilder {
                 proof_account_worker_threads,
                 prewarming_threads,
                 bal_streaming_threads,
+                sparse_trie_threads,
                 max_blocking_tasks = config.rayon.max_blocking_tasks,
                 "Initialized rayon thread pools and configured lazy BAL streaming pool"
             );
@@ -883,6 +907,7 @@ impl RuntimeBuilder {
                 proof_account_worker_pool,
                 prewarming_pool,
                 bal_streaming_pool,
+                sparse_trie_pool,
             )
         };
 
@@ -917,6 +942,8 @@ impl RuntimeBuilder {
             prewarming_pool,
             #[cfg(feature = "rayon")]
             bal_streaming_pool,
+            #[cfg(feature = "rayon")]
+            sparse_trie_pool,
             worker_map: WorkerMap::new(),
             task_manager_handle: Mutex::new(Some(task_manager_handle)),
         };

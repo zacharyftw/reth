@@ -48,6 +48,8 @@ pub(super) struct SparseTrieCacheTask<A = ConfigurableSparseTrie, S = Configurab
     trie: SparseStateTrie<A, S>,
     /// Handle to the proof worker pools (storage and account).
     proof_worker_handle: ProofWorkerHandle,
+    /// Dedicated rayon pool for parallel sparse trie operations.
+    rayon_pool: Arc<rayon::ThreadPool>,
 
     /// The size of proof targets chunk to spawn in one calculation.
     /// If None, chunking is disabled and all targets are processed in a single proof.
@@ -121,6 +123,7 @@ where
         metrics: MultiProofTaskMetrics,
         trie: SparseStateTrie<A, S>,
         chunk_size: usize,
+        rayon_pool: Arc<rayon::ThreadPool>,
     ) -> Self {
         let (proof_result_tx, proof_result_rx) = crossbeam_channel::unbounded();
         let (hashed_state_tx, hashed_state_rx) = crossbeam_channel::unbounded();
@@ -137,6 +140,7 @@ where
             proof_result_rx,
             updates: hashed_state_rx,
             proof_worker_handle,
+            rayon_pool,
             trie,
             chunk_size,
             max_targets_for_chunking: DEFAULT_MAX_TARGETS_FOR_CHUNKING,
@@ -257,6 +261,11 @@ where
         skip_all
     )]
     pub(super) fn run(&mut self) -> Result<StateRootComputeOutcome, ParallelStateRootError> {
+        let pool = self.rayon_pool.clone();
+        pool.install(|| self.run_inner())
+    }
+
+    fn run_inner(&mut self) -> Result<StateRootComputeOutcome, ParallelStateRootError> {
         let now = Instant::now();
 
         let mut total_idle_time = std::time::Duration::ZERO;
