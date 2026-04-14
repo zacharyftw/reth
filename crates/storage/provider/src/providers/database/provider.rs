@@ -168,6 +168,13 @@ pub enum SaveBlocksMode {
     /// Full mode: write block structure + receipts + state + trie.
     /// Used by engine/production code.
     Full,
+    /// Write block structure and advance the latest checkpoint with the merged end-state of the
+    /// batch.
+    ///
+    /// This writes the block structure for every block, then materializes only the final plain /
+    /// hashed state and trie updates that survive after applying the whole batch. Receipts,
+    /// per-block changesets, and history indices are skipped.
+    BlocksAndCheckpoint,
     /// Blocks only: write block structure (headers, txs, senders, indices).
     /// Receipts/state/trie are skipped - they may come later via separate calls.
     /// Used by `insert_block`.
@@ -175,8 +182,18 @@ pub enum SaveBlocksMode {
 }
 
 impl SaveBlocksMode {
-    /// Returns `true` if this is [`SaveBlocksMode::Full`].
+    /// Returns `true` if this mode advances the latest fully persisted state checkpoint.
     pub const fn with_state(self) -> bool {
+        matches!(self, Self::Full | Self::BlocksAndCheckpoint)
+    }
+
+    /// Returns `true` if this mode writes receipts, per-block changesets, and history indices.
+    pub const fn writes_receipts_and_changesets(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// Returns `true` if this mode should run pruning after persisting blocks.
+    pub const fn runs_pruner(self) -> bool {
         matches!(self, Self::Full)
     }
 }
@@ -482,11 +499,11 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         Ok(StaticFileWriteCtx {
             write_senders: EitherWriterDestination::senders(self).is_static_file() &&
                 self.prune_modes.sender_recovery.is_none_or(|m| !m.is_full()),
-            write_receipts: save_mode.with_state() &&
+            write_receipts: save_mode.writes_receipts_and_changesets() &&
                 EitherWriter::receipts_destination(self).is_static_file(),
-            write_account_changesets: save_mode.with_state() &&
+            write_account_changesets: save_mode.writes_receipts_and_changesets() &&
                 EitherWriterDestination::account_changesets(self).is_static_file(),
-            write_storage_changesets: save_mode.with_state() &&
+            write_storage_changesets: save_mode.writes_receipts_and_changesets() &&
                 EitherWriterDestination::storage_changesets(self).is_static_file(),
             tip,
             receipts_prune_mode: self.prune_modes.receipts,
@@ -513,10 +530,12 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
     /// Writes executed blocks and state to storage.
     ///
     /// This method parallelizes static file (SF) writes with MDBX writes.
-    /// The SF thread writes headers, transactions, senders (if SF), and receipts (if SF, Full mode
-    /// only). The main thread writes MDBX data (indices, state, trie - Full mode only).
+    /// The SF thread writes headers, transactions, senders (if SF), and receipts / changesets when
+    /// requested. The main thread always writes MDBX block structure and optionally writes the
+    /// fully persisted checkpoint state / trie.
     ///
-    /// Use [`SaveBlocksMode::Full`] for production (includes receipts, state, trie).
+    /// Use [`SaveBlocksMode::Full`] for production (includes receipts, changesets, state, trie).
+    /// Use [`SaveBlocksMode::BlocksAndCheckpoint`] to checkpoint only the batch's merged end-state.
     /// Use [`SaveBlocksMode::BlocksOnly`] for block structure only (used by `insert_block`).
     #[instrument(level = "debug", target = "providers::db", skip_all, fields(block_count = blocks.len()))]
     pub fn save_blocks(
@@ -641,7 +660,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 self.insert_block_mdbx_only(recovered_block, tx_nums[i])?;
                 timings.insert_block += start.elapsed();
 
-                if save_mode.with_state() {
+                if save_mode.writes_receipts_and_changesets() {
                     let execution_output = block.execution_outcome();
 
                     // Write state and changesets to the database.
@@ -662,6 +681,21 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                     )?;
                     timings.write_state += start.elapsed();
                 }
+            }
+
+            if matches!(save_mode, SaveBlocksMode::BlocksAndCheckpoint) {
+                let start = Instant::now();
+                let checkpoint_outcome = Self::checkpoint_execution_outcome(&blocks);
+                self.write_state(
+                    WriteStateInput::Multiple(&checkpoint_outcome),
+                    OriginalValuesKnown::No,
+                    StateWriteConfig {
+                        write_receipts: false,
+                        write_account_changesets: false,
+                        write_storage_changesets: false,
+                    },
+                )?;
+                timings.write_state += start.elapsed();
             }
 
             // Write all hashed state and trie updates in single batches.
@@ -686,8 +720,8 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 timings.write_trie_updates += start.elapsed();
             }
 
-            // Full mode: update history indices
-            if save_mode.with_state() {
+            // Only full mode writes the per-block history indices required for historical state.
+            if save_mode.writes_receipts_and_changesets() {
                 let start = Instant::now();
                 self.update_history_indices(first_number..=last_block_number)?;
                 timings.update_history_indices = start.elapsed();
@@ -724,6 +758,28 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         debug!(target: "providers::db", range = ?first_number..=last_block_number, "Appended block data");
 
         Ok(())
+    }
+
+    fn checkpoint_execution_outcome(
+        blocks: &[ExecutedBlock<N::Primitives>],
+    ) -> ExecutionOutcome<ReceiptTy<N>> {
+        debug_assert!(!blocks.is_empty(), "checkpoint execution outcome requires blocks");
+
+        let first_block = blocks.first().expect("checked above").recovered_block().number();
+        let mut checkpoint_outcome = ExecutionOutcome::new(
+            Default::default(),
+            Vec::with_capacity(blocks.len()),
+            first_block,
+            Vec::with_capacity(blocks.len()),
+        );
+
+        for block in blocks {
+            checkpoint_outcome.bundle.extend(block.execution_outcome().state.clone());
+            checkpoint_outcome.receipts.push(Vec::new());
+            checkpoint_outcome.requests.push(Default::default());
+        }
+
+        checkpoint_outcome
     }
 
     /// Writes MDBX-only data for a block (indices, lookups, and senders if configured for MDBX).

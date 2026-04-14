@@ -1341,7 +1341,7 @@ where
         }
     }
 
-    /// Helper method to persist block structure and advance `db_tip`.
+    /// Helper method to persist the canonical batch and advance the persisted checkpoint.
     fn persist_blocks(&mut self, blocks_to_persist: Vec<ExecutedBlock<N>>) {
         if blocks_to_persist.is_empty() {
             debug!(target: "engine::tree", "Returned empty set of blocks to persist");
@@ -1359,7 +1359,7 @@ where
         let (tx, rx) = crossbeam_channel::bounded(1);
         let _ = self.persistence.save_blocks_with_mode(
             blocks_to_persist,
-            SaveBlocksMode::BlocksOnly,
+            SaveBlocksMode::BlocksAndCheckpoint,
             tx,
         );
 
@@ -1457,6 +1457,7 @@ where
         action: CurrentPersistenceAction,
     ) -> Result<(), AdvancePersistenceError> {
         self.metrics.engine.persistence_duration.record(start_time.elapsed());
+        let commit_duration = result.commit_duration;
 
         let Some(BlockNumHash { hash: persisted_hash, number: persisted_number }) =
             result.last_block
@@ -1470,7 +1471,9 @@ where
 
         match action {
             CurrentPersistenceAction::SavingDbTip { .. } => {
-                self.persistence_state.finish_db_tip(persisted_hash, persisted_number);
+                self.persistence_state.finish_full(persisted_hash, persisted_number);
+                self.on_new_persisted_block()?;
+                self.purge_timing_stats(persisted_number, commit_duration);
             }
             CurrentPersistenceAction::RemovingBlocks { .. } => {
                 self.persistence_state.finish_remove(persisted_hash, persisted_number);

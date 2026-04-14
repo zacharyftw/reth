@@ -66,7 +66,7 @@ impl PersistenceState {
             Some((rx, Instant::now(), CurrentPersistenceAction::RemovingBlocks { new_tip_num }));
     }
 
-    /// Sets the state for a block save operation that advances `db_tip`.
+    /// Sets the state for a background save operation that advances the persisted frontiers.
     pub(crate) fn start_save_db_tip(
         &mut self,
         highest: BlockNumHash,
@@ -80,13 +80,6 @@ impl PersistenceState {
     #[cfg(test)]
     pub(crate) fn current_action(&self) -> Option<&CurrentPersistenceAction> {
         self.rx.as_ref().map(|rx| &rx.2)
-    }
-
-    /// Sets state for a finished `db_tip` persistence task.
-    pub(crate) fn finish_db_tip(&mut self, persisted_hash: B256, persisted_number: u64) {
-        trace!(target: "engine::tree", block= %persisted_number, hash=%persisted_hash, "updating db_tip persistence state");
-        self.rx = None;
-        self.db_tip = BlockNumHash::new(persisted_number, persisted_hash);
     }
 
     /// Sets state for a finished block removal task.
@@ -113,7 +106,7 @@ impl PersistenceState {
 /// The currently running persistence action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CurrentPersistenceAction {
-    /// The persistence task is saving block structure to advance `db_tip`.
+    /// The persistence task is saving blocks and advancing the persisted frontiers.
     SavingDbTip {
         /// The highest block being saved to `db_tip`.
         highest: BlockNumHash,

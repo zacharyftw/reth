@@ -187,7 +187,7 @@ where
             //
             // The pruner reads the indices from rocksdb, filters it, and writes to indices, so it
             // must be able to read anything written by save_blocks.
-            if mode.with_state() && self.pruner.is_pruning_needed(last.number) {
+            if mode.runs_pruner() && self.pruner.is_pruning_needed(last.number) {
                 debug!(target: "engine::persistence", block_num=?last.number, "Running pruner");
                 let prune_start = Instant::now();
                 let provider_rw = self.provider.database_provider_rw()?;

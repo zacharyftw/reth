@@ -551,7 +551,7 @@ async fn test_tree_persists_blocks_to_db_tip_in_background() {
     let PersistenceAction::SaveBlocks { blocks: saved_blocks, mode, .. } = received_action else {
         panic!("unexpected action received {received_action:?}");
     };
-    assert_eq!(mode, SaveBlocksMode::BlocksOnly);
+    assert_eq!(mode, SaveBlocksMode::BlocksAndCheckpoint);
     assert_eq!(saved_blocks, blocks);
 }
 
@@ -814,18 +814,8 @@ async fn test_tree_state_on_new_head_reorg() {
     else {
         panic!("received wrong action");
     };
-    assert_eq!(mode, SaveBlocksMode::BlocksOnly);
+    assert_eq!(mode, SaveBlocksMode::BlocksAndCheckpoint);
     assert_eq!(saved_blocks, vec![blocks[0].clone(), blocks[1].clone(), blocks[2].clone()]);
-
-    sender
-        .send(PersistenceResult {
-            last_block: Some(blocks[2].recovered_block().num_hash()),
-            commit_duration: Some(Duration::ZERO),
-        })
-        .unwrap();
-
-    test_harness.tree.try_poll_persistence().unwrap();
-    assert_eq!(test_harness.tree.persistence_state.current_action().cloned(), None);
 
     // reorg case
     let result = test_harness.tree.on_new_head(fork_block_5.recovered_block().hash()).unwrap();
@@ -840,6 +830,28 @@ async fn test_tree_state_on_new_head_reorg() {
         assert_eq!(old.len(), 1);
         assert_eq!(old[0].recovered_block().hash(), blocks[2].recovered_block().hash());
     }
+
+    for block in &blocks[..=2] {
+        test_harness.provider.add_block(
+            block.recovered_block().hash(),
+            Arc::unwrap_or_clone(block.recovered_block.clone()).into_block(),
+        );
+    }
+
+    sender
+        .send(PersistenceResult {
+            last_block: Some(blocks[2].recovered_block().num_hash()),
+            commit_duration: Some(Duration::ZERO),
+        })
+        .unwrap();
+
+    test_harness.tree.try_poll_persistence().unwrap();
+    assert_eq!(test_harness.tree.persistence_state.current_action().cloned(), None);
+    assert_eq!(test_harness.tree.persistence_state.db_tip, blocks[2].recovered_block().num_hash());
+    assert_eq!(
+        test_harness.tree.persistence_state.db_checkpoint,
+        blocks[2].recovered_block().num_hash()
+    );
 
     // The canonical head has not changed yet, so there is no new persistence action to run.
     test_harness.tree.advance_persistence().unwrap();
@@ -862,6 +874,45 @@ async fn test_tree_state_on_new_head_reorg() {
             new_tip_num: blocks[1].recovered_block().number()
         })
     );
+}
+
+#[test]
+fn test_persistence_completion_advances_checkpoint_and_evicts_blocks() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(1..5).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    let persisted = blocks[2].recovered_block().num_hash();
+
+    test_harness
+        .tree
+        .on_persistence_complete(
+            PersistenceResult {
+                last_block: Some(persisted),
+                commit_duration: Some(Duration::ZERO),
+            },
+            Instant::now(),
+            CurrentPersistenceAction::SavingDbTip { highest: persisted },
+        )
+        .unwrap();
+
+    assert_eq!(test_harness.tree.persistence_state.db_tip, persisted);
+    assert_eq!(test_harness.tree.persistence_state.db_checkpoint, persisted);
+    assert!(test_harness
+        .tree
+        .canonical_in_memory_state
+        .state_by_number(blocks[2].recovered_block().number())
+        .is_none());
+    assert!(test_harness
+        .tree
+        .state
+        .tree_state
+        .executed_block_by_hash(blocks[2].recovered_block().hash())
+        .is_none());
+    assert!(test_harness
+        .tree
+        .state
+        .tree_state
+        .executed_block_by_hash(blocks[3].recovered_block().hash())
+        .is_some());
 }
 
 #[test]
