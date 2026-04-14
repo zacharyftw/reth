@@ -18,7 +18,6 @@ use reth_network_types::PeerAddr;
 use secp256k1::SecretKey;
 use std::{
     collections::VecDeque,
-    future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
@@ -111,13 +110,7 @@ impl Discovery {
                         )?;
 
                     discv5_config.discv5_config_mut().on_decode_failure =
-                        Some(Arc::new(move |data: &[u8], src: SocketAddr| {
-                            if src.is_ipv4() != discovery_v4_addr.is_ipv4() {
-                                return Box::pin(async {})
-                                    as Pin<Box<dyn Future<Output = ()> + Send + '_>>
-                            }
-                            callback(data, src)
-                        }));
+                        Some(callback as Arc<dyn discv5::OnDecodeFailure>);
 
                     let discv4_updates = discv4_service.update_stream();
                     let discv4_service = discv4_service.spawn();
