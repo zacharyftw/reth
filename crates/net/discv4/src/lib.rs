@@ -1997,12 +1997,11 @@ pub(crate) async fn receive_loop(udp: Arc<UdpSocket>, tx: IngressSender, local_i
     let mut buf = [0; MAX_PACKET_SIZE];
 
     loop {
-        match udp.recv_from(&mut buf).await {
+        let res = udp.recv_from(&mut buf).await;
+        match res {
             Err(err) => {
                 debug!(target: "discv4", %err, "Failed to read datagram.");
-                let _ = tx.send(IngressEvent::RecvError(err)).await.map_err(|err| {
-                    debug!(target: "discv4", %err, "failed send incoming packet");
-                });
+                handler.send(IngressEvent::RecvError(err)).await;
             }
             Ok((read, remote_addr)) => {
                 handler.handle_packet(&buf[..read], remote_addr).await;
@@ -2036,19 +2035,17 @@ impl IngressHandler {
         }
     }
 
+    async fn send(&self, event: IngressEvent) {
+        let _ = self.tx.send(event).await.map_err(|err| {
+            debug!(target: "discv4", %err, "failed send incoming packet");
+        });
+    }
+
     fn handle_packet(
         &self,
         data: &[u8],
         src: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        let send = |event: IngressEvent| {
-            Box::pin(async {
-                let _ = self.tx.send(event).await.map_err(|err| {
-                    debug!(target: "discv4", %err, "failed send incoming packet");
-                });
-            })
-        };
-
         let (cache, last_tick) = &mut *self.state.lock();
 
         if last_tick.elapsed() >= self.tick_interval {
@@ -2073,11 +2070,11 @@ impl IngressHandler {
                     return Box::pin(async {})
                 }
 
-                send(IngressEvent::Packet(src, packet))
+                Box::pin(self.send(IngressEvent::Packet(src, packet)))
             }
             Err(err) => {
                 trace!(target: "discv4", %err, "Failed to decode packet");
-                send(IngressEvent::BadPacket(src, err, data.to_vec()))
+                Box::pin(self.send(IngressEvent::BadPacket(src, err, data.to_vec())))
             }
         }
     }
