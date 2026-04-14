@@ -48,7 +48,7 @@ use std::{
     cell::RefCell,
     collections::{btree_map, hash_map::Entry, BTreeMap, HashMap, VecDeque},
     fmt,
-    future::poll_fn,
+    future::Future,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     pin::Pin,
@@ -155,6 +155,12 @@ type EgressReceiver = mpsc::Receiver<(Bytes, SocketAddr)>;
 pub(crate) type IngressSender = mpsc::Sender<IngressEvent>;
 pub(crate) type IngressReceiver = mpsc::Receiver<IngressEvent>;
 
+/// Callback that decodes raw packets and forwards them to the discv4 ingress channel.
+///
+/// Returned by [`Discv4::bind_shared`] for use as discv5's `on_decode_failure` callback.
+pub type IngressCallback =
+    Arc<dyn Fn(&[u8], SocketAddr) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> + Send + Sync>;
+
 type NodeRecordSender = OneshotSender<Vec<NodeRecord>>;
 
 /// The Discv4 frontend.
@@ -243,17 +249,61 @@ impl Discv4 {
     /// ```
     pub async fn bind(
         local_address: SocketAddr,
+        local_node_record: NodeRecord,
+        secret_key: SecretKey,
+        config: Discv4Config,
+    ) -> io::Result<(Self, Discv4Service)> {
+        let socket = Arc::new(UdpSocket::bind(local_address).await?);
+        trace!(target: "discv4", local_addr=?socket.local_addr(), "opened UDP socket");
+        let (tx, rx) = mpsc::channel(config.udp_ingress_message_buffer);
+
+        Self::bind_with_socket(socket, Some(tx), rx, local_node_record, secret_key, config)
+    }
+
+    /// Creates a new `Discv4` instance using a pre-bound shared socket. No receive loop is
+    /// spawned; instead returns a callback that should be invoked for each raw packet received
+    /// by the socket owner (e.g. discv5's `on_decode_failure`).
+    ///
+    /// The callback decodes the packet and forwards it to the service's ingress channel.
+    pub async fn bind_shared(
+        socket: Arc<UdpSocket>,
+        local_node_record: NodeRecord,
+        secret_key: SecretKey,
+        config: Discv4Config,
+    ) -> io::Result<(Self, Discv4Service, IngressCallback)> {
+        let (tx, rx) = mpsc::channel(config.udp_ingress_message_buffer);
+        let local_id = local_node_record.id;
+        let (discv4, service) =
+            Self::bind_with_socket(socket, None, rx, local_node_record, secret_key, config)?;
+
+        let handler = Arc::new(Mutex::new(IngressHandler::new(tx, local_id)));
+
+        let callback: IngressCallback =
+            Arc::new(move |data: &[u8], src: SocketAddr| handler.lock().handle_packet(data, src));
+
+        Ok((discv4, service, callback))
+    }
+
+    fn bind_with_socket(
+        socket: Arc<UdpSocket>,
+        ingress_tx: Option<IngressSender>,
+        ingress_rx: IngressReceiver,
         mut local_node_record: NodeRecord,
         secret_key: SecretKey,
         config: Discv4Config,
     ) -> io::Result<(Self, Discv4Service)> {
-        let socket = UdpSocket::bind(local_address).await?;
         let local_addr = socket.local_addr()?;
         local_node_record.udp_port = local_addr.port();
-        trace!(target: "discv4", ?local_addr,"opened UDP socket");
 
-        let mut service =
-            Discv4Service::new(socket, local_addr, local_node_record, secret_key, config);
+        let mut service = Discv4Service::new(
+            socket,
+            ingress_tx,
+            ingress_rx,
+            local_addr,
+            local_node_record,
+            secret_key,
+            config,
+        );
 
         // resolve the external address immediately
         service.resolve_external_ip();
@@ -511,20 +561,28 @@ pub struct Discv4Service {
 
 impl Discv4Service {
     /// Create a new instance for a bound [`UdpSocket`].
+    ///
+    /// If `spawn_receive` is `true`, the receive loop is spawned to read from the socket and feed
+    /// packets into the `ingress` channel. If `false`, the caller is responsible for feeding
+    /// packets externally (shared socket mode).
+    /// If `ingress_tx` is `Some`, the receive loop is spawned to read from the socket. If `None`,
+    /// the caller feeds packets into `ingress_rx` externally (shared socket mode).
     pub(crate) fn new(
-        socket: UdpSocket,
+        socket: Arc<UdpSocket>,
+        ingress_tx: Option<IngressSender>,
+        ingress_rx: IngressReceiver,
         local_address: SocketAddr,
         local_node_record: NodeRecord,
         secret_key: SecretKey,
         config: Discv4Config,
     ) -> Self {
-        let socket = Arc::new(socket);
-        let (ingress_tx, ingress_rx) = mpsc::channel(config.udp_ingress_message_buffer);
         let (egress_tx, egress_rx) = mpsc::channel(config.udp_egress_message_buffer);
         let mut tasks = JoinSet::<()>::new();
 
-        let udp = Arc::clone(&socket);
-        tasks.spawn(receive_loop(udp, ingress_tx, local_node_record.id));
+        if let Some(ingress_tx) = ingress_tx {
+            let udp = Arc::clone(&socket);
+            tasks.spawn(receive_loop(udp, ingress_tx, local_node_record.id));
+        }
 
         let udp = Arc::clone(&socket);
         tasks.spawn(send_loop(udp, egress_rx));
@@ -1939,75 +1997,96 @@ pub(crate) async fn send_loop(udp: Arc<UdpSocket>, rx: EgressReceiver) {
 /// Rate limits the number of incoming packets from individual IPs to 1 packet/second
 const MAX_INCOMING_PACKETS_PER_MINUTE_BY_IP: usize = 60usize;
 
-/// Continuously awaits new incoming messages and sends them back through the channel.
+/// Handles decoding, rate-limiting, and deduplication of incoming discv4 packets.
 ///
-/// The receive loop enforce primitive rate limiting for ips to prevent message spams from
-/// individual IPs
-pub(crate) async fn receive_loop(udp: Arc<UdpSocket>, tx: IngressSender, local_id: PeerId) {
-    let send = |event: IngressEvent| async {
-        let _ = tx.send(event).await.map_err(|err| {
-            debug!(
-                target: "discv4",
-                 %err,
-                "failed send incoming packet",
-            )
-        });
-    };
+/// Used by both the standalone [`receive_loop`] and the shared-port [`IngressCallback`]
+/// returned by [`Discv4::bind_shared`].
+struct IngressHandler {
+    tx: IngressSender,
+    local_id: PeerId,
+    cache: ReceiveCache,
+    tick: usize,
+    last_tick: Instant,
+    tick_interval: Duration,
+}
 
-    let mut cache = ReceiveCache::default();
+impl IngressHandler {
+    fn new(tx: IngressSender, local_id: PeerId) -> Self {
+        let tick = MAX_INCOMING_PACKETS_PER_MINUTE_BY_IP / 2;
+        Self {
+            tx,
+            local_id,
+            cache: ReceiveCache::default(),
+            tick,
+            last_tick: Instant::now(),
+            tick_interval: Duration::from_secs(tick as u64),
+        }
+    }
 
-    // tick at half the rate of the limit
-    let tick = MAX_INCOMING_PACKETS_PER_MINUTE_BY_IP / 2;
-    let mut interval = tokio::time::interval(Duration::from_secs(tick as u64));
+    /// Ticks the rate-limit counters if the interval has elapsed.
+    fn maybe_tick(&mut self) {
+        if self.last_tick.elapsed() >= self.tick_interval {
+            self.cache.tick_ips(self.tick);
+            self.last_tick = Instant::now();
+        }
+    }
 
-    let mut buf = [0; MAX_PACKET_SIZE];
-    loop {
-        let res = udp.recv_from(&mut buf).await;
-        match res {
-            Err(err) => {
-                debug!(target: "discv4", %err, "Failed to read datagram.");
-                send(IngressEvent::RecvError(err)).await;
-            }
-            Ok((read, remote_addr)) => {
-                // rate limit incoming packets by IP
-                if cache.inc_ip(remote_addr.ip()) > MAX_INCOMING_PACKETS_PER_MINUTE_BY_IP {
-                    trace!(target: "discv4", ?remote_addr, "Too many incoming packets from IP.");
-                    continue
-                }
+    /// Rate-limits, decodes, deduplicates, and returns an owned future that sends the result
+    /// to the ingress channel. The returned future is `'static` so it can escape an `FnMut`
+    /// closure (used by [`Discv4::bind_shared`]).
+    fn handle_packet(
+        &mut self,
+        data: &[u8],
+        src: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        self.maybe_tick();
 
-                let packet = &buf[..read];
-                match Message::decode(packet) {
-                    Ok(packet) => {
-                        if packet.node_id == local_id {
-                            // received our own message
-                            debug!(target: "discv4", ?remote_addr, "Received own packet.");
-                            continue
-                        }
-
-                        // skip if we've already received the same packet
-                        if cache.contains_packet(packet.hash) {
-                            debug!(target: "discv4", ?remote_addr, "Received duplicate packet.");
-                            continue
-                        }
-
-                        send(IngressEvent::Packet(remote_addr, packet)).await;
-                    }
-                    Err(err) => {
-                        trace!(target: "discv4", %err,"Failed to decode packet");
-                        send(IngressEvent::BadPacket(remote_addr, err, packet.to_vec())).await
-                    }
-                }
-            }
+        if self.cache.inc_ip(src.ip()) > MAX_INCOMING_PACKETS_PER_MINUTE_BY_IP {
+            trace!(target: "discv4", ?src, "Too many incoming packets from IP.");
+            return Box::pin(async {})
         }
 
-        // reset the tracked ips if the interval has passed
-        if poll_fn(|cx| match interval.poll_tick(cx) {
-            Poll::Ready(_) => Poll::Ready(true),
-            Poll::Pending => Poll::Ready(false),
-        })
-        .await
-        {
-            cache.tick_ips(tick);
+        match Message::decode(data) {
+            Ok(packet) => {
+                if packet.node_id == self.local_id {
+                    return Box::pin(async {})
+                }
+                if self.cache.contains_packet(packet.hash) {
+                    return Box::pin(async {})
+                }
+                let tx = self.tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(IngressEvent::Packet(src, packet)).await;
+                })
+            }
+            Err(err) => {
+                let tx = self.tx.clone();
+                let data = data.to_vec();
+                Box::pin(async move {
+                    let _ = tx.send(IngressEvent::BadPacket(src, err, data)).await;
+                })
+            }
+        }
+    }
+}
+
+/// Continuously awaits new incoming messages and sends them back through the channel.
+///
+/// The receive loop enforces primitive rate limiting for IPs to prevent message spams from
+/// individual IPs.
+pub(crate) async fn receive_loop(udp: Arc<UdpSocket>, tx: IngressSender, local_id: PeerId) {
+    let mut handler = IngressHandler::new(tx, local_id);
+    let mut buf = [0; MAX_PACKET_SIZE];
+
+    loop {
+        match udp.recv_from(&mut buf).await {
+            Err(err) => {
+                debug!(target: "discv4", %err, "Failed to read datagram.");
+                let _ = handler.tx.send(IngressEvent::RecvError(err)).await;
+            }
+            Ok((read, remote_addr)) => {
+                handler.handle_packet(&buf[..read], remote_addr).await;
+            }
         }
     }
 }
@@ -2080,7 +2159,7 @@ enum Discv4Command {
 
 /// Event type receiver produces
 #[derive(Debug)]
-pub(crate) enum IngressEvent {
+pub enum IngressEvent {
     /// Encountered an error when reading a datagram message.
     RecvError(io::Error),
     /// Received a bad message

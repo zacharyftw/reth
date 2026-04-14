@@ -472,38 +472,68 @@ pub fn build_local_enr(
 
     let Config { discv5_config, fork, tcp_socket, other_enr_kv_pairs, .. } = config;
 
-    let socket = match discv5_config.listen_config {
+    let socket = match &discv5_config.listen_config {
         ListenConfig::Ipv4 { ip, port } => {
-            if ip != Ipv4Addr::UNSPECIFIED {
-                builder.ip4(ip);
+            if *ip != Ipv4Addr::UNSPECIFIED {
+                builder.ip4(*ip);
             }
-            builder.udp4(port);
+            builder.udp4(*port);
             builder.tcp4(tcp_socket.port());
 
-            (ip, port).into()
+            (*ip, *port).into()
         }
         ListenConfig::Ipv6 { ip, port } => {
-            if ip != Ipv6Addr::UNSPECIFIED {
-                builder.ip6(ip);
+            if *ip != Ipv6Addr::UNSPECIFIED {
+                builder.ip6(*ip);
             }
-            builder.udp6(port);
+            builder.udp6(*port);
             builder.tcp6(tcp_socket.port());
 
-            (ip, port).into()
+            (*ip, *port).into()
         }
         ListenConfig::DualStack { ipv4, ipv4_port, ipv6, ipv6_port } => {
-            if ipv4 != Ipv4Addr::UNSPECIFIED {
-                builder.ip4(ipv4);
+            if *ipv4 != Ipv4Addr::UNSPECIFIED {
+                builder.ip4(*ipv4);
             }
-            builder.udp4(ipv4_port);
+            builder.udp4(*ipv4_port);
             builder.tcp4(tcp_socket.port());
 
-            if ipv6 != Ipv6Addr::UNSPECIFIED {
-                builder.ip6(ipv6);
+            if *ipv6 != Ipv6Addr::UNSPECIFIED {
+                builder.ip6(*ipv6);
             }
-            builder.udp6(ipv6_port);
+            builder.udp6(*ipv6_port);
 
-            (ipv6, ipv6_port).into()
+            (*ipv6, *ipv6_port).into()
+        }
+        ListenConfig::FromSockets { ipv4, ipv6 } => {
+            if let Some(s) = ipv4 {
+                let addr = s.local_addr().expect("socket must have local addr");
+                if let IpAddr::V4(ip) = addr.ip() {
+                    if ip != Ipv4Addr::UNSPECIFIED {
+                        builder.ip4(ip);
+                    }
+                    builder.udp4(addr.port());
+                    builder.tcp4(tcp_socket.port());
+                }
+            }
+            if let Some(s) = ipv6 {
+                let addr = s.local_addr().expect("socket must have local addr");
+                if let IpAddr::V6(ip) = addr.ip() {
+                    if ip != Ipv6Addr::UNSPECIFIED {
+                        builder.ip6(ip);
+                    }
+                    builder.udp6(addr.port());
+                }
+            }
+
+            // Use the first available socket address
+            if let Some(s) = ipv4 {
+                s.local_addr().expect("socket must have local addr")
+            } else if let Some(s) = ipv6 {
+                s.local_addr().expect("socket must have local addr")
+            } else {
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+            }
         }
     };
 
