@@ -107,7 +107,10 @@ where
     // For each changed account node, look up its current value
     // The input is already sorted, so the output will be sorted
     for (path, _new_node) in trie_updates.account_nodes_ref() {
-        let old_node = cursor.seek_exact(*path)?.map(|(_path, node)| node);
+        let old_node = match cursor.seek(*path)? {
+            Some((found_path, node)) if found_path == *path => Some(node),
+            _ => None,
+        };
         account_changesets.push((*path, old_node));
     }
 
@@ -134,7 +137,10 @@ fn compute_storage_changesets(
     // For each changed storage node, look up its current value
     // The input is already sorted, so the output will be sorted
     for (path, _new_node) in &storage_updates.storage_nodes {
-        let old_node = cursor.seek_exact(*path)?.map(|(_path, node)| node);
+        let old_node = match cursor.seek(*path)? {
+            Some((found_path, node)) if found_path == *path => Some(node),
+            _ => None,
+        };
         storage_changesets.push((*path, old_node));
     }
 
@@ -303,6 +309,39 @@ mod tests {
         // path3 should have None (it didn't exist before)
         assert_eq!(changesets.account_nodes_ref()[1].0, path3);
         assert_eq!(changesets.account_nodes_ref()[1].1, None);
+    }
+
+    #[test]
+    fn test_account_changesets_missing_path_between_existing_nodes() {
+        let path1 = Nibbles::from_nibbles([0x1, 0x2, 0x3]);
+        let path2 = Nibbles::from_nibbles([0x4, 0x5, 0x6]);
+        let missing_path = Nibbles::from_nibbles([0x2, 0x2, 0x2]);
+        let node1 = BranchNodeCompact::new(0b1111, 0b1010, 0, vec![], None);
+        let node2 = BranchNodeCompact::new(0b1111, 0b1100, 0, vec![], None);
+
+        let mut account_nodes = BTreeMap::new();
+        account_nodes.insert(path1, node1.clone());
+        account_nodes.insert(path2, node2.clone());
+
+        let mut storage_tries = B256Map::default();
+        storage_tries.insert(B256::default(), BTreeMap::new());
+        let factory = MockTrieCursorFactory::new(account_nodes, storage_tries);
+
+        let updates = TrieUpdatesSorted::new(
+            vec![
+                (path1, Some(node1.clone())),
+                (missing_path, Some(BranchNodeCompact::new(0b1111, 0b0001, 0, vec![], None))),
+                (path2, Some(node2.clone())),
+            ],
+            B256Map::default(),
+        );
+
+        let changesets = compute_trie_changesets(&factory, &updates).unwrap();
+
+        assert_eq!(changesets.account_nodes_ref().len(), 3);
+        assert_eq!(changesets.account_nodes_ref()[0], (path1, Some(node1)));
+        assert_eq!(changesets.account_nodes_ref()[1], (missing_path, None));
+        assert_eq!(changesets.account_nodes_ref()[2], (path2, Some(node2)));
     }
 
     #[test]
