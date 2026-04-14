@@ -167,6 +167,18 @@ where
     fn wait_for_caches(&self) -> CacheWaitDurations {
         debug!(target: "engine::tree::payload_processor", "Waiting for execution cache and sparse trie locks");
 
+        // The common case is that both caches are already idle. Avoid spawning two short-lived
+        // blocking workers when we can confirm that immediately.
+        if let (Some(execution_cache_duration), Some(sparse_trie_duration)) = (
+            self.execution_cache.try_wait_for_availability(),
+            self.sparse_state_trie.try_wait_for_availability(),
+        ) {
+            return CacheWaitDurations {
+                execution_cache: execution_cache_duration,
+                sparse_trie: sparse_trie_duration,
+            }
+        }
+
         // Wait for both caches in parallel using std threads
         let execution_cache = self.execution_cache.clone();
         let sparse_trie = self.sparse_state_trie.clone();
