@@ -25,7 +25,7 @@ pub trait TrieKeyAdapter: Clone + Send + Sync + 'static {
 
     /// The subkey type for storage trie `DupSort` lookups
     /// (e.g., `StoredNibblesSubKey` or `PackedStoredNibblesSubKey`).
-    type StorageSubKey: Key + From<Nibbles> + Clone + PartialEq;
+    type StorageSubKey: Key + From<Nibbles> + Clone + Ord;
 
     /// The storage trie entry type that pairs a subkey with a `BranchNodeCompact`.
     type StorageValue: Value + StorageTrieEntryLike<SubKey = Self::StorageSubKey>;
@@ -276,6 +276,39 @@ where
         + DbDupCursorRO<A::StorageTrieTable>
         + DbDupCursorRW<A::StorageTrieTable>,
 {
+    fn advance_to_subkey(
+        &mut self,
+        current: &mut Option<A::StorageValue>,
+        initialized: &mut bool,
+        subkey: &A::StorageSubKey,
+    ) -> Result<(), DatabaseError> {
+        if !*initialized {
+            *current = self.cursor.seek_by_key_subkey(self.hashed_address, subkey.clone())?;
+            *initialized = true;
+            return Ok(());
+        }
+
+        while current.as_ref().is_some_and(|entry| entry.nibbles() < subkey) {
+            *current = self.cursor.next_dup()?.map(|(_, value)| value);
+        }
+
+        Ok(())
+    }
+
+    fn refresh_current_at_or_after(
+        &mut self,
+        subkey: &A::StorageSubKey,
+    ) -> Result<Option<A::StorageValue>, DatabaseError> {
+        if let Some((key, value)) = self.cursor.current()? &&
+            key == self.hashed_address &&
+            value.nibbles() >= subkey
+        {
+            return Ok(Some(value))
+        }
+
+        self.cursor.seek_by_key_subkey(self.hashed_address, subkey.clone())
+    }
+
     /// Writes storage updates that are already sorted
     pub fn write_storage_trie_updates_sorted(
         &mut self,
@@ -287,24 +320,28 @@ where
         }
 
         let mut num_entries = 0;
+        let mut current = None;
+        let mut initialized = false;
         for (nibbles, maybe_updated) in updates.storage_nodes.iter().filter(|(n, _)| !n.is_empty())
         {
             num_entries += 1;
             let nibbles = A::StorageSubKey::from(*nibbles);
+
+            self.advance_to_subkey(&mut current, &mut initialized, &nibbles)?;
+
             // Delete the old entry if it exists.
-            if self
-                .cursor
-                .seek_by_key_subkey(self.hashed_address, nibbles.clone())?
-                .as_ref()
-                .is_some_and(|e| *e.nibbles() == nibbles)
-            {
+            if current.as_ref().is_some_and(|entry| entry.nibbles() == &nibbles) {
                 self.cursor.delete_current()?;
+                current = self.refresh_current_at_or_after(&nibbles)?;
             }
 
             // There is an updated version of this node, insert new entry.
             if let Some(node) = maybe_updated {
-                self.cursor
-                    .upsert(self.hashed_address, &A::StorageValue::new(nibbles, node.clone()))?;
+                self.cursor.upsert(
+                    self.hashed_address,
+                    &A::StorageValue::new(nibbles.clone(), node.clone()),
+                )?;
+                current = self.refresh_current_at_or_after(&nibbles)?;
             }
         }
 
@@ -376,6 +413,7 @@ mod tests {
     use alloy_primitives::hex_literal::hex;
     use reth_db_api::{cursor::DbCursorRW, transaction::DbTxMut};
     use reth_provider::test_utils::create_test_provider_factory;
+    use reth_trie::updates::StorageTrieUpdatesSorted;
 
     #[test]
     fn test_account_trie_order() {
@@ -440,5 +478,70 @@ mod tests {
             let mut cursor = trie_factory.storage_trie_cursor(hashed_address).unwrap();
             assert_eq!(cursor.seek(key.into()).unwrap().unwrap().1, value);
         });
+    }
+
+    #[test]
+    fn test_storage_cursor_sorted_writes_walk_forward() {
+        let factory = create_test_provider_factory();
+        let provider = factory.provider_rw().unwrap();
+        let hashed_address = B256::random();
+
+        let mut initial = provider.tx_ref().cursor_dup_write::<tables::StoragesTrie>().unwrap();
+        initial
+            .upsert(
+                hashed_address,
+                &StorageTrieEntry {
+                    nibbles: StoredNibblesSubKey::from(Nibbles::from_nibbles([0x1])),
+                    node: BranchNodeCompact::new(0b0001, 0b0001, 0, vec![], None),
+                },
+            )
+            .unwrap();
+        initial
+            .upsert(
+                hashed_address,
+                &StorageTrieEntry {
+                    nibbles: StoredNibblesSubKey::from(Nibbles::from_nibbles([0x3])),
+                    node: BranchNodeCompact::new(0b0011, 0b0011, 0, vec![], None),
+                },
+            )
+            .unwrap();
+
+        let updates = StorageTrieUpdatesSorted {
+            is_deleted: false,
+            storage_nodes: vec![
+                (
+                    Nibbles::from_nibbles([0x1]),
+                    Some(BranchNodeCompact::new(0b1111, 0b1111, 0, vec![], None)),
+                ),
+                (
+                    Nibbles::from_nibbles([0x2]),
+                    Some(BranchNodeCompact::new(0b0010, 0b0010, 0, vec![], None)),
+                ),
+                (Nibbles::from_nibbles([0x3]), None),
+                (
+                    Nibbles::from_nibbles([0x4]),
+                    Some(BranchNodeCompact::new(0b0100, 0b0100, 0, vec![], None)),
+                ),
+            ],
+        };
+
+        let mut cursor = DatabaseStorageTrieCursor::<_, LegacyKeyAdapter>::new(
+            provider.tx_ref().cursor_dup_write::<tables::StoragesTrie>().unwrap(),
+            hashed_address,
+        );
+        cursor.write_storage_trie_updates_sorted(&updates).unwrap();
+
+        let mut read_cursor = provider.tx_ref().cursor_dup_read::<tables::StoragesTrie>().unwrap();
+        let entries = read_cursor
+            .walk_dup(Some(hashed_address), None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].1.nibbles.0, Nibbles::from_nibbles([0x1]));
+        assert_eq!(entries[0].1.node, BranchNodeCompact::new(0b1111, 0b1111, 0, vec![], None));
+        assert_eq!(entries[1].1.nibbles.0, Nibbles::from_nibbles([0x2]));
+        assert_eq!(entries[2].1.nibbles.0, Nibbles::from_nibbles([0x4]));
     }
 }
