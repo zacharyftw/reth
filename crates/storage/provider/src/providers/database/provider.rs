@@ -27,7 +27,7 @@ use alloy_consensus::{
 use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{
     keccak256,
-    map::{hash_map, AddressSet, B256Map, HashMap},
+    map::{hash_map, AddressSet, B256Map, B256Set, HashMap, HashSet},
     Address, BlockHash, BlockNumber, TxHash, TxNumber, B256,
 };
 use itertools::Itertools;
@@ -67,7 +67,7 @@ use reth_storage_api::{
 use reth_storage_errors::provider::{ProviderResult, StaticFileWriterError};
 use reth_trie::{
     updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
-    HashedPostStateSorted,
+    HashedPostStateSorted, Nibbles,
 };
 use reth_trie_db::{ChangesetCache, DatabaseStorageTrieCursor, TrieTableAdapter};
 use revm_database::states::{
@@ -559,6 +559,10 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
     /// The SF thread writes headers, transactions, senders (if SF), and receipts (if SF, Full mode
     /// only). The main thread writes MDBX data (indices, state, trie - Full mode only).
     ///
+    /// When `buffer_blocks` is non-empty, hashed state and trie updates for keys that also
+    /// appear in the buffer blocks are skipped. Those keys will be overwritten when the buffer
+    /// blocks are persisted in a future cycle, so writing them now is wasted I/O.
+    ///
     /// Use [`SaveBlocksMode::Full`] for production (includes receipts, state, trie).
     /// Use [`SaveBlocksMode::BlocksOnly`] for block structure only (used by `insert_block`).
     #[instrument(level = "debug", target = "providers::db", skip_all, fields(block_count = blocks.len()))]
@@ -566,6 +570,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         &self,
         blocks: Vec<ExecutedBlock<N::Primitives>>,
         save_mode: SaveBlocksMode,
+        buffer_blocks: &[ExecutedBlock<N::Primitives>],
     ) -> ProviderResult<()> {
         if blocks.is_empty() {
             debug!(target: "providers::db", "Attempted to write empty block range");
@@ -710,19 +715,42 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             // Write all hashed state and trie updates in single batches.
             // This reduces cursor open/close overhead from N calls to 1.
             if save_mode.with_state() {
+                // Collect overwrite keys from buffer blocks so we can skip writing
+                // hashed state / trie entries that will be overwritten when those
+                // blocks are persisted in a future cycle.
+                let (skip_accounts, skip_storages, skip_account_nodes, skip_storage_nodes) =
+                    Self::collect_buffer_overwrite_keys(buffer_blocks);
+
                 // Blocks are oldest-to-newest, merge_batch expects newest-to-oldest.
                 let start = Instant::now();
-                let merged_hashed_state = HashedPostStateSorted::merge_batch(
+                let merged: Arc<HashedPostStateSorted> = HashedPostStateSorted::merge_batch(
                     blocks.iter().rev().map(|b| b.trie_data().hashed_state),
                 );
+                let mut merged_hashed_state =
+                    Arc::try_unwrap(merged).unwrap_or_else(|arc| (*arc).clone());
+                if !skip_accounts.is_empty() || !skip_storages.is_empty() {
+                    Self::filter_hashed_state(
+                        &mut merged_hashed_state,
+                        &skip_accounts,
+                        &skip_storages,
+                    );
+                }
                 if !merged_hashed_state.is_empty() {
                     self.write_hashed_state(&merged_hashed_state)?;
                 }
                 timings.write_hashed_state += start.elapsed();
 
                 let start = Instant::now();
-                let merged_trie =
+                let merged: Arc<TrieUpdatesSorted> =
                     TrieUpdatesSorted::merge_batch(blocks.iter().rev().map(|b| b.trie_updates()));
+                let mut merged_trie = Arc::try_unwrap(merged).unwrap_or_else(|arc| (*arc).clone());
+                if !skip_account_nodes.is_empty() || !skip_storage_nodes.is_empty() {
+                    Self::filter_trie_updates(
+                        &mut merged_trie,
+                        &skip_account_nodes,
+                        &skip_storage_nodes,
+                    );
+                }
                 if !merged_trie.is_empty() {
                     self.write_trie_updates_sorted(&merged_trie)?;
                 }
@@ -763,6 +791,87 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         debug!(target: "providers::db", range = ?first_number..=last_block_number, "Appended block data");
 
         Ok(())
+    }
+
+    /// Collects the set of hashed-state and trie-update keys touched by `buffer_blocks`.
+    ///
+    /// Returns `(skip_accounts, skip_storages, skip_account_nodes, skip_storage_nodes)`:
+    /// - `skip_accounts`: hashed addresses whose account entry will be overwritten
+    /// - `skip_storages`: per-address set of hashed slots that will be overwritten
+    /// - `skip_account_nodes`: account-trie nibble paths that will be overwritten
+    /// - `skip_storage_nodes`: per-address set of storage-trie nibble paths that will be
+    ///   overwritten
+    fn collect_buffer_overwrite_keys(
+        buffer_blocks: &[ExecutedBlock<N::Primitives>],
+    ) -> (B256Set, B256Map<B256Set>, HashSet<Nibbles>, B256Map<HashSet<Nibbles>>) {
+        let mut skip_accounts = B256Set::default();
+        let mut skip_storages: B256Map<B256Set> = B256Map::default();
+        let mut skip_account_nodes: HashSet<Nibbles> = HashSet::default();
+        let mut skip_storage_nodes: B256Map<HashSet<Nibbles>> = B256Map::default();
+
+        for block in buffer_blocks {
+            let hashed_state = block.hashed_state();
+            for (hashed_address, _) in hashed_state.accounts() {
+                skip_accounts.insert(*hashed_address);
+            }
+            for (hashed_address, storage) in hashed_state.account_storages() {
+                let slots = skip_storages.entry(*hashed_address).or_default();
+                for (hashed_slot, _) in storage.storage_slots_ref() {
+                    slots.insert(*hashed_slot);
+                }
+            }
+
+            let trie = block.trie_updates();
+            for (nibbles, _) in trie.account_nodes_ref() {
+                skip_account_nodes.insert(nibbles.clone());
+            }
+            for (hashed_address, storage_trie) in trie.storage_tries_ref() {
+                let nodes = skip_storage_nodes.entry(*hashed_address).or_default();
+                for (nibbles, _) in storage_trie.storage_nodes_ref() {
+                    nodes.insert(nibbles.clone());
+                }
+            }
+        }
+
+        (skip_accounts, skip_storages, skip_account_nodes, skip_storage_nodes)
+    }
+
+    /// Removes entries from `hashed_state` whose keys appear in the skip sets.
+    fn filter_hashed_state(
+        hashed_state: &mut HashedPostStateSorted,
+        skip_accounts: &B256Set,
+        skip_storages: &B256Map<B256Set>,
+    ) {
+        hashed_state.accounts.retain(|(addr, _)| !skip_accounts.contains(addr));
+
+        for (addr, skip_slots) in skip_storages {
+            if let Some(storage) = hashed_state.storages.get_mut(addr) {
+                storage.storage_slots.retain(|(slot, _)| !skip_slots.contains(slot));
+            }
+        }
+        // Remove empty storage entries left after filtering.
+        hashed_state.storages.retain(|_, storage| !storage.is_empty() || storage.is_wiped());
+    }
+
+    /// Removes entries from `trie_updates` whose paths appear in the skip sets.
+    fn filter_trie_updates(
+        trie_updates: &mut TrieUpdatesSorted,
+        skip_account_nodes: &HashSet<Nibbles>,
+        skip_storage_nodes: &B256Map<HashSet<Nibbles>>,
+    ) {
+        trie_updates
+            .account_nodes_mut()
+            .retain(|(nibbles, _)| !skip_account_nodes.contains(nibbles));
+
+        for (addr, skip_nodes) in skip_storage_nodes {
+            if let Some(storage_trie) = trie_updates.storage_tries_mut().get_mut(addr) {
+                storage_trie.storage_nodes.retain(|(nibbles, _)| !skip_nodes.contains(nibbles));
+            }
+        }
+        // Remove empty storage tries left after filtering.
+        trie_updates
+            .storage_tries_mut()
+            .retain(|_, storage_trie| !storage_trie.is_empty() || storage_trie.is_deleted());
     }
 
     /// Writes MDBX-only data for a block (indices, lookups, and senders if configured for MDBX).
@@ -3490,7 +3599,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> BlockWriter
         );
 
         // Delegate to save_blocks with BlocksOnly mode (skips receipts/state/trie)
-        self.save_blocks(vec![executed_block], SaveBlocksMode::BlocksOnly)?;
+        self.save_blocks(vec![executed_block], SaveBlocksMode::BlocksOnly, &[])?;
 
         // Return the body indices
         self.block_body_indices(block_number)?
@@ -4997,7 +5106,7 @@ mod tests {
             ComputedTrieData::default(),
         );
         let provider_rw = factory.provider_rw().unwrap();
-        provider_rw.save_blocks(vec![genesis_executed], SaveBlocksMode::Full).unwrap();
+        provider_rw.save_blocks(vec![genesis_executed], SaveBlocksMode::Full, &[]).unwrap();
         provider_rw.commit().unwrap();
 
         let mut blocks: Vec<ExecutedBlock> = Vec::new();
@@ -5069,7 +5178,7 @@ mod tests {
         }
 
         let provider_rw = factory.provider_rw().unwrap();
-        provider_rw.save_blocks(blocks, SaveBlocksMode::Full).unwrap();
+        provider_rw.save_blocks(blocks, SaveBlocksMode::Full, &[]).unwrap();
         provider_rw.commit().unwrap();
 
         let provider = factory.provider().unwrap();

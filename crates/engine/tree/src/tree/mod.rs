@@ -2,7 +2,7 @@ use crate::{
     backfill::{BackfillAction, BackfillSyncState},
     chain::FromOrchestrator,
     engine::{DownloadRequest, EngineApiEvent, EngineApiKind, EngineApiRequest, FromEngine},
-    persistence::PersistenceHandle,
+    persistence::{PersistenceHandle, SaveBlocksBatch},
     tree::{error::InsertPayloadError, payload_validator::TreeCtx},
 };
 use alloy_consensus::BlockHeader;
@@ -1349,22 +1349,25 @@ where
 
     /// Helper method to save blocks and set the persistence state. This ensures we keep track of
     /// the current persistence action while we're saving blocks.
-    fn persist_blocks(&mut self, blocks_to_persist: Vec<ExecutedBlock<N>>) {
-        if blocks_to_persist.is_empty() {
+    fn persist_blocks(&mut self, batch: SaveBlocksBatch<N>) {
+        if batch.blocks.is_empty() {
             debug!(target: "engine::tree", "Returned empty set of blocks to persist");
             return
         }
 
-        // NOTE: checked non-empty above
-        let highest_num_hash = blocks_to_persist
+        // The highest block to be persisted determines the persistence state tracking.
+        // Use persist_count to find the highest block that will actually be written to disk.
+        let highest_num_hash = batch
+            .blocks
             .iter()
+            .take(batch.persist_count)
             .max_by_key(|block| block.recovered_block().number())
             .map(|b| b.recovered_block().num_hash())
             .expect("Checked non-empty persisting blocks");
 
-        debug!(target: "engine::tree", count=blocks_to_persist.len(), blocks = ?blocks_to_persist.iter().map(|block| block.recovered_block().num_hash()).collect::<Vec<_>>(), "Persisting blocks");
+        debug!(target: "engine::tree", count=batch.blocks.len(), persist_count=batch.persist_count, blocks = ?batch.blocks.iter().map(|block| block.recovered_block().num_hash()).collect::<Vec<_>>(), "Persisting blocks");
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let _ = self.persistence.save_blocks(blocks_to_persist, tx);
+        let _ = self.persistence.save_blocks(batch, tx);
 
         self.persistence_state.start_save(highest_num_hash, rx);
     }
@@ -1378,9 +1381,8 @@ where
             if let Some(new_tip_num) = self.find_disk_reorg()? {
                 self.remove_blocks(new_tip_num)
             } else if self.should_persist() {
-                let blocks_to_persist =
-                    self.get_canonical_blocks_to_persist(PersistTarget::Threshold)?;
-                self.persist_blocks(blocks_to_persist);
+                let batch = self.get_canonical_blocks_to_persist(PersistTarget::Threshold)?;
+                self.persist_blocks(batch);
             }
         }
 
@@ -1411,15 +1413,15 @@ where
                 self.on_persistence_complete(result, start_time)?;
             }
 
-            let blocks_to_persist = self.get_canonical_blocks_to_persist(PersistTarget::Head)?;
+            let batch = self.get_canonical_blocks_to_persist(PersistTarget::Head)?;
 
-            if blocks_to_persist.is_empty() {
+            if batch.blocks.is_empty() {
                 debug!(target: "engine::tree", "persistence complete, signaling termination");
                 return Ok(())
             }
 
-            debug!(target: "engine::tree", count = blocks_to_persist.len(), "persisting remaining blocks before shutdown");
-            self.persist_blocks(blocks_to_persist);
+            debug!(target: "engine::tree", count = batch.blocks.len(), "persisting remaining blocks before shutdown");
+            self.persist_blocks(batch);
         }
     }
 
@@ -2018,16 +2020,20 @@ where
     }
 
     /// Returns a batch of consecutive canonical blocks to persist in the range
-    /// `(last_persisted_number .. target]`. The expected order is oldest -> newest.
+    /// `(last_persisted_number .. canonical_head]`. The expected order is oldest -> newest.
+    ///
+    /// All blocks above `last_persisted_number` are included in the batch, but only
+    /// those up to the persistence target (determined by [`PersistTarget`]) are marked
+    /// for actual persistence via [`SaveBlocksBatch::persist_count`].
     fn get_canonical_blocks_to_persist(
         &self,
         target: PersistTarget,
-    ) -> Result<Vec<ExecutedBlock<N>>, AdvancePersistenceError> {
+    ) -> Result<SaveBlocksBatch<N>, AdvancePersistenceError> {
         // We will calculate the state root using the database, so we need to be sure there are no
         // changes
         debug_assert!(!self.persistence_state.in_progress());
 
-        let mut blocks_to_persist = Vec::new();
+        let mut all_blocks = Vec::new();
         let mut current_hash = self.state.tree_state.canonical_block_hash();
         let last_persisted_number = self.persistence_state.last_persisted_block.number;
         let canonical_head_number = self.state.tree_state.canonical_block_number();
@@ -2052,17 +2058,18 @@ where
                 break;
             }
 
-            if block.recovered_block().number() <= target_number {
-                blocks_to_persist.push(block.clone());
-            }
-
+            all_blocks.push(block.clone());
             current_hash = block.recovered_block().parent_hash();
         }
 
         // Reverse the order so that the oldest block comes first
-        blocks_to_persist.reverse();
+        all_blocks.reverse();
 
-        Ok(blocks_to_persist)
+        // Only blocks up to target_number are persisted; the rest are buffer blocks
+        let persist_count =
+            all_blocks.iter().filter(|b| b.recovered_block().number() <= target_number).count();
+
+        Ok(SaveBlocksBatch { blocks: all_blocks, persist_count })
     }
 
     /// This clears the blocks from the in-memory tree state that have been persisted to the

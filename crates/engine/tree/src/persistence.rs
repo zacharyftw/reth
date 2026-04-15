@@ -102,8 +102,8 @@ where
                         self.sync_metrics_tx.send(MetricEvent::SyncHeight { height: new_tip_num });
                     let _ = sender.send(PersistenceResult { last_block, commit_duration: None });
                 }
-                PersistenceAction::SaveBlocks(blocks, sender) => {
-                    let result = self.on_save_blocks(blocks)?;
+                PersistenceAction::SaveBlocks(batch, sender) => {
+                    let result = self.on_save_blocks(batch)?;
                     let result_number = result.last_block.map(|b| b.number);
 
                     let _ = sender.send(result);
@@ -144,14 +144,18 @@ where
         Ok(new_tip_hash.map(|hash| BlockNumHash { hash, number: new_tip_num }))
     }
 
-    #[instrument(level = "debug", target = "engine::persistence", skip_all, fields(block_count = blocks.len()))]
+    #[instrument(level = "debug", target = "engine::persistence", skip_all, fields(block_count = batch.blocks.len()))]
     fn on_save_blocks(
         &mut self,
-        blocks: Vec<ExecutedBlock<N::Primitives>>,
+        batch: SaveBlocksBatch<N::Primitives>,
     ) -> Result<PersistenceResult, PersistenceError> {
-        let first_block = blocks.first().map(|b| b.recovered_block.num_hash());
-        let last_block = blocks.last().map(|b| b.recovered_block.num_hash());
-        let block_count = blocks.len();
+        let SaveBlocksBatch { blocks, persist_count } = batch;
+        let (blocks_to_persist, buffer_blocks) = blocks.split_at(persist_count);
+        let blocks_to_persist = blocks_to_persist.to_vec();
+
+        let first_block = blocks_to_persist.first().map(|b| b.recovered_block.num_hash());
+        let last_block = blocks_to_persist.last().map(|b| b.recovered_block.num_hash());
+        let block_count = blocks_to_persist.len();
 
         let pending_finalized = self.pending_finalized_block.take();
         let pending_safe = self.pending_safe_block.take();
@@ -162,7 +166,7 @@ where
 
         if let Some(last) = last_block {
             let provider_rw = self.provider.database_provider_rw()?;
-            provider_rw.save_blocks(blocks, SaveBlocksMode::Full)?;
+            provider_rw.save_blocks(blocks_to_persist, SaveBlocksMode::Full, buffer_blocks)?;
 
             if let Some(finalized) = pending_finalized {
                 provider_rw.save_finalized_block_number(finalized.min(last.number))?;
@@ -216,6 +220,28 @@ pub enum PersistenceError {
     ProviderError(#[from] ProviderError),
 }
 
+/// A batch of blocks passed to the persistence service.
+///
+/// Contains all canonical blocks collected during a persistence cycle. Only the first
+/// `persist_count` blocks are written to disk; the remaining blocks are included for
+/// downstream consumers but are not persisted yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SaveBlocksBatch<N: NodePrimitives = EthPrimitives> {
+    /// All blocks in the batch, ordered oldest to newest.
+    pub blocks: Vec<ExecutedBlock<N>>,
+    /// Number of leading blocks to actually persist. The blocks at indices
+    /// `[persist_count..]` are passed through but not written to storage.
+    pub persist_count: usize,
+}
+
+impl<N: NodePrimitives> SaveBlocksBatch<N> {
+    /// Creates a new batch where all blocks should be persisted.
+    pub fn persist_all(blocks: Vec<ExecutedBlock<N>>) -> Self {
+        let persist_count = blocks.len();
+        Self { blocks, persist_count }
+    }
+}
+
 /// A signal to the persistence service that part of the tree state can be persisted.
 #[derive(Debug)]
 pub enum PersistenceAction<N: NodePrimitives = EthPrimitives> {
@@ -224,7 +250,7 @@ pub enum PersistenceAction<N: NodePrimitives = EthPrimitives> {
     ///
     /// First, header, transaction, and receipt-related data should be written to static files.
     /// Then the execution history-related data will be written to the database.
-    SaveBlocks(Vec<ExecutedBlock<N>>, CrossbeamSender<PersistenceResult>),
+    SaveBlocks(SaveBlocksBatch<N>, CrossbeamSender<PersistenceResult>),
 
     /// Removes block data above the given block number from the database.
     ///
@@ -308,10 +334,10 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
     /// If there are no blocks to persist, then `None` is sent in the sender.
     pub fn save_blocks(
         &self,
-        blocks: Vec<ExecutedBlock<T>>,
+        batch: SaveBlocksBatch<T>,
         tx: CrossbeamSender<PersistenceResult>,
     ) -> Result<(), SendError<PersistenceAction<T>>> {
-        self.send_action(PersistenceAction::SaveBlocks(blocks, tx))
+        self.send_action(PersistenceAction::SaveBlocks(batch, tx))
     }
 
     /// Queues the finalized block number to be persisted on disk.
@@ -407,7 +433,7 @@ mod tests {
         let blocks = vec![];
         let (tx, rx) = crossbeam_channel::bounded(1);
 
-        handle.save_blocks(blocks, tx).unwrap();
+        handle.save_blocks(SaveBlocksBatch::persist_all(blocks), tx).unwrap();
 
         let result = rx.recv().unwrap();
         assert!(result.last_block.is_none());
@@ -426,7 +452,7 @@ mod tests {
         let blocks = vec![executed];
         let (tx, rx) = crossbeam_channel::bounded(1);
 
-        handle.save_blocks(blocks, tx).unwrap();
+        handle.save_blocks(SaveBlocksBatch::persist_all(blocks), tx).unwrap();
 
         let result = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("test timed out");
 
@@ -443,7 +469,7 @@ mod tests {
         let last_hash = blocks.last().unwrap().recovered_block().hash();
         let (tx, rx) = crossbeam_channel::bounded(1);
 
-        handle.save_blocks(blocks, tx).unwrap();
+        handle.save_blocks(SaveBlocksBatch::persist_all(blocks), tx).unwrap();
         let result = rx.recv().unwrap();
         assert_eq!(last_hash, result.last_block.unwrap().hash);
     }
@@ -460,7 +486,7 @@ mod tests {
             let last_hash = blocks.last().unwrap().recovered_block().hash();
             let (tx, rx) = crossbeam_channel::bounded(1);
 
-            handle.save_blocks(blocks, tx).unwrap();
+            handle.save_blocks(SaveBlocksBatch::persist_all(blocks), tx).unwrap();
 
             let result = rx.recv().unwrap();
             assert_eq!(last_hash, result.last_block.unwrap().hash);
@@ -555,7 +581,7 @@ mod tests {
 
         {
             let provider_rw = provider_factory.database_provider_rw().unwrap();
-            provider_rw.save_blocks(blocks_a, SaveBlocksMode::Full).unwrap();
+            provider_rw.save_blocks(blocks_a, SaveBlocksMode::Full, &[]).unwrap();
             provider_rw.commit().unwrap();
         }
 
@@ -612,7 +638,7 @@ mod tests {
             provider_rw.commit().unwrap();
 
             let provider_rw = pf.database_provider_rw().unwrap();
-            provider_rw.save_blocks(vec![block_b2], SaveBlocksMode::Full).unwrap();
+            provider_rw.save_blocks(vec![block_b2], SaveBlocksMode::Full, &[]).unwrap();
             provider_rw.commit().unwrap();
         });
 

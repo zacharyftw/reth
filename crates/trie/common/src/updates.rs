@@ -589,9 +589,19 @@ impl TrieUpdatesSorted {
         &self.account_nodes
     }
 
+    /// Returns mutable reference to updated account nodes.
+    pub fn account_nodes_mut(&mut self) -> &mut Vec<(Nibbles, Option<BranchNodeCompact>)> {
+        &mut self.account_nodes
+    }
+
     /// Returns reference to updated storage tries.
     pub const fn storage_tries_ref(&self) -> &B256Map<StorageTrieUpdatesSorted> {
         &self.storage_tries
+    }
+
+    /// Returns mutable reference to updated storage tries.
+    pub fn storage_tries_mut(&mut self) -> &mut B256Map<StorageTrieUpdatesSorted> {
+        &mut self.storage_tries
     }
 
     /// Returns the total number of updates including account nodes and all storage updates.
