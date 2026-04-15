@@ -1994,7 +1994,7 @@ impl<'a> RocksDBBatch<'a> {
     #[expect(clippy::too_many_arguments)]
     fn prune_history_shards_inner<K>(
         &mut self,
-        shards: Vec<(K, BlockNumberList)>,
+        shards: Vec<(K, Option<BlockNumberList>)>,
         to_block: BlockNumber,
         get_highest: impl Fn(&K) -> u64,
         is_sentinel: impl Fn(&K) -> bool,
@@ -2014,10 +2014,11 @@ impl<'a> RocksDBBatch<'a> {
         let mut last_remaining: Option<(K, BlockNumberList)> = None;
 
         for (key, block_list) in shards {
-            if !is_sentinel(&key) && get_highest(&key) <= to_block {
+            if block_list.is_none() || (!is_sentinel(&key) && get_highest(&key) <= to_block) {
                 delete_shard(self, key)?;
                 deleted = true;
             } else {
+                let block_list = block_list.expect("missing block list handled above");
                 let original_len = block_list.len();
                 let filtered =
                     BlockNumberList::new_pre_sorted(block_list.iter().filter(|&b| b > to_block));
@@ -2061,7 +2062,12 @@ impl<'a> RocksDBBatch<'a> {
         address: Address,
         to_block: BlockNumber,
     ) -> ProviderResult<PruneShardOutcome> {
-        let shards = self.provider.account_history_shards(address)?;
+        let shards = self
+            .provider
+            .account_history_shards(address)?
+            .into_iter()
+            .map(|(key, value)| (key, Some(value)))
+            .collect();
         self.prune_history_shards_inner(
             shards,
             to_block,
@@ -2150,11 +2156,15 @@ impl<'a> RocksDBBatch<'a> {
                 let key = ShardedKey::<Address>::decode(key_bytes)
                     .map_err(|_| ProviderError::Database(DatabaseError::Decode))?;
 
-                let Some(value_bytes) = iter.value() else { break };
-                let value = BlockNumberList::decompress(value_bytes)
-                    .map_err(|_| ProviderError::Database(DatabaseError::Decode))?;
+                if key.highest_block_number <= *to_block && key.highest_block_number != u64::MAX {
+                    shards.push((key, None));
+                } else {
+                    let Some(value_bytes) = iter.value() else { break };
+                    let value = BlockNumberList::decompress(value_bytes)
+                        .map_err(|_| ProviderError::Database(DatabaseError::Decode))?;
+                    shards.push((key, Some(value)));
+                }
 
-                shards.push((key, value));
                 iter.next();
             }
 
@@ -2187,7 +2197,12 @@ impl<'a> RocksDBBatch<'a> {
         storage_key: B256,
         to_block: BlockNumber,
     ) -> ProviderResult<PruneShardOutcome> {
-        let shards = self.provider.storage_history_shards(address, storage_key)?;
+        let shards = self
+            .provider
+            .storage_history_shards(address, storage_key)?
+            .into_iter()
+            .map(|(key, value)| (key, Some(value)))
+            .collect();
         self.prune_history_shards_inner(
             shards,
             to_block,
@@ -2277,11 +2292,17 @@ impl<'a> RocksDBBatch<'a> {
                 let key = StorageShardedKey::decode(key_bytes)
                     .map_err(|_| ProviderError::Database(DatabaseError::Decode))?;
 
-                let Some(value_bytes) = iter.value() else { break };
-                let value = BlockNumberList::decompress(value_bytes)
-                    .map_err(|_| ProviderError::Database(DatabaseError::Decode))?;
+                if key.sharded_key.highest_block_number <= *to_block &&
+                    key.sharded_key.highest_block_number != u64::MAX
+                {
+                    shards.push((key, None));
+                } else {
+                    let Some(value_bytes) = iter.value() else { break };
+                    let value = BlockNumberList::decompress(value_bytes)
+                        .map_err(|_| ProviderError::Database(DatabaseError::Decode))?;
+                    shards.push((key, Some(value)));
+                }
 
-                shards.push((key, value));
                 iter.next();
             }
 
