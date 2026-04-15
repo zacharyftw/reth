@@ -291,17 +291,22 @@ where
         {
             num_entries += 1;
             let nibbles = A::StorageSubKey::from(*nibbles);
-            // Delete the old entry if it exists.
-            if self
-                .cursor
-                .seek_by_key_subkey(self.hashed_address, nibbles.clone())?
-                .as_ref()
-                .is_some_and(|e| *e.nibbles() == nibbles)
-            {
-                self.cursor.delete_current()?;
+            let existing = self.cursor.seek_by_key_subkey(self.hashed_address, nibbles.clone())?;
+
+            if let Some(existing) = existing.as_ref().filter(|entry| *entry.nibbles() == nibbles) {
+                match maybe_updated {
+                    Some(node) if existing.node() == node => continue,
+                    Some(node) => {
+                        self.cursor.put_current(
+                            self.hashed_address,
+                            &A::StorageValue::new(nibbles, node.clone()),
+                        )?;
+                    }
+                    None => self.cursor.delete_current()?,
+                }
+                continue;
             }
 
-            // There is an updated version of this node, insert new entry.
             if let Some(node) = maybe_updated {
                 self.cursor
                     .upsert(self.hashed_address, &A::StorageValue::new(nibbles, node.clone()))?;
@@ -439,6 +444,54 @@ mod tests {
             let trie_factory = DatabaseTrieCursorFactory::<_, A>::new(provider.tx_ref());
             let mut cursor = trie_factory.storage_trie_cursor(hashed_address).unwrap();
             assert_eq!(cursor.seek(key.into()).unwrap().unwrap().1, value);
+        });
+    }
+
+    #[test]
+    fn write_storage_trie_updates_replaces_exact_matches_in_place() {
+        use reth_storage_api::StorageSettingsCache;
+
+        let factory = create_test_provider_factory();
+        let provider = factory.provider_rw().unwrap();
+        let hashed_address = B256::random();
+        let key = Nibbles::from_nibbles([0x2, 0x3]);
+
+        let original = BranchNodeCompact::new(0b0011, 0b0001, 0, vec![], None);
+        let updated = BranchNodeCompact::new(0b0111, 0b0011, 0, vec![], None);
+
+        crate::with_adapter!(provider, |A| {
+            let mut raw = provider
+                .tx_ref()
+                .cursor_dup_write::<<A as TrieTableAdapter>::StorageTrieTable>()
+                .unwrap();
+            raw.upsert(
+                hashed_address,
+                &<<A as TrieKeyAdapter>::StorageValue as StorageTrieEntryLike>::new(
+                    <A as TrieKeyAdapter>::StorageSubKey::from(key),
+                    original.clone(),
+                ),
+            )
+            .unwrap();
+
+            let trie_factory = DatabaseTrieCursorFactory::<_, A>::new(provider.tx_ref());
+            let mut cursor = trie_factory.storage_trie_cursor(hashed_address).unwrap();
+            let updates = StorageTrieUpdatesSorted {
+                is_deleted: false,
+                storage_nodes: vec![(key, Some(updated.clone()))],
+            };
+            cursor.write_storage_trie_updates_sorted(&updates).unwrap();
+
+            let entries = provider
+                .tx_ref()
+                .cursor_dup_read::<<A as TrieTableAdapter>::StorageTrieTable>()
+                .unwrap()
+                .walk_dup(Some(hashed_address), None)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].1.node(), &updated);
         });
     }
 }
