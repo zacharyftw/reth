@@ -1312,14 +1312,14 @@ impl ArenaParallelSparseTrie {
             match &arena[current] {
                 ArenaSparseNode::EmptyRoot | ArenaSparseNode::TakenSubtrie => return None,
                 ArenaSparseNode::Leaf { key, value, .. } => {
-                    let remaining = full_path.slice(path_offset..);
-                    return (remaining == *key).then_some(value);
+                    return Self::path_matches_remaining(full_path, path_offset, key)
+                        .then_some(value);
                 }
                 ArenaSparseNode::Branch(b) => {
                     let short_key = &b.short_key;
                     let logical_end = path_offset + short_key.len();
                     if full_path.len() <= logical_end ||
-                        full_path.slice(path_offset..logical_end) != *short_key
+                        !Self::path_matches_segment(full_path, path_offset, short_key)
                     {
                         return None;
                     }
@@ -1362,8 +1362,7 @@ impl ArenaParallelSparseTrie {
                     return Ok(LeafLookup::NonExistent);
                 }
                 ArenaSparseNode::Leaf { key, value, .. } => {
-                    let remaining = full_path.slice(path_offset..);
-                    if remaining != *key {
+                    if !Self::path_matches_remaining(full_path, path_offset, key) {
                         return Ok(LeafLookup::NonExistent);
                     }
                     if let Some(expected) = expected_value &&
@@ -1385,7 +1384,7 @@ impl ArenaParallelSparseTrie {
                         return Ok(LeafLookup::NonExistent);
                     }
 
-                    if full_path.slice(path_offset..logical_end) != *short_key {
+                    if !Self::path_matches_segment(full_path, path_offset, short_key) {
                         return Ok(LeafLookup::NonExistent);
                     }
 
@@ -1420,6 +1419,22 @@ impl ArenaParallelSparseTrie {
                 }
             }
         }
+    }
+
+    fn path_matches_segment(full_path: &Nibbles, path_offset: usize, segment: &Nibbles) -> bool {
+        segment
+            .iter()
+            .enumerate()
+            .all(|(offset, nibble)| full_path.get_unchecked(path_offset + offset) == nibble)
+    }
+
+    fn path_matches_remaining(
+        full_path: &Nibbles,
+        path_offset: usize,
+        remaining: &Nibbles,
+    ) -> bool {
+        full_path.len() == path_offset + remaining.len() &&
+            Self::path_matches_segment(full_path, path_offset, remaining)
     }
 
     /// Encodes a leaf node's RLP and pushes it onto `rlp_node_buf`. If the leaf is already
