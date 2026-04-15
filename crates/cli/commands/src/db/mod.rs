@@ -236,17 +236,11 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
                 });
             }
             Subcommands::MigrateV2(command) => {
-                let Environment { provider_factory, config, .. } =
+                let Environment { provider_factory, .. } =
                     self.env.init::<N>(AccessRights::RW, ctx.task_executor.clone())?;
 
                 // Migrate changesets+receipts, clear tables, compact MDBX
                 command.execute::<N>(provider_factory).await?;
-
-                // Reopen DB after compaction swap and run pipeline to rebuild
-                let Environment { provider_factory, .. } =
-                    self.env.init::<N>(AccessRights::RW, ctx.task_executor.clone())?;
-
-                migrate_v2::Command::run_pipeline::<N>(provider_factory, &config).await?;
             }
         }
 

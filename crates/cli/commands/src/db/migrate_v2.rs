@@ -5,10 +5,7 @@
 //! state), compacts MDBX, then runs the pipeline to rebuild them.
 
 use crate::common::CliNodeTypes;
-use alloy_primitives::B256;
 use clap::Parser;
-use reth_config::Config;
-use reth_consensus::noop::NoopConsensus;
 use reth_db::{
     mdbx::{self, ffi},
     models::StorageBeforeTx,
@@ -21,8 +18,6 @@ use reth_db_api::{
     tables,
     transaction::{DbTx, DbTxMut},
 };
-use reth_downloaders::{bodies::noop::NoopBodiesDownloader, headers::noop::NoopHeaderDownloader};
-use reth_evm::noop::NoopEvmConfig;
 use reth_node_builder::NodeTypesWithDBAdapter;
 use reth_provider::{
     providers::ProviderNodeTypes, DBProvider, DatabaseProviderFactory, MetadataProvider,
@@ -30,13 +25,9 @@ use reth_provider::{
     StaticFileProviderFactory, StaticFileWriter, StorageSettings,
 };
 use reth_prune_types::PruneSegment;
-use reth_stages::{sets::DefaultStages, Pipeline};
 use reth_stages_types::{StageCheckpoint, StageId};
-use reth_static_file::StaticFileProducer;
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::StageCheckpointReader;
-use std::sync::Arc;
-use tokio::sync::watch;
 use tracing::info;
 
 /// `reth db migrate-v2` command
@@ -50,7 +41,6 @@ impl Command {
     /// 2. Flip `StorageSettings` to v2
     /// 3. Clear recomputable MDBX tables + reset stage checkpoints
     /// 4. Compact MDBX
-    /// 5. Run pipeline to rebuild senders, indices, and trie
     pub async fn execute<N: CliNodeTypes>(
         self,
         provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, DatabaseEnv>>,
@@ -89,7 +79,6 @@ impl Command {
         }
 
         drop(provider);
-        info!(target: "reth::cli", "Preflight checks passed");
 
         // === Phase 1: Migrate changesets → static files ===
         Self::migrate_account_changesets(&provider_factory, tip)?;
@@ -124,53 +113,7 @@ impl Command {
         // The caller will reopen the environment and run the pipeline.
         // We return here — the pipeline step is handled in mod.rs after
         // reopening the database with the compacted copy.
-        info!(target: "reth::cli", "Migration data phases complete");
-        Ok(())
-    }
-
-    /// Builds and runs the pipeline to rebuild cleared tables.
-    ///
-    /// Must be called after the database has been compacted and reopened.
-    pub async fn run_pipeline<N: CliNodeTypes>(
-        provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, DatabaseEnv>>,
-        config: &Config,
-    ) -> eyre::Result<()>
-    where
-        N::Primitives: reth_primitives_traits::NodePrimitives<
-            Receipt: reth_db_api::table::Value + reth_codecs::Compact,
-        >,
-    {
-        let tip = provider_factory
-            .provider()?
-            .get_stage_checkpoint(StageId::Execution)?
-            .map(|c| c.block_number)
-            .unwrap_or(0);
-
-        info!(target: "reth::cli", tip, "Running pipeline to rebuild tables");
-
-        let (_tip_tx, tip_rx) = watch::channel(B256::ZERO);
-
-        let mut pipeline = Pipeline::<NodeTypesWithDBAdapter<N, DatabaseEnv>>::builder()
-            .with_max_block(tip)
-            .add_stages(DefaultStages::new(
-                provider_factory.clone(),
-                tip_rx,
-                Arc::new(NoopConsensus::default()),
-                NoopHeaderDownloader::default(),
-                NoopBodiesDownloader::default(),
-                NoopEvmConfig::<N::Evm>::default(),
-                config.stages.clone(),
-                config.prune.segments.clone(),
-                None,
-            ))
-            .build(
-                provider_factory.clone(),
-                StaticFileProducer::new(provider_factory, config.prune.segments.clone()),
-            );
-
-        pipeline.run().await?;
-
-        info!(target: "reth::cli", "Pipeline finished");
+        info!(target: "reth::cli", "Migration complete. You should now restart the node and let it run the pipeline to rebuild the remaining data.");
         Ok(())
     }
 
