@@ -112,6 +112,15 @@ impl DatabaseEnvMetrics {
         }
     }
 
+    /// Returns the cached metric handles for the given table operation, if metrics are enabled.
+    pub(crate) fn operation_metrics(
+        &self,
+        table: &'static str,
+        operation: Operation,
+    ) -> Option<OperationMetrics> {
+        self.operations.get(&(table, operation)).cloned()
+    }
+
     /// Record metrics for opening a database transaction.
     pub(crate) fn record_opened_transaction(&self, mode: TransactionMode) {
         self.transactions

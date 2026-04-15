@@ -2,7 +2,7 @@
 
 use super::utils::*;
 use crate::{
-    metrics::{DatabaseEnvMetrics, Operation},
+    metrics::{DatabaseEnvMetrics, Operation, OperationMetrics},
     DatabaseError,
 };
 use reth_db_api::{
@@ -29,18 +29,62 @@ pub struct Cursor<K: TransactionKind, T: Table> {
     pub(crate) inner: reth_libmdbx::Cursor<K>,
     /// Cache buffer that receives compressed values.
     buf: Vec<u8>,
-    /// Reference to metric handles in the DB environment. If `None`, metrics are not recorded.
-    metrics: Option<Arc<DatabaseEnvMetrics>>,
+    /// Pre-bound metric handles for cursor write operations. If `None`, metrics are not recorded.
+    metrics: Option<CursorWriteMetrics>,
     /// Phantom data to enforce encoding/decoding.
     _dbi: PhantomData<T>,
 }
 
+#[derive(Debug)]
+struct CursorWriteMetrics {
+    upsert: OperationMetrics,
+    insert: OperationMetrics,
+    append: OperationMetrics,
+    append_dup: OperationMetrics,
+    delete_current: OperationMetrics,
+    delete_current_duplicates: OperationMetrics,
+}
+
+impl CursorWriteMetrics {
+    fn new<T: Table>(metrics: &DatabaseEnvMetrics) -> Option<Self> {
+        Some(Self {
+            upsert: metrics.operation_metrics(T::NAME, Operation::CursorUpsert)?,
+            insert: metrics.operation_metrics(T::NAME, Operation::CursorInsert)?,
+            append: metrics.operation_metrics(T::NAME, Operation::CursorAppend)?,
+            append_dup: metrics.operation_metrics(T::NAME, Operation::CursorAppendDup)?,
+            delete_current: metrics.operation_metrics(T::NAME, Operation::CursorDeleteCurrent)?,
+            delete_current_duplicates: metrics
+                .operation_metrics(T::NAME, Operation::CursorDeleteCurrentDuplicates)?,
+        })
+    }
+
+    fn for_operation(&self, operation: Operation) -> &OperationMetrics {
+        match operation {
+            Operation::CursorUpsert => &self.upsert,
+            Operation::CursorInsert => &self.insert,
+            Operation::CursorAppend => &self.append,
+            Operation::CursorAppendDup => &self.append_dup,
+            Operation::CursorDeleteCurrent => &self.delete_current,
+            Operation::CursorDeleteCurrentDuplicates => &self.delete_current_duplicates,
+            _ => unreachable!("cursor metrics only support write operations"),
+        }
+    }
+}
+
 impl<K: TransactionKind, T: Table> Cursor<K, T> {
-    pub(crate) const fn new_with_metrics(
+    pub(crate) fn new_with_metrics(
         inner: reth_libmdbx::Cursor<K>,
         metrics: Option<Arc<DatabaseEnvMetrics>>,
     ) -> Self {
-        Self { inner, buf: Vec::new(), metrics, _dbi: PhantomData }
+        Self {
+            inner,
+            buf: Vec::new(),
+            metrics: match metrics {
+                Some(metrics) => CursorWriteMetrics::new::<T>(&metrics),
+                None => None,
+            },
+            _dbi: PhantomData,
+        }
     }
 
     /// If `self.metrics` is `Some(...)`, record a metric with the provided operation and value
@@ -53,8 +97,8 @@ impl<K: TransactionKind, T: Table> Cursor<K, T> {
         value_size: Option<usize>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        if let Some(metrics) = self.metrics.clone() {
-            metrics.record_operation(T::NAME, operation, value_size, || f(self))
+        if let Some(metrics) = self.metrics.as_ref().map(|m| m.for_operation(operation).clone()) {
+            metrics.record(value_size, || f(self))
         } else {
             f(self)
         }
