@@ -19,6 +19,7 @@ use reth_trie::{
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
 use std::{
+    cell::Cell,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -105,6 +106,9 @@ pub struct CachedStateProvider<S, const PREWARM: bool = false> {
     /// Optional cache statistics for detailed block logging. Only tracked when slow block
     /// threshold is configured.
     cache_stats: Option<Arc<CacheStats>>,
+
+    /// Per-provider hit/miss counters accumulated off the hot path and flushed on drop.
+    local_stats: LocalCacheStats,
 }
 
 impl<S> CachedStateProvider<S> {
@@ -115,7 +119,13 @@ impl<S> CachedStateProvider<S> {
         caches: ExecutionCache,
         metrics: CachedStateMetrics,
     ) -> Self {
-        Self { state_provider, caches, metrics, cache_stats: None }
+        Self {
+            state_provider,
+            caches,
+            metrics,
+            cache_stats: None,
+            local_stats: LocalCacheStats::new(),
+        }
     }
 }
 
@@ -126,7 +136,13 @@ impl<S> CachedStateProvider<S, true> {
         caches: ExecutionCache,
         metrics: CachedStateMetrics,
     ) -> Self {
-        Self { state_provider, caches, metrics, cache_stats: None }
+        Self {
+            state_provider,
+            caches,
+            metrics,
+            cache_stats: None,
+            local_stats: LocalCacheStats::new(),
+        }
     }
 }
 
@@ -138,6 +154,12 @@ impl<S, const PREWARM: bool> CachedStateProvider<S, PREWARM> {
     }
 }
 
+impl<S, const PREWARM: bool> Drop for CachedStateProvider<S, PREWARM> {
+    fn drop(&mut self) {
+        self.local_stats.flush((!PREWARM).then_some(&self.metrics), self.cache_stats.as_deref());
+    }
+}
+
 /// Represents the status of a key in the cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CachedStatus<T> {
@@ -145,6 +167,106 @@ pub enum CachedStatus<T> {
     NotCached(T),
     /// The key exists in cache and has a specific value.
     Cached(T),
+}
+
+#[derive(Debug, Default)]
+struct LocalCacheStats {
+    account_hits: Cell<u64>,
+    account_misses: Cell<u64>,
+    storage_hits: Cell<u64>,
+    storage_misses: Cell<u64>,
+    code_hits: Cell<u64>,
+    code_misses: Cell<u64>,
+}
+
+impl LocalCacheStats {
+    const fn new() -> Self {
+        Self {
+            account_hits: Cell::new(0),
+            account_misses: Cell::new(0),
+            storage_hits: Cell::new(0),
+            storage_misses: Cell::new(0),
+            code_hits: Cell::new(0),
+            code_misses: Cell::new(0),
+        }
+    }
+
+    fn record_account_hit(&self) {
+        self.account_hits.set(self.account_hits.get() + 1);
+    }
+
+    fn record_account_miss(&self) {
+        self.account_misses.set(self.account_misses.get() + 1);
+    }
+
+    fn record_storage_hit(&self) {
+        self.storage_hits.set(self.storage_hits.get() + 1);
+    }
+
+    fn record_storage_miss(&self) {
+        self.storage_misses.set(self.storage_misses.get() + 1);
+    }
+
+    fn record_code_hit(&self) {
+        self.code_hits.set(self.code_hits.get() + 1);
+    }
+
+    fn record_code_miss(&self) {
+        self.code_misses.set(self.code_misses.get() + 1);
+    }
+
+    fn flush(&self, metrics: Option<&CachedStateMetrics>, cache_stats: Option<&CacheStats>) {
+        self.flush_metric_pair(
+            &self.account_hits,
+            metrics.map(|m| &m.account_cache_hits),
+            cache_stats.map(|s| &s.account_hits),
+        );
+        self.flush_metric_pair(
+            &self.account_misses,
+            metrics.map(|m| &m.account_cache_misses),
+            cache_stats.map(|s| &s.account_misses),
+        );
+        self.flush_metric_pair(
+            &self.storage_hits,
+            metrics.map(|m| &m.storage_cache_hits),
+            cache_stats.map(|s| &s.storage_hits),
+        );
+        self.flush_metric_pair(
+            &self.storage_misses,
+            metrics.map(|m| &m.storage_cache_misses),
+            cache_stats.map(|s| &s.storage_misses),
+        );
+        self.flush_metric_pair(
+            &self.code_hits,
+            metrics.map(|m| &m.code_cache_hits),
+            cache_stats.map(|s| &s.code_hits),
+        );
+        self.flush_metric_pair(
+            &self.code_misses,
+            metrics.map(|m| &m.code_cache_misses),
+            cache_stats.map(|s| &s.code_misses),
+        );
+    }
+
+    fn flush_metric_pair(
+        &self,
+        local: &Cell<u64>,
+        metric: Option<&Gauge>,
+        stats: Option<&AtomicUsize>,
+    ) {
+        let value = local.replace(0);
+        if value == 0 {
+            return;
+        }
+
+        if let Some(metric) = metric {
+            metric.increment(value as f64);
+        }
+
+        if let Some(stats) = stats {
+            stats.fetch_add(value as usize, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Metrics for the cached state provider, showing hits / misses for each cache
@@ -412,29 +534,19 @@ impl<S: AccountReader, const PREWARM: bool> AccountReader for CachedStateProvide
             })? {
                 // During prewarm we only record stats (not prometheus metrics)
                 CachedStatus::NotCached(value) => {
-                    if let Some(stats) = &self.cache_stats {
-                        stats.record_account_miss();
-                    }
+                    self.local_stats.record_account_miss();
                     Ok(value)
                 }
                 CachedStatus::Cached(value) => {
-                    if let Some(stats) = &self.cache_stats {
-                        stats.record_account_hit();
-                    }
+                    self.local_stats.record_account_hit();
                     Ok(value)
                 }
             }
         } else if let Some(account) = self.caches.0.account_cache.get(address) {
-            self.metrics.account_cache_hits.increment(1);
-            if let Some(stats) = &self.cache_stats {
-                stats.record_account_hit();
-            }
+            self.local_stats.record_account_hit();
             Ok(account)
         } else {
-            self.metrics.account_cache_misses.increment(1);
-            if let Some(stats) = &self.cache_stats {
-                stats.record_account_miss();
-            }
+            self.local_stats.record_account_miss();
             self.state_provider.basic_account(address)
         }
     }
@@ -452,29 +564,19 @@ impl<S: StateProvider, const PREWARM: bool> StateProvider for CachedStateProvide
             })? {
                 // During prewarm we only record stats (not prometheus metrics)
                 CachedStatus::NotCached(value) => {
-                    if let Some(stats) = &self.cache_stats {
-                        stats.record_storage_miss();
-                    }
+                    self.local_stats.record_storage_miss();
                     Ok(Some(value).filter(|v| !v.is_zero()))
                 }
                 CachedStatus::Cached(value) => {
-                    if let Some(stats) = &self.cache_stats {
-                        stats.record_storage_hit();
-                    }
+                    self.local_stats.record_storage_hit();
                     Ok(Some(value).filter(|v| !v.is_zero()))
                 }
             }
         } else if let Some(value) = self.caches.0.storage_cache.get(&(account, storage_key)) {
-            self.metrics.storage_cache_hits.increment(1);
-            if let Some(stats) = &self.cache_stats {
-                stats.record_storage_hit();
-            }
+            self.local_stats.record_storage_hit();
             Ok(Some(value).filter(|v| !v.is_zero()))
         } else {
-            self.metrics.storage_cache_misses.increment(1);
-            if let Some(stats) = &self.cache_stats {
-                stats.record_storage_miss();
-            }
+            self.local_stats.record_storage_miss();
             self.state_provider.storage(account, storage_key)
         }
     }
@@ -488,29 +590,19 @@ impl<S: BytecodeReader, const PREWARM: bool> BytecodeReader for CachedStateProvi
             })? {
                 // During prewarm we only record stats (not prometheus metrics)
                 CachedStatus::NotCached(code) => {
-                    if let Some(stats) = &self.cache_stats {
-                        stats.record_code_miss();
-                    }
+                    self.local_stats.record_code_miss();
                     Ok(code)
                 }
                 CachedStatus::Cached(code) => {
-                    if let Some(stats) = &self.cache_stats {
-                        stats.record_code_hit();
-                    }
+                    self.local_stats.record_code_hit();
                     Ok(code)
                 }
             }
         } else if let Some(code) = self.caches.0.code_cache.get(code_hash) {
-            self.metrics.code_cache_hits.increment(1);
-            if let Some(stats) = &self.cache_stats {
-                stats.record_code_hit();
-            }
+            self.local_stats.record_code_hit();
             Ok(code)
         } else {
-            self.metrics.code_cache_misses.increment(1);
-            if let Some(stats) = &self.cache_stats {
-                stats.record_code_miss();
-            }
+            self.local_stats.record_code_miss();
             self.state_provider.bytecode_by_hash(code_hash)
         }
     }
@@ -1043,6 +1135,43 @@ mod tests {
         let res = state_provider.storage(address, storage_key);
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), Some(storage_value));
+    }
+
+    #[test]
+    fn test_cached_state_provider_flushes_cache_stats_on_drop() {
+        let address = Address::random();
+        let storage_key = StorageKey::random();
+        let storage_value = U256::from(1);
+        let account =
+            ExtendedAccount::new(0, U256::ZERO).extend_storage(vec![(storage_key, storage_value)]);
+
+        let provider = MockEthProvider::default();
+        provider.extend_accounts(vec![(address, account)]);
+
+        let cache_stats = Arc::new(CacheStats::default());
+
+        {
+            let caches = ExecutionCache::new(1000);
+            caches.insert_account(address, Some(Account::default()));
+
+            let state_provider =
+                CachedStateProvider::new(provider, caches, CachedStateMetrics::zeroed())
+                    .with_cache_stats(Some(cache_stats.clone()));
+
+            assert_eq!(state_provider.basic_account(&address).unwrap(), Some(Account::default()));
+            assert_eq!(state_provider.storage(address, storage_key).unwrap(), Some(storage_value));
+            assert_eq!(state_provider.storage(address, storage_key).unwrap(), Some(storage_value));
+
+            assert_eq!(cache_stats.account_hits(), 0);
+            assert_eq!(cache_stats.account_misses(), 0);
+            assert_eq!(cache_stats.storage_hits(), 0);
+            assert_eq!(cache_stats.storage_misses(), 0);
+        }
+
+        assert_eq!(cache_stats.account_hits(), 1);
+        assert_eq!(cache_stats.account_misses(), 0);
+        assert_eq!(cache_stats.storage_hits(), 0);
+        assert_eq!(cache_stats.storage_misses(), 2);
     }
 
     #[test]
