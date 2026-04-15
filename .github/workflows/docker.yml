@@ -62,10 +62,13 @@ jobs:
 
       - name: Determine build parameters
         id: params
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BUILD_TYPE: ${{ inputs.build_type }}
         run: |
           REGISTRY="ghcr.io/${{ github.repository_owner }}"
 
-          if [[ "${{ github.event_name }}" == "push" ]]; then
+          if [[ "${EVENT_NAME}" == "push" ]]; then
             VERSION="${GITHUB_REF#refs/tags/}"
             echo "targets=ethereum" >> "$GITHUB_OUTPUT"
 
@@ -83,7 +86,7 @@ jobs:
               echo "ethereum_set=ethereum.tags=${REGISTRY}/reth:${VERSION}" >> "$GITHUB_OUTPUT"
             fi
 
-          elif [[ "${{ github.event_name }}" == "schedule" ]] || [[ "${{ inputs.build_type }}" == "nightly" ]]; then
+          elif [[ "${EVENT_NAME}" == "schedule" ]] || [[ "${BUILD_TYPE}" == "nightly" ]]; then
             echo "targets=nightly" >> "$GITHUB_OUTPUT"
             echo "ethereum_tags=${REGISTRY}/reth:nightly" >> "$GITHUB_OUTPUT"
             echo "ethereum_set=ethereum.tags=${REGISTRY}/reth:nightly" >> "$GITHUB_OUTPUT"

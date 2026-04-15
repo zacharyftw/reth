@@ -109,8 +109,9 @@ jobs:
           DEREK_TOKEN: ${{ secrets.DEREK_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          INPUT_FORCE: ${{ inputs.force || 'false' }}
         run: |
-          FORCE="${{ inputs.force || 'false' }}"
+          FORCE="${INPUT_FORCE:-false}"
           MODE="${{ steps.mode.outputs.mode }}"
           .github/scripts/bench-scheduled-refs.sh "$FORCE" "$MODE"
 
