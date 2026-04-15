@@ -52,12 +52,23 @@ fn prefix_range(
 ) -> core::ops::Range<usize> {
     // Advance past entries before `prefix`.
     let begin = start + sorted_keys[start..].partition_point(|p| p < prefix);
-    // Find the end of entries that start with `prefix`.
-    let mut end = begin;
-    while end < sorted_keys.len() && sorted_keys[end].starts_with(prefix) {
-        end += 1;
-    }
+    let end = prefix_successor(prefix).map_or(sorted_keys.len(), |upper_bound| {
+        begin + sorted_keys[begin..].partition_point(|p| p < &upper_bound)
+    });
     begin..end
+}
+
+/// Returns the smallest nibble path strictly greater than every key with the given prefix.
+fn prefix_successor(prefix: &Nibbles) -> Option<Nibbles> {
+    let mut upper_bound = *prefix;
+    while let Some(last) = upper_bound.pop() {
+        if last < 0x0f {
+            upper_bound.push(last + 1);
+            return Some(upper_bound);
+        }
+    }
+
+    None
 }
 
 /// Returns the per-slot byte size used by `SlotMap<_, T>`. `SlotMap` wraps each value in a
@@ -3134,7 +3145,7 @@ impl SparseTrie for ArenaParallelSparseTrie {
 
 #[cfg(test)]
 mod tests {
-    use super::TRACE_TARGET;
+    use super::{prefix_range, TRACE_TARGET};
     use crate::{ArenaParallelSparseTrie, ArenaParallelismThresholds, LeafUpdate, SparseTrie};
     use alloy_primitives::{map::B256Map, B256, U256};
     use rand::{seq::SliceRandom, Rng, SeedableRng};
@@ -3142,6 +3153,32 @@ mod tests {
     use reth_trie_common::{Nibbles, ProofV2Target};
     use std::collections::BTreeMap;
     use tracing::{info, trace};
+
+    #[test]
+    fn prefix_range_uses_upper_bound_search() {
+        fn n(path: &[u8]) -> Nibbles {
+            Nibbles::from_nibbles(path)
+        }
+
+        let sorted = vec![
+            n(&[0x1]),
+            n(&[0x1, 0x0]),
+            n(&[0x1, 0x0, 0x1]),
+            n(&[0x1, 0xf, 0xf]),
+            n(&[0x2]),
+            n(&[0x2, 0x0]),
+            n(&[0xf, 0xf]),
+            n(&[0xf, 0xf, 0x0]),
+            n(&[0xf, 0xf, 0xf]),
+        ];
+
+        assert_eq!(prefix_range(&sorted, 0, &n(&[0x1])), 0..4);
+        assert_eq!(prefix_range(&sorted, 0, &n(&[0x1, 0xf, 0xf])), 3..4);
+        assert_eq!(prefix_range(&sorted, 4, &n(&[0x2])), 4..6);
+        assert_eq!(prefix_range(&sorted, 0, &n(&[0x2, 0xf])), 6..6);
+        assert_eq!(prefix_range(&sorted, 6, &n(&[0xf, 0xf])), 6..9);
+        assert_eq!(prefix_range(&sorted, 0, &Nibbles::default()), 0..sorted.len());
+    }
 
     /// Test harness for proptest-based arena sparse trie testing.
     ///
