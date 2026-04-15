@@ -904,6 +904,38 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         }
         Ok(())
     }
+
+    fn advance_hashed_account_cursor(
+        hashed_accounts_cursor: &mut impl DbCursorRO<tables::HashedAccounts>,
+        current: &mut Option<(B256, Account)>,
+        initialized: &mut bool,
+        hashed_address: B256,
+    ) -> ProviderResult<()> {
+        if !*initialized {
+            *current = hashed_accounts_cursor.seek(hashed_address)?;
+            *initialized = true;
+            return Ok(());
+        }
+
+        while current.as_ref().is_some_and(|(key, _)| *key < hashed_address) {
+            *current = hashed_accounts_cursor.next()?;
+        }
+
+        Ok(())
+    }
+
+    fn refresh_hashed_account_cursor(
+        hashed_accounts_cursor: &mut impl DbCursorRO<tables::HashedAccounts>,
+        hashed_address: B256,
+    ) -> ProviderResult<Option<(B256, Account)>> {
+        if let Some((key, account)) = hashed_accounts_cursor.current()? &&
+            key >= hashed_address
+        {
+            return Ok(Some((key, account)))
+        }
+
+        Ok(hashed_accounts_cursor.seek(hashed_address)?)
+    }
 }
 
 impl<TX: DbTx + 'static, N: NodeTypes> TryIntoHistoricalStateProvider for DatabaseProvider<TX, N> {
@@ -2654,11 +2686,37 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
     fn write_hashed_state(&self, hashed_state: &HashedPostStateSorted) -> ProviderResult<()> {
         // Write hashed account updates.
         let mut hashed_accounts_cursor = self.tx_ref().cursor_write::<tables::HashedAccounts>()?;
+        let mut current_hashed_account = None;
+        let mut initialized_hashed_account_cursor = false;
         for (hashed_address, account) in hashed_state.accounts() {
+            Self::advance_hashed_account_cursor(
+                &mut hashed_accounts_cursor,
+                &mut current_hashed_account,
+                &mut initialized_hashed_account_cursor,
+                *hashed_address,
+            )?;
+
             if let Some(account) = account {
+                if current_hashed_account
+                    .as_ref()
+                    .is_some_and(|(db_hashed_address, _)| db_hashed_address == hashed_address)
+                {
+                    hashed_accounts_cursor.delete_current()?;
+                }
                 hashed_accounts_cursor.upsert(*hashed_address, account)?;
-            } else if hashed_accounts_cursor.seek_exact(*hashed_address)?.is_some() {
+                current_hashed_account = Self::refresh_hashed_account_cursor(
+                    &mut hashed_accounts_cursor,
+                    *hashed_address,
+                )?;
+            } else if current_hashed_account
+                .as_ref()
+                .is_some_and(|(db_hashed_address, _)| db_hashed_address == hashed_address)
+            {
                 hashed_accounts_cursor.delete_current()?;
+                current_hashed_account = Self::refresh_hashed_account_cursor(
+                    &mut hashed_accounts_cursor,
+                    *hashed_address,
+                )?;
             }
         }
 
@@ -5229,6 +5287,63 @@ mod tests {
     #[test]
     fn test_save_blocks_v2_table_assertions() {
         run_save_blocks_and_verify(StorageMode::V2);
+    }
+
+    #[test]
+    fn write_hashed_state_walks_sorted_account_updates() {
+        let factory = create_test_provider_factory();
+        factory.set_storage_settings_cache(StorageSettings::v2());
+
+        let first_hashed_address = B256::with_last_byte(1);
+        let middle_hashed_address = B256::with_last_byte(2);
+        let last_hashed_address = B256::with_last_byte(3);
+
+        let provider_rw = factory.provider_rw().unwrap();
+        let mut hashed_accounts_cursor =
+            provider_rw.tx.cursor_write::<tables::HashedAccounts>().unwrap();
+        hashed_accounts_cursor
+            .upsert(
+                first_hashed_address,
+                &Account { nonce: 1, balance: U256::from(1), bytecode_hash: None },
+            )
+            .unwrap();
+        hashed_accounts_cursor
+            .upsert(
+                last_hashed_address,
+                &Account { nonce: 3, balance: U256::from(3), bytecode_hash: None },
+            )
+            .unwrap();
+
+        let hashed_state = HashedPostStateSorted::new(
+            vec![
+                (
+                    first_hashed_address,
+                    Some(Account { nonce: 10, balance: U256::from(10), bytecode_hash: None }),
+                ),
+                (
+                    middle_hashed_address,
+                    Some(Account { nonce: 20, balance: U256::from(20), bytecode_hash: None }),
+                ),
+                (last_hashed_address, None),
+            ],
+            Default::default(),
+        );
+
+        provider_rw.write_hashed_state(&hashed_state).unwrap();
+
+        let mut hashed_accounts_cursor =
+            provider_rw.tx.cursor_read::<tables::HashedAccounts>().unwrap();
+        let first_entry =
+            hashed_accounts_cursor.seek_exact(first_hashed_address).unwrap().unwrap().1;
+        assert_eq!(first_entry.nonce, 10);
+        assert_eq!(first_entry.balance, U256::from(10));
+
+        let middle_entry =
+            hashed_accounts_cursor.seek_exact(middle_hashed_address).unwrap().unwrap().1;
+        assert_eq!(middle_entry.nonce, 20);
+        assert_eq!(middle_entry.balance, U256::from(20));
+
+        assert!(hashed_accounts_cursor.seek_exact(last_hashed_address).unwrap().is_none());
     }
 
     #[test]
