@@ -2018,6 +2018,19 @@ impl<'a> RocksDBBatch<'a> {
                 delete_shard(self, key)?;
                 deleted = true;
             } else {
+                let first_block = block_list.iter().next();
+                if first_block.is_some_and(|block| block > to_block) {
+                    last_remaining = Some((key, block_list));
+                    continue;
+                }
+
+                let last_block = block_list.iter().next_back();
+                if last_block.is_some_and(|block| block <= to_block) {
+                    delete_shard(self, key)?;
+                    deleted = true;
+                    continue;
+                }
+
                 let original_len = block_list.len();
                 let filtered =
                     BlockNumberList::new_pre_sorted(block_list.iter().filter(|&b| b > to_block));
