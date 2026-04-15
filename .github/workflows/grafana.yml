@@ -6,11 +6,16 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   check-dashboard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Check for ${DS_PROMETHEUS} in overview.json
         run: |
           if grep -Fn '${DS_PROMETHEUS}' etc/grafana/dashboards/overview.json; then

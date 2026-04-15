@@ -48,7 +48,7 @@ services:
 
   loki:
     restart: unless-stopped
-    image: grafana/loki:latest
+    image: grafana/loki:3.5
     ports:
       - 3100:3100
     volumes:
@@ -58,7 +58,7 @@ services:
 
   promtail:
     restart: unless-stopped
-    image: grafana/promtail:latest
+    image: grafana/promtail:3.5
     depends_on:
       - loki
     volumes:
@@ -68,7 +68,7 @@ services:
 
   grafana:
     restart: unless-stopped
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.6.0
     depends_on:
       - reth
       - prometheus
