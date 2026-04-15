@@ -2013,21 +2013,21 @@ impl<'a> RocksDBBatch<'a> {
         let mut updated = false;
         let mut last_remaining: Option<(K, BlockNumberList)> = None;
 
-        for (key, block_list) in shards {
+        for (key, mut block_list) in shards {
             if !is_sentinel(&key) && get_highest(&key) <= to_block {
                 delete_shard(self, key)?;
                 deleted = true;
             } else {
-                let original_len = block_list.len();
-                let filtered =
-                    BlockNumberList::new_pre_sorted(block_list.iter().filter(|&b| b > to_block));
+                // Roaring can drop the pruned prefix in place, which is cheaper than rebuilding
+                // the surviving suffix with a fresh iterator when a shard is only partially pruned.
+                let removed = block_list.0.remove_range(..=to_block);
 
-                if filtered.is_empty() {
+                if block_list.is_empty() {
                     delete_shard(self, key)?;
                     deleted = true;
-                } else if filtered.len() < original_len {
-                    put_shard(self, key.clone(), &filtered)?;
-                    last_remaining = Some((key, filtered));
+                } else if removed > 0 {
+                    put_shard(self, key.clone(), &block_list)?;
+                    last_remaining = Some((key, block_list));
                     updated = true;
                 } else {
                     last_remaining = Some((key, block_list));
