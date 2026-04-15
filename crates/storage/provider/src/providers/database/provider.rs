@@ -3043,6 +3043,18 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 }
 
 impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
+    fn seek_account_trie_at_or_after<A: TrieTableAdapter>(
+        cursor: &mut impl DbCursorRO<A::AccountTrieTable>,
+        cursor_key: &mut Option<A::AccountKey>,
+        key: &A::AccountKey,
+    ) -> ProviderResult<()> {
+        if cursor_key.as_ref().is_none_or(|current| current < key) {
+            *cursor_key = cursor.seek(key.clone())?.map(|(existing_key, _)| existing_key);
+        }
+
+        Ok(())
+    }
+
     fn write_account_trie_updates<A: TrieTableAdapter>(
         tx: &TX,
         trie_updates: &TrieUpdatesSorted,
@@ -3052,6 +3064,8 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
         TX: DbTxMut,
     {
         let mut account_trie_cursor = tx.cursor_write::<A::AccountTrieTable>()?;
+        let mut cursor_key = None;
+
         // Process sorted account nodes
         for (key, updated_node) in trie_updates.account_nodes_ref() {
             let nibbles = A::AccountKey::from(*key);
@@ -3059,13 +3073,36 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
                 Some(node) => {
                     if !key.is_empty() {
                         *num_entries += 1;
-                        account_trie_cursor.upsert(nibbles, node)?;
+                        Self::seek_account_trie_at_or_after::<A>(
+                            &mut account_trie_cursor,
+                            &mut cursor_key,
+                            &nibbles,
+                        )?;
+
+                        if cursor_key.as_ref() == Some(&nibbles) {
+                            account_trie_cursor.upsert(nibbles.clone(), node)?;
+                        } else if cursor_key.is_none() {
+                            account_trie_cursor.append(nibbles.clone(), node)?;
+                        } else {
+                            account_trie_cursor.insert(nibbles.clone(), node)?;
+                        }
+
+                        cursor_key = Some(nibbles);
                     }
                 }
                 None => {
                     *num_entries += 1;
-                    if account_trie_cursor.seek_exact(nibbles)?.is_some() {
+                    Self::seek_account_trie_at_or_after::<A>(
+                        &mut account_trie_cursor,
+                        &mut cursor_key,
+                        &nibbles,
+                    )?;
+
+                    if cursor_key.as_ref() == Some(&nibbles) {
                         account_trie_cursor.delete_current()?;
+                        cursor_key = account_trie_cursor
+                            .seek(nibbles)?
+                            .map(|(existing_key, _)| existing_key);
                     }
                 }
             }
@@ -4238,6 +4275,22 @@ mod tests {
                     ),
                 )
                 .unwrap();
+
+            // Add a later account node so inserting a new middle key exercises the cursor insert
+            // path instead of the append-at-end fast path.
+            let later_key = StoredNibbles(Nibbles::from_nibbles([0x8, 0x0]));
+            cursor
+                .upsert(
+                    later_key,
+                    &BranchNodeCompact::new(
+                        0b0000_1111_0000_1111,
+                        0b0000_0000_0000_0000,
+                        0b0000_0000_0000_0000,
+                        vec![],
+                        None,
+                    ),
+                )
+                .unwrap();
         }
 
         // Pre-populate storage tries with data
@@ -4382,6 +4435,10 @@ mod tests {
         let nibbles3 = StoredNibbles(Nibbles::from_nibbles([0x5, 0x6]));
         let entry3 = cursor.seek_exact(nibbles3).unwrap();
         assert!(entry3.is_some(), "New account node should exist");
+
+        let later_key = StoredNibbles(Nibbles::from_nibbles([0x8, 0x0]));
+        let later_entry = cursor.seek_exact(later_key).unwrap();
+        assert!(later_entry.is_some(), "Untouched later account node should still exist");
 
         // Verify storage trie updates were written correctly
         let mut storage_cursor = tx.cursor_dup_read::<tables::StoragesTrie>().unwrap();
