@@ -904,6 +904,42 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         }
         Ok(())
     }
+
+    fn advance_hashed_storage_cursor(
+        hashed_storage_cursor: &mut impl DbDupCursorRO<tables::HashedStorages>,
+        hashed_address: B256,
+        current: &mut Option<StorageEntry>,
+        initialized: &mut bool,
+        hashed_slot: B256,
+    ) -> ProviderResult<()> {
+        if !*initialized {
+            *current = hashed_storage_cursor.seek_by_key_subkey(hashed_address, hashed_slot)?;
+            *initialized = true;
+            return Ok(());
+        }
+
+        while current.as_ref().is_some_and(|entry| entry.key < hashed_slot) {
+            *current = hashed_storage_cursor.next_dup()?.map(|(_, value)| value);
+        }
+
+        Ok(())
+    }
+
+    fn refresh_hashed_storage_cursor(
+        hashed_storage_cursor: &mut (impl DbDupCursorRO<tables::HashedStorages>
+                  + DbCursorRO<tables::HashedStorages>),
+        hashed_address: B256,
+        hashed_slot: B256,
+    ) -> ProviderResult<Option<StorageEntry>> {
+        if let Some((key, entry)) = hashed_storage_cursor.current()? &&
+            key == hashed_address &&
+            entry.key >= hashed_slot
+        {
+            return Ok(Some(entry))
+        }
+
+        Ok(hashed_storage_cursor.seek_by_key_subkey(hashed_address, hashed_slot)?)
+    }
 }
 
 impl<TX: DbTx + 'static, N: NodeTypes> TryIntoHistoricalStateProvider for DatabaseProvider<TX, N> {
@@ -2671,18 +2707,36 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 hashed_storage_cursor.delete_current_duplicates()?;
             }
 
+            let mut current = None;
+            let mut initialized = false;
+
             for (hashed_slot, value) in storage.storage_slots_ref() {
                 let entry = StorageEntry { key: *hashed_slot, value: *value };
 
-                if let Some(db_entry) =
-                    hashed_storage_cursor.seek_by_key_subkey(*hashed_address, entry.key)? &&
-                    db_entry.key == entry.key
-                {
+                Self::advance_hashed_storage_cursor(
+                    &mut hashed_storage_cursor,
+                    *hashed_address,
+                    &mut current,
+                    &mut initialized,
+                    entry.key,
+                )?;
+
+                if current.as_ref().is_some_and(|db_entry| db_entry.key == entry.key) {
                     hashed_storage_cursor.delete_current()?;
+                    current = Self::refresh_hashed_storage_cursor(
+                        &mut hashed_storage_cursor,
+                        *hashed_address,
+                        entry.key,
+                    )?;
                 }
 
                 if !entry.value.is_zero() {
                     hashed_storage_cursor.upsert(*hashed_address, &entry)?;
+                    current = Self::refresh_hashed_storage_cursor(
+                        &mut hashed_storage_cursor,
+                        *hashed_address,
+                        entry.key,
+                    )?;
                 }
             }
         }
@@ -5382,6 +5436,61 @@ mod tests {
 
         let mdbx_account_cs = provider_rw.tx.entries::<tables::AccountChangeSets>().unwrap();
         assert_eq!(mdbx_account_cs, 0, "v2: MDBX AccountChangeSets should remain empty");
+    }
+
+    #[test]
+    fn test_write_hashed_state_walks_sorted_storage_updates() {
+        let factory = create_test_provider_factory();
+        let provider_rw = factory.provider_rw().unwrap();
+
+        let hashed_address = B256::random();
+        let slot1 = B256::with_last_byte(1);
+        let slot2 = B256::with_last_byte(2);
+        let slot3 = B256::with_last_byte(3);
+        let slot4 = B256::with_last_byte(4);
+
+        let mut initial = provider_rw.tx.cursor_dup_write::<tables::HashedStorages>().unwrap();
+        initial
+            .upsert(hashed_address, &StorageEntry { key: slot1, value: U256::from(10) })
+            .unwrap();
+        initial
+            .upsert(hashed_address, &StorageEntry { key: slot3, value: U256::from(30) })
+            .unwrap();
+
+        let hashed_state = HashedPostStateSorted::new(
+            vec![],
+            B256Map::from_iter([(
+                hashed_address,
+                reth_trie::HashedStorageSorted {
+                    wiped: false,
+                    storage_slots: vec![
+                        (slot1, U256::from(11)),
+                        (slot2, U256::from(22)),
+                        (slot3, U256::ZERO),
+                        (slot4, U256::from(44)),
+                    ],
+                },
+            )]),
+        );
+
+        provider_rw.write_hashed_state(&hashed_state).unwrap();
+
+        let entries = provider_rw
+            .tx
+            .cursor_dup_read::<tables::HashedStorages>()
+            .unwrap()
+            .walk_dup(Some(hashed_address), None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].1.key, slot1);
+        assert_eq!(entries[0].1.value, U256::from(11));
+        assert_eq!(entries[1].1.key, slot2);
+        assert_eq!(entries[1].1.value, U256::from(22));
+        assert_eq!(entries[2].1.key, slot4);
+        assert_eq!(entries[2].1.value, U256::from(44));
     }
 
     #[test]
