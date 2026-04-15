@@ -369,15 +369,21 @@ jobs:
         id: snapshot-check
         run: |
           set +e
-          .github/scripts/bench-reth-snapshot.sh --check
+          CHECK_OUTPUT=$(.github/scripts/bench-reth-snapshot.sh --check)
           rc=$?
           set -e
+          echo "$CHECK_OUTPUT"
+          RESOLVED_NAME=$(echo "$CHECK_OUTPUT" | grep '^snapshot-name=' | tail -1 | cut -d= -f2-)
           case "$rc" in
             0)  echo "needed=false" >> "$GITHUB_OUTPUT" ;;
             10) echo "needed=true"  >> "$GITHUB_OUTPUT" ;;
             *)  echo "::error::Snapshot check failed (exit $rc)"
                 exit "$rc" ;;
           esac
+          if [ -n "$RESOLVED_NAME" ]; then
+            echo "BENCH_SNAPSHOT_NAME=${RESOLVED_NAME}" >> "$GITHUB_ENV"
+            echo "Pinned snapshot: $RESOLVED_NAME"
+          fi
 
       - name: Prepare source dirs
         run: |

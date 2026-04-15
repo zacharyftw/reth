@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 #
-# Downloads the latest snapshot into the schelk volume using
-# `reth download` with progress reporting to the GitHub PR comment.
+# Downloads a snapshot into the schelk volume using `reth download`
+# with progress reporting to the GitHub PR comment.
+#
+# By default, resolves the *previous* week's snapshot (second-to-last
+# `reth-1-minimal-stable-weekly-*` entry in the bucket, sorted by name).
+# Set BENCH_SNAPSHOT_NAME to override with a specific snapshot.
 #
 # Skips the download if the manifest content hasn't changed since
 # the last successful download (checked via SHA-256 of the manifest).
@@ -24,7 +28,36 @@ MC="mc"
 BUCKET="minio/reth-snapshots"
 # Allow overriding the snapshot name (e.g. for big-blocks mode where the
 # big-blocks manifest specifies which base snapshot to use).
-SNAPSHOT_NAME="${BENCH_SNAPSHOT_NAME:-reth-1-minimal-stable}"
+if [ -n "${BENCH_SNAPSHOT_NAME:-}" ]; then
+  SNAPSHOT_NAME="$BENCH_SNAPSHOT_NAME"
+else
+  # Resolve the previous week's snapshot by listing all weekly snapshots,
+  # sorting by name (which sorts chronologically since names contain
+  # ISO week numbers, e.g. reth-1-minimal-stable-weekly-2026-W15),
+  # and picking the second-to-last entry.
+  WEEKLY_PREFIX="reth-1-minimal-stable-weekly-"
+
+  LIST_OUTPUT=$($MC ls "${BUCKET}/" 2>&1) || {
+    echo "::error::Failed to list ${BUCKET}: ${LIST_OUTPUT}"
+    exit 2
+  }
+
+  mapfile -t WEEKLY_SNAPSHOTS < <(
+    printf '%s\n' "$LIST_OUTPUT" \
+      | awk '$NF ~ /\/$/ { print $NF }' \
+      | sed 's:/$::' \
+      | grep -E "^${WEEKLY_PREFIX}[0-9]{4}-W[0-9]{2}$" \
+      | LC_ALL=C sort
+  )
+
+  if [ "${#WEEKLY_SNAPSHOTS[@]}" -lt 2 ]; then
+    echo "::error::Expected at least 2 weekly snapshots matching ${WEEKLY_PREFIX}* in ${BUCKET}, found ${#WEEKLY_SNAPSHOTS[@]}"
+    exit 2
+  fi
+
+  SNAPSHOT_NAME="${WEEKLY_SNAPSHOTS[${#WEEKLY_SNAPSHOTS[@]}-2]}"
+  echo "Resolved previous-week snapshot: $SNAPSHOT_NAME"
+fi
 MANIFEST_PATH="${SNAPSHOT_NAME}/manifest.json"
 DATADIR_NAME="datadir"
 HASH_MODE_SUFFIX=""
@@ -47,11 +80,14 @@ LOCAL_HASH=""
 
 if [ "$REMOTE_HASH" = "$LOCAL_HASH" ]; then
   echo "Snapshot is up-to-date (manifest hash: ${REMOTE_HASH:0:16}…)"
+  echo "snapshot-name=${SNAPSHOT_NAME}"
   exit 0
 fi
 
 echo "Snapshot needs update (local: ${LOCAL_HASH:+${LOCAL_HASH:0:16}…}${LOCAL_HASH:-<none>}, remote: ${REMOTE_HASH:0:16}…)"
 if [ "${1:-}" = "--check" ]; then
+  # Output the resolved snapshot name so callers can pin it for the download step
+  echo "snapshot-name=${SNAPSHOT_NAME}"
   exit 10
 fi
 
