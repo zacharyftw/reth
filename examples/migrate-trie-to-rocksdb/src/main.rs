@@ -141,6 +141,9 @@ fn do_copy<TX: DbTx>(tx: &TX, rocksdb: &RocksDBProvider) -> Result<()> {
     println!("Committing RocksDB batch...");
     batch.commit()?;
 
+    println!("Compacting trie column families...");
+    rocksdb.compact_trie_cfs();
+
     println!("Migration complete:");
     println!("  AccountsTrie: {accounts_count} entries");
     println!("  StoragesTrie: {storage_count} entries");

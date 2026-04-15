@@ -1244,6 +1244,11 @@ impl RocksDBProvider {
 
         batch.commit()?;
 
+        // Compact trie CFs so the bulk-loaded data is pushed into sorted levels
+        // for optimal read performance. Without this, all data sits in L0 files
+        // causing high read amplification on every seek.
+        self.compact_trie_cfs();
+
         Ok(())
     }
 

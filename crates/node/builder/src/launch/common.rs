@@ -501,8 +501,6 @@ where
                 .build()?
         };
 
-        // Compact trie CFs on startup if they have pending compaction.
-        rocksdb_provider.compact_trie_cfs();
 
         let prune_config = self.prune_config();
         let factory = ProviderFactory::new(
