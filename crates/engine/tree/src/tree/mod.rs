@@ -2120,6 +2120,12 @@ where
             "computing block trie updates",
         );
         let db_provider = self.provider.database_provider_ro()?;
+        // TODO(trie-on-rocks): when storage v2 is enabled, this should use
+        // `compute_block_trie_updates_cf` with a RocksDB cursor factory so the
+        // DB-fallback path reads trie data from RocksDB instead of stale MDBX.
+        // Currently the deferred trie task populates the cache with correct data
+        // (it uses OverlayStateProvider which routes to RocksDB), so this DB
+        // fallback is only hit on cold start / cache eviction.
         let trie_updates = reth_trie_db::compute_block_trie_updates(
             &self.changeset_cache,
             &db_provider,

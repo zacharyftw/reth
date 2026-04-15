@@ -8,7 +8,7 @@
 //! - **Memory efficiency**: Automatic eviction ensures bounded memory usage
 
 use crate::{
-    DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, TrieTableAdapter,
+    DatabaseHashedCursorFactory, DatabaseTrieCursorFactory, TrieTableAdapter,
 };
 use alloy_primitives::{map::B256Map, BlockNumber, B256};
 use parking_lot::RwLock;
@@ -20,8 +20,9 @@ use reth_storage_api::{
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use reth_trie::{
     changesets::compute_trie_changesets,
+    hashed_cursor::HashedPostStateCursorFactory,
     trie_cursor::{InMemoryTrieCursorFactory, TrieCursor, TrieCursorFactory},
-    TrieInputSorted,
+    StateRoot, TrieInputSorted,
 };
 use reth_trie_common::updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted};
 use std::{
@@ -96,6 +97,49 @@ where
         + StorageSettingsCache,
     A: TrieTableAdapter,
 {
+    let cursor_factory = DatabaseTrieCursorFactory::<_, A>::new(provider.tx_ref());
+    compute_block_trie_changesets_with_factory(provider, block_number, &cursor_factory)
+}
+
+/// Computes trie changesets for a block using a caller-provided trie cursor factory.
+///
+/// This is the generic version of [`compute_block_trie_changesets`] that allows the caller
+/// to specify the trie data source (e.g. RocksDB instead of MDBX).
+///
+/// The `base_cursor_factory` provides the underlying trie cursor for reading persisted
+/// trie nodes. Hashed state is always read from MDBX via the provider's transaction.
+pub fn compute_block_trie_changesets_cf<Provider, CF>(
+    provider: &Provider,
+    block_number: BlockNumber,
+    base_cursor_factory: &CF,
+) -> Result<TrieUpdatesSorted, ProviderError>
+where
+    Provider: DBProvider
+        + StageCheckpointReader
+        + ChangeSetReader
+        + StorageChangeSetReader
+        + BlockNumReader
+        + StorageSettingsCache,
+    CF: TrieCursorFactory,
+{
+    compute_block_trie_changesets_with_factory(provider, block_number, base_cursor_factory)
+}
+
+/// Core changeset computation generic over the trie cursor factory.
+fn compute_block_trie_changesets_with_factory<Provider, CF>(
+    provider: &Provider,
+    block_number: BlockNumber,
+    base_cursor_factory: &CF,
+) -> Result<TrieUpdatesSorted, ProviderError>
+where
+    Provider: DBProvider
+        + StageCheckpointReader
+        + ChangeSetReader
+        + StorageChangeSetReader
+        + BlockNumReader
+        + StorageSettingsCache,
+    CF: TrieCursorFactory,
+{
     debug!(
         target: "trie::changeset_cache",
         block_number,
@@ -124,16 +168,18 @@ where
         prefix_sets_prev,
     );
 
-    type DbStateRoot<'a, TX, A> = reth_trie::StateRoot<
-        DatabaseTrieCursorFactory<&'a TX, A>,
-        DatabaseHashedCursorFactory<&'a TX>,
-    >;
-
-    let cumulative_trie_updates_prev =
-        DbStateRoot::<_, A>::overlay_root_from_nodes_with_updates(provider.tx_ref(), input_prev)
-            .map_err(ProviderError::other)?
-            .1
-            .into_sorted();
+    let cumulative_trie_updates_prev = StateRoot::new(
+        InMemoryTrieCursorFactory::new(base_cursor_factory, input_prev.nodes.as_ref()),
+        HashedPostStateCursorFactory::new(
+            DatabaseHashedCursorFactory::new(provider.tx_ref()),
+            input_prev.state.as_ref(),
+        ),
+    )
+    .with_prefix_sets(input_prev.prefix_sets.freeze())
+    .root_with_updates()
+    .map_err(ProviderError::other)?
+    .1
+    .into_sorted();
 
     // Step 3: Create prefix sets from individual revert (only paths changed by this block)
     let prefix_sets = individual_state_revert.construct_prefix_sets();
@@ -146,17 +192,23 @@ where
         prefix_sets,
     );
 
-    let trie_updates =
-        DbStateRoot::<_, A>::overlay_root_from_nodes_with_updates(provider.tx_ref(), input)
-            .map_err(ProviderError::other)?
-            .1
-            .into_sorted();
+    let trie_updates = StateRoot::new(
+        InMemoryTrieCursorFactory::new(base_cursor_factory, input.nodes.as_ref()),
+        HashedPostStateCursorFactory::new(
+            DatabaseHashedCursorFactory::new(provider.tx_ref()),
+            input.state.as_ref(),
+        ),
+    )
+    .with_prefix_sets(input.prefix_sets.freeze())
+    .root_with_updates()
+    .map_err(ProviderError::other)?
+    .1
+    .into_sorted();
 
     // Step 5: Compute changesets using cumulative trie updates for block-1 as overlay
     // Create an overlay cursor factory that has the trie state from after block-1
-    let db_cursor_factory = DatabaseTrieCursorFactory::<_, A>::new(provider.tx_ref());
     let overlay_factory =
-        InMemoryTrieCursorFactory::new(db_cursor_factory, &cumulative_trie_updates_prev);
+        InMemoryTrieCursorFactory::new(base_cursor_factory, &cumulative_trie_updates_prev);
 
     let changesets =
         compute_trie_changesets(&overlay_factory, &trie_updates).map_err(ProviderError::other)?;
@@ -233,8 +285,48 @@ where
         + StorageSettingsCache,
     A: TrieTableAdapter,
 {
-    let tx = provider.tx_ref();
+    let cursor_factory = DatabaseTrieCursorFactory::<_, A>::new(provider.tx_ref());
+    compute_block_trie_updates_with_factory(cache, provider, block_number, &cursor_factory)
+}
 
+/// Computes block trie updates using the changeset cache and a caller-provided cursor factory.
+///
+/// This is the generic version of [`compute_block_trie_updates`] that allows the caller
+/// to specify the trie data source (e.g. RocksDB instead of MDBX).
+pub fn compute_block_trie_updates_cf<Provider, CF>(
+    cache: &ChangesetCache,
+    provider: &Provider,
+    block_number: BlockNumber,
+    base_cursor_factory: &CF,
+) -> ProviderResult<TrieUpdatesSorted>
+where
+    Provider: DBProvider
+        + StageCheckpointReader
+        + ChangeSetReader
+        + StorageChangeSetReader
+        + BlockNumReader
+        + StorageSettingsCache,
+    CF: TrieCursorFactory,
+{
+    compute_block_trie_updates_with_factory(cache, provider, block_number, base_cursor_factory)
+}
+
+/// Core trie updates computation generic over the trie cursor factory.
+fn compute_block_trie_updates_with_factory<Provider, CF>(
+    cache: &ChangesetCache,
+    provider: &Provider,
+    block_number: BlockNumber,
+    base_cursor_factory: &CF,
+) -> ProviderResult<TrieUpdatesSorted>
+where
+    Provider: DBProvider
+        + StageCheckpointReader
+        + ChangeSetReader
+        + StorageChangeSetReader
+        + BlockNumReader
+        + StorageSettingsCache,
+    CF: TrieCursorFactory,
+{
     // Get the database tip block number
     let db_tip_block = provider
         .get_stage_checkpoint(reth_stages_types::StageId::Finish)?
@@ -254,15 +346,16 @@ where
     })?;
 
     // Step 2: Get the trie changesets for the target block from cache
-    let changesets = cache.get_or_compute(block_hash, block_number, provider)?;
+    let changesets =
+        cache.get_or_compute_cf(block_hash, block_number, provider, base_cursor_factory)?;
 
     // Step 3: Get the trie reverts for the state after the target block using the cache
-    let reverts = cache.get_or_compute_range(provider, (block_number + 1)..=db_tip_block)?;
+    let reverts =
+        cache.get_or_compute_range_cf(provider, (block_number + 1)..=db_tip_block, base_cursor_factory)?;
 
     // Step 4: Create an InMemoryTrieCursorFactory with the reverts
     // This gives us the trie state as it was after the target block was processed
-    let db_cursor_factory = DatabaseTrieCursorFactory::<_, A>::new(tx);
-    let cursor_factory = InMemoryTrieCursorFactory::new(db_cursor_factory, &reverts);
+    let cursor_factory = InMemoryTrieCursorFactory::new(base_cursor_factory, &reverts);
 
     // Step 5: Collect all account trie nodes that changed in the target block
     let account_nodes_ref = changesets.account_nodes_ref();
@@ -657,6 +750,184 @@ impl ChangesetCache {
             num_account_nodes,
             num_storage_tries,
             "Finished accumulating trie reverts for block range"
+        );
+
+        Ok(accumulated_reverts)
+    }
+
+    /// Like [`Self::get_or_compute`], but uses a caller-provided trie cursor factory
+    /// for the fallback DB computation instead of the default MDBX-based factory.
+    ///
+    /// This is needed when storage v2 is enabled and trie data lives in RocksDB
+    /// rather than MDBX.
+    pub fn get_or_compute_cf<P, CF>(
+        &self,
+        block_hash: B256,
+        block_number: u64,
+        provider: &P,
+        base_cursor_factory: &CF,
+    ) -> ProviderResult<Arc<TrieUpdatesSorted>>
+    where
+        P: DBProvider
+            + StageCheckpointReader
+            + ChangeSetReader
+            + StorageChangeSetReader
+            + BlockNumReader
+            + StorageSettingsCache,
+        CF: TrieCursorFactory,
+    {
+        // Try cache first, and if missing, check for a pending computation.
+        let pending = {
+            let cache = self.inner.read();
+            if let Some(changesets) = cache.get(&block_hash) {
+                debug!(
+                    target: "trie::changeset_cache",
+                    ?block_hash,
+                    block_number,
+                    "Changeset cache HIT"
+                );
+                return Ok(changesets);
+            }
+            cache.pending.get(&block_hash).cloned()
+        };
+
+        // If there's a pending computation, wait for it instead of computing from DB.
+        if let Some(pending) = pending {
+            debug!(
+                target: "trie::changeset_cache",
+                ?block_hash,
+                block_number,
+                "Changeset cache MISS but pending computation found, waiting"
+            );
+
+            let start = Instant::now();
+
+            if let Some(changesets) = pending.wait() {
+                debug!(
+                    target: "trie::changeset_cache",
+                    ?block_hash,
+                    block_number,
+                    elapsed = ?start.elapsed(),
+                    "Pending changeset resolved"
+                );
+                return Ok(changesets);
+            }
+
+            debug!(
+                target: "trie::changeset_cache",
+                ?block_hash,
+                block_number,
+                elapsed = ?start.elapsed(),
+                "Pending changeset was cancelled, falling through to DB computation"
+            );
+        }
+
+        // No cache hit and no pending computation - compute from database
+        warn!(
+            target: "trie::changeset_cache",
+            ?block_hash,
+            block_number,
+            "Changeset cache MISS, falling back to DB-based computation (with custom cursor factory)"
+        );
+
+        let start = Instant::now();
+
+        // Compute changesets using the provided cursor factory
+        let changesets =
+            compute_block_trie_changesets_cf(provider, block_number, base_cursor_factory)?;
+
+        let changesets = Arc::new(changesets);
+        let elapsed = start.elapsed();
+
+        debug!(
+            target: "trie::changeset_cache",
+            ?elapsed,
+            block_number,
+            ?block_hash,
+            "Changeset computed from database and inserting into cache"
+        );
+
+        // Store in cache (with write lock)
+        self.insert(block_hash, block_number, Arc::clone(&changesets));
+
+        Ok(changesets)
+    }
+
+    /// Like [`Self::get_or_compute_range`], but uses a caller-provided trie cursor factory
+    /// for any fallback DB computations.
+    pub fn get_or_compute_range_cf<P, CF>(
+        &self,
+        provider: &P,
+        range: RangeInclusive<BlockNumber>,
+        base_cursor_factory: &CF,
+    ) -> ProviderResult<TrieUpdatesSorted>
+    where
+        P: DBProvider
+            + StageCheckpointReader
+            + ChangeSetReader
+            + StorageChangeSetReader
+            + BlockNumReader
+            + StorageSettingsCache,
+        CF: TrieCursorFactory,
+    {
+        // Get the database tip block number
+        let db_tip_block = provider
+            .get_stage_checkpoint(reth_stages_types::StageId::Finish)?
+            .as_ref()
+            .map(|chk| chk.block_number)
+            .ok_or_else(|| ProviderError::InsufficientChangesets {
+                requested: *range.start(),
+                available: 0..=0,
+            })?;
+
+        let start_block = *range.start();
+        let end_block = *range.end();
+
+        // If range end is beyond the tip, return an error
+        if end_block > db_tip_block {
+            return Err(ProviderError::InsufficientChangesets {
+                requested: end_block,
+                available: 0..=db_tip_block,
+            });
+        }
+
+        let timer = Instant::now();
+
+        debug!(
+            target: "trie::changeset_cache",
+            start_block,
+            end_block,
+            db_tip_block,
+            "Starting get_or_compute_range_cf"
+        );
+
+        let mut accumulated_reverts = TrieUpdatesSorted::default();
+
+        for block_number in range.rev() {
+            let block_hash = provider.block_hash(block_number)?.ok_or_else(|| {
+                ProviderError::other(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("block hash not found for block number {}", block_number),
+                ))
+            })?;
+
+            let changesets =
+                self.get_or_compute_cf(block_hash, block_number, provider, base_cursor_factory)?;
+
+            accumulated_reverts.extend_ref_and_sort(&changesets);
+        }
+
+        let elapsed = timer.elapsed();
+
+        debug!(
+            target: "trie::changeset_cache",
+            ?elapsed,
+            start_block,
+            end_block,
+            num_blocks = end_block.saturating_sub(start_block).saturating_add(1),
+            num_account_nodes = accumulated_reverts.account_nodes_ref().len(),
+            num_storage_tries = accumulated_reverts.storage_tries_ref().len(),
+            "Finished accumulating trie reverts for block range (with custom cursor factory)"
         );
 
         Ok(accumulated_reverts)

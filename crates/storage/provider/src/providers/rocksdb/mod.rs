@@ -11,3 +11,4 @@ pub use provider::{
     RocksDBRawIter, RocksDBStats, RocksDBTableStats, RocksReadSnapshot, RocksTx,
 };
 pub(crate) use trie_cursor::{RocksDBAccountTrieCursor, RocksDBStorageTrieCursor};
+pub use trie_cursor::RocksDBTrieCursorFactory;

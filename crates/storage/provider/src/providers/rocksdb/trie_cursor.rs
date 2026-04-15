@@ -22,14 +22,14 @@ use reth_trie::{
 /// pairs, while storage trie entries use compound keys to flatten MDBX's DupSort layout.
 #[derive(Debug)]
 #[allow(dead_code)]
-pub(crate) struct RocksDBTrieCursorFactory<'db> {
+pub struct RocksDBTrieCursorFactory<'db> {
     provider: &'db RocksDBProvider,
 }
 
 impl<'db> RocksDBTrieCursorFactory<'db> {
     /// Creates a new [`RocksDBTrieCursorFactory`].
     #[allow(dead_code)]
-    pub(crate) const fn new(provider: &'db RocksDBProvider) -> Self {
+    pub const fn new(provider: &'db RocksDBProvider) -> Self {
         Self { provider }
     }
 }
@@ -73,7 +73,7 @@ impl<'db> TrieCursorFactory for RocksDBTrieCursorFactory<'db> {
 ///
 /// Iterates over `AccountsTrie` column family entries with `PackedStoredNibbles` keys
 /// and `BranchNodeCompact` values.
-pub(crate) struct RocksDBAccountTrieCursor<'db> {
+pub struct RocksDBAccountTrieCursor<'db> {
     iter: RocksDBRawIterEnum<'db>,
 }
 
@@ -154,7 +154,7 @@ impl TrieCursor for RocksDBAccountTrieCursor<'_> {
 /// (`B256 || PackedStoredNibblesSubKey`). Only returns entries matching the
 /// current `hashed_address` prefix. Uses bounded iterators to constrain
 /// RocksDB to the address prefix range, skipping irrelevant SSTs.
-pub(crate) struct RocksDBStorageTrieCursor<'db> {
+pub struct RocksDBStorageTrieCursor<'db> {
     iter: RocksDBRawIterEnum<'db>,
     hashed_address: B256,
 }

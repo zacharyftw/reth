@@ -862,7 +862,14 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 available: 0..=0,
             })?;
 
-        let trie_revert = self.changeset_cache.get_or_compute_range(self, from..=db_tip_block)?;
+        let trie_revert = if self.cached_storage_settings().is_v2() {
+            let rocksdb = self.rocksdb_provider();
+            let factory =
+                crate::providers::rocksdb::RocksDBTrieCursorFactory::new(&rocksdb);
+            self.changeset_cache.get_or_compute_range_cf(self, from..=db_tip_block, &factory)?
+        } else {
+            self.changeset_cache.get_or_compute_range(self, from..=db_tip_block)?
+        };
         self.write_trie_updates_sorted(&trie_revert)?;
 
         Ok(())
