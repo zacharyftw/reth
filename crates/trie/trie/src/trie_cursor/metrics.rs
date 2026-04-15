@@ -155,6 +155,17 @@ impl<'metrics, C: TrieCursor> TrieCursor for InstrumentedTrieCursor<'metrics, C>
         result
     }
 
+    fn seek_exact_value(
+        &mut self,
+        key: Nibbles,
+    ) -> Result<Option<BranchNodeCompact>, DatabaseError> {
+        let start = Instant::now();
+        self.metrics.seek_exact_count += 1;
+        let result = self.cursor.seek_exact_value(key);
+        self.metrics.total_duration += start.elapsed();
+        result
+    }
+
     fn seek(
         &mut self,
         key: Nibbles,

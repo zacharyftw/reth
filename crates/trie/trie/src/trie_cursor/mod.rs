@@ -59,6 +59,14 @@ pub trait TrieCursor {
         key: Nibbles,
     ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError>;
 
+    /// Move the cursor to the key and return only the exact-match node value.
+    fn seek_exact_value(
+        &mut self,
+        key: Nibbles,
+    ) -> Result<Option<BranchNodeCompact>, DatabaseError> {
+        Ok(self.seek_exact(key)?.map(|(_, node)| node))
+    }
+
     /// Move the cursor to the key and return a value matching of greater than the key.
     fn seek(&mut self, key: Nibbles)
         -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError>;

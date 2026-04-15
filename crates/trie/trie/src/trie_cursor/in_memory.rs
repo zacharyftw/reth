@@ -226,6 +226,32 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
         Ok(entry)
     }
 
+    fn seek_exact_value(
+        &mut self,
+        key: Nibbles,
+    ) -> Result<Option<BranchNodeCompact>, DatabaseError> {
+        self.cursor_seek(key)?;
+        let mem_entry = self.in_memory_cursor.seek(&key);
+
+        self.seeked = true;
+
+        let entry = match (mem_entry, &self.cursor_entry) {
+            (Some((mem_key, entry_inner)), _) if *mem_key == key => entry_inner.clone(),
+            (_, Some((db_key, node))) if db_key == &key => Some(node.clone()),
+            _ => None,
+        };
+
+        let next_key = entry.as_ref().map(|_| key);
+        debug_assert!(
+            self.last_key.is_none_or(|last| next_key.is_none_or(|next| next >= last)),
+            "Cannot return entry {:?} previous to the last returned entry at {:?}",
+            next_key,
+            self.last_key,
+        );
+        self.last_key = next_key;
+        Ok(entry)
+    }
+
     fn seek(
         &mut self,
         key: Nibbles,
