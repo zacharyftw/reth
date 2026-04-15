@@ -172,27 +172,30 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
     /// node.
     fn choose_next_entry(&mut self) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
         loop {
-            match (self.in_memory_cursor.current().cloned(), &self.cursor_entry) {
-                (Some((mem_key, None)), _)
-                    if self.cursor_entry.as_ref().is_none_or(|(db_key, _)| &mem_key < db_key) =>
+            let mem_entry =
+                self.in_memory_cursor.current().map(|(key, node)| (*key, node.as_ref()));
+
+            match (mem_entry, self.cursor_entry.as_ref()) {
+                (Some((mem_key, None)), db_entry)
+                    if db_entry.is_none_or(|(db_key, _)| mem_key < *db_key) =>
                 {
                     // If overlay has a removed node but DB cursor is exhausted or ahead of the
                     // in-memory cursor then move ahead in-memory, as there might be further
                     // non-removed overlay nodes.
                     self.in_memory_cursor.first_after(&mem_key);
                 }
-                (Some((mem_key, None)), Some((db_key, _))) if &mem_key == db_key => {
+                (Some((mem_key, None)), Some((db_key, _))) if mem_key == *db_key => {
                     // If overlay has a removed node which is returned from DB then move both
                     // cursors ahead to the next key.
                     self.in_memory_cursor.first_after(&mem_key);
                     self.cursor_next()?;
                 }
-                (Some((mem_key, Some(node))), _)
-                    if self.cursor_entry.as_ref().is_none_or(|(db_key, _)| &mem_key <= db_key) =>
+                (Some((mem_key, Some(node))), db_entry)
+                    if db_entry.is_none_or(|(db_key, _)| mem_key <= *db_key) =>
                 {
                     // If overlay returns a node prior to the DB's node, or the DB is exhausted,
                     // then we return the overlay's node.
-                    return Ok(Some((mem_key, node)))
+                    return Ok(Some((mem_key, node.clone())))
                 }
                 // All other cases:
                 // - mem_key > db_key
