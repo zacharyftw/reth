@@ -37,6 +37,36 @@ where
         })
     }
 
+    validate_block_post_execution_without_gas_used(
+        block,
+        chain_spec,
+        receipts,
+        requests,
+        receipt_root_bloom,
+    )
+}
+
+/// Validates all post-execution block properties except gas usage.
+///
+/// This performs the same checks as [`validate_block_post_execution`] but skips the
+/// `header.gas_used` vs `receipts.last().cumulative_gas_used` comparison. This is useful
+/// for chains that compute `header.gas_used` differently (e.g., excluding state gas).
+///
+/// Checks performed:
+/// - Receipt root and logs bloom (post-Byzantium)
+/// - Requests hash (post-Prague)
+pub fn validate_block_post_execution_without_gas_used<B, R, ChainSpec>(
+    block: &RecoveredBlock<B>,
+    chain_spec: &ChainSpec,
+    receipts: &[R],
+    requests: &Requests,
+    receipt_root_bloom: Option<(B256, Bloom)>,
+) -> Result<(), ConsensusError>
+where
+    B: Block,
+    R: Receipt,
+    ChainSpec: EthereumHardforks,
+{
     // Before Byzantium, receipts contained state root that would mean that expensive
     // operation as hashing that is required for state root got calculated in every
     // transaction This was replaced with is_success flag.
@@ -191,6 +221,87 @@ mod tests {
             ConsensusError::BodyReceiptRootDiff(diff)
                 if diff.got == calculated_receipts_root && diff.expected == expected_receipts_root
         ));
+    }
+
+    use reth_chainspec::{ChainSpec, ChainSpecBuilder};
+    use reth_ethereum_primitives::Block;
+    use reth_primitives_traits::proofs;
+
+    /// Helper to build a post-Byzantium `RecoveredBlock` with the given receipt root and bloom.
+    fn block_with_receipt_root_bloom(
+        receipts_root: B256,
+        logs_bloom: Bloom,
+    ) -> RecoveredBlock<Block> {
+        let header =
+            reth_primitives_traits::Header { receipts_root, logs_bloom, ..Default::default() };
+        RecoveredBlock::new_unhashed(Block { header, ..Default::default() }, vec![])
+    }
+
+    fn byzantium_chain_spec() -> ChainSpec {
+        ChainSpecBuilder::mainnet().london_activated().build()
+    }
+
+    #[test]
+    fn test_without_gas_used_valid_receipts() {
+        let receipts: Vec<Receipt> = vec![Receipt::default(); 3];
+        let receipts_with_bloom =
+            receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
+        let receipts_root = calculate_receipt_root(&receipts_with_bloom);
+        let logs_bloom =
+            receipts_with_bloom.iter().fold(Bloom::ZERO, |bloom, r| bloom | r.bloom_ref());
+
+        let block = block_with_receipt_root_bloom(receipts_root, logs_bloom);
+        let chain_spec = byzantium_chain_spec();
+
+        assert!(validate_block_post_execution_without_gas_used(
+            &block,
+            &chain_spec,
+            &receipts,
+            &Requests::default(),
+            None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_without_gas_used_wrong_receipt_root() {
+        let receipts: Vec<Receipt> = vec![Receipt::default(); 3];
+        let block = block_with_receipt_root_bloom(B256::random(), Bloom::ZERO);
+        let chain_spec = byzantium_chain_spec();
+
+        assert!(matches!(
+            validate_block_post_execution_without_gas_used(
+                &block,
+                &chain_spec,
+                &receipts,
+                &Requests::default(),
+                None,
+            )
+            .unwrap_err(),
+            ConsensusError::BodyReceiptRootDiff(_)
+        ));
+    }
+
+    #[test]
+    fn test_without_gas_used_precomputed_bloom() {
+        let receipts: Vec<Receipt> = vec![Receipt::default(); 3];
+        let receipts_with_bloom =
+            receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
+        let receipts_root = calculate_receipt_root(&receipts_with_bloom);
+        let logs_bloom =
+            receipts_with_bloom.iter().fold(Bloom::ZERO, |bloom, r| bloom | r.bloom_ref());
+
+        let block = block_with_receipt_root_bloom(receipts_root, logs_bloom);
+        let chain_spec = byzantium_chain_spec();
+
+        assert!(validate_block_post_execution_without_gas_used(
+            &block,
+            &chain_spec,
+            &receipts,
+            &Requests::default(),
+            Some((receipts_root, logs_bloom)),
+        )
+        .is_ok());
     }
 
     #[test]
