@@ -35,6 +35,7 @@ on:
         type: choice
         options:
           - always
+          - on-win
           - on-error
           - never
       mode:
@@ -760,7 +761,7 @@ jobs:
             await core.summary.addRaw(md).write();
 
       - name: Send Slack notification (success)
-        if: success() && env.BENCH_SLACK == 'always'
+        if: success() && (env.BENCH_SLACK == 'always' || env.BENCH_SLACK == 'on-win')
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           SLACK_BENCH_BOT_TOKEN: ${{ secrets.SLACK_BENCH_BOT_TOKEN }}
@@ -788,7 +789,15 @@ jobs:
             // Filter notifications based on mode
             const changes = summary.changes || {};
             const mode = process.env.BENCH_MODE || 'nightly';
+            const slackMode = process.env.BENCH_SLACK || 'always';
             const hasRegression = Object.values(changes).some(c => c.sig === 'bad');
+            const hasImprovement = Object.values(changes).some(c => c.sig === 'good');
+
+            // on-win mode: only notify on improvements
+            if (slackMode === 'on-win' && !hasImprovement) {
+              core.info('on-win mode: no improvement detected, skipping Slack notification');
+              return;
+            }
 
             // Hourly mode: only notify on regressions
             if (mode === 'hourly' && !hasRegression) {
@@ -907,7 +916,7 @@ jobs:
             }
 
       - name: Send Slack notification (failure)
-        if: failure() && env.BENCH_SLACK != 'never'
+        if: failure() && env.BENCH_SLACK != 'never' && env.BENCH_SLACK != 'on-win'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           SLACK_BENCH_BOT_TOKEN: ${{ secrets.SLACK_BENCH_BOT_TOKEN }}
@@ -942,7 +951,7 @@ jobs:
               },
               {
                 type: 'section',
-                text: { type: 'mrkdwn', text: `*${modeLabel} regression* failed while *${failedStep}*\ncc <@U09FARE0B9Q> <@U09FAL2UMLJ>` },
+                text: { type: 'mrkdwn', text: `*${modeLabel} regression* failed while *${failedStep}*\ncc <@U09FARE0B9Q> <@U09FAL2UMLJ>\n@ai investigate this` },
               },
               {
                 type: 'actions',
