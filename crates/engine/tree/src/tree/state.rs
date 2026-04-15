@@ -101,6 +101,23 @@ impl<N: NodePrimitives> TreeState<N> {
         Some((parent_hash, blocks))
     }
 
+    /// Returns deferred trie handles for all available blocks for the given hash that lead back to
+    /// the canonical chain, from newest to oldest, and the parent hash of the oldest returned
+    /// block.
+    ///
+    /// Returns `None` if the block for the given hash is not found.
+    pub fn trie_handles_by_hash(&self, hash: B256) -> Option<(B256, Vec<DeferredTrieData>)> {
+        let block = self.blocks_by_hash.get(&hash)?;
+        let mut parent_hash = block.recovered_block().parent_hash();
+        let mut handles = vec![block.trie_data_handle()];
+        while let Some(executed) = self.blocks_by_hash.get(&parent_hash) {
+            parent_hash = executed.recovered_block().parent_hash();
+            handles.push(executed.trie_data_handle());
+        }
+
+        Some((parent_hash, handles))
+    }
+
     /// Prepares a cached lazy overlay for the current canonical head.
     ///
     /// This should be called after the canonical head changes to optimistically
@@ -113,14 +130,11 @@ impl<N: NodePrimitives> TreeState<N> {
         let canonical_hash = self.current_canonical_head.hash;
 
         // Get blocks leading to the canonical head
-        let Some((anchor_hash, blocks)) = self.blocks_by_hash(canonical_hash) else {
+        let Some((anchor_hash, handles)) = self.trie_handles_by_hash(canonical_hash) else {
             // Canonical head not in memory (persisted), no overlay needed
             self.cached_canonical_overlay = None;
             return None;
         };
-
-        // Extract deferred trie data handles from blocks (newest to oldest)
-        let handles: Vec<DeferredTrieData> = blocks.iter().map(|b| b.trie_data_handle()).collect();
 
         let overlay = LazyOverlay::new(anchor_hash, handles);
         self.cached_canonical_overlay = Some(PreparedCanonicalOverlay {
@@ -133,7 +147,7 @@ impl<N: NodePrimitives> TreeState<N> {
             target: "engine::tree",
             %canonical_hash,
             %anchor_hash,
-            num_blocks = blocks.len(),
+            num_blocks = overlay.num_blocks(),
             "Prepared cached canonical overlay"
         );
 

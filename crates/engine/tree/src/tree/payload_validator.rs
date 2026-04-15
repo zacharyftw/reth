@@ -1564,11 +1564,13 @@ where
         parent_hash: B256,
         state: &EngineApiTreeState<N>,
     ) -> (Option<LazyOverlay>, B256) {
-        // Get blocks leading to the parent to determine the anchor
-        let (anchor_hash, blocks) =
-            state.tree_state.blocks_by_hash(parent_hash).unwrap_or_else(|| (parent_hash, vec![]));
+        // Get deferred trie handles leading to the parent to determine the anchor.
+        let (anchor_hash, handles) = state
+            .tree_state
+            .trie_handles_by_hash(parent_hash)
+            .unwrap_or_else(|| (parent_hash, vec![]));
 
-        if blocks.is_empty() {
+        if handles.is_empty() {
             debug!(target: "engine::tree::payload_validator", "Parent found on disk, no lazy overlay needed");
             return (None, anchor_hash);
         }
@@ -1587,12 +1589,9 @@ where
         debug!(
             target: "engine::tree::payload_validator",
             %anchor_hash,
-            num_blocks = blocks.len(),
+            num_blocks = handles.len(),
             "Creating lazy overlay for in-memory blocks"
         );
-
-        // Extract deferred trie data handles (non-blocking)
-        let handles: Vec<DeferredTrieData> = blocks.iter().map(|b| b.trie_data_handle()).collect();
 
         (Some(LazyOverlay::new(anchor_hash, handles)), anchor_hash)
     }
@@ -1626,13 +1625,12 @@ where
         let (anchor_hash, overlay_blocks) = ctx
             .state()
             .tree_state
-            .blocks_by_hash(block.parent_hash())
+            .trie_handles_by_hash(block.parent_hash())
             .unwrap_or_else(|| (block.parent_hash(), Vec::new()));
 
         // Collect lightweight ancestor trie data handles. We don't call trie_data() here;
         // the merge and any fallback sorting happens in the compute_trie_input_task.
-        let ancestors: Vec<DeferredTrieData> =
-            overlay_blocks.iter().rev().map(|b| b.trie_data_handle()).collect();
+        let ancestors: Vec<DeferredTrieData> = overlay_blocks.into_iter().rev().collect();
 
         // Create deferred handle with fallback inputs in case the background task hasn't completed.
         // Resolve the lazy handle into Arc<HashedPostState>. By this point the hashed state has
