@@ -4,13 +4,13 @@ use alloy_eips::merge::EPOCH_SLOTS;
 use core::time::Duration;
 
 /// Triggers persistence when the number of canonical blocks in memory exceeds this threshold.
-pub const DEFAULT_PERSISTENCE_THRESHOLD: u64 = 12;
+pub const DEFAULT_PERSISTENCE_THRESHOLD: u64 = 42;
 
 /// Maximum canonical-minus-persisted gap before engine API processing is stalled.
-pub const DEFAULT_PERSISTENCE_BACKPRESSURE_THRESHOLD: u64 = 44;
+pub const DEFAULT_PERSISTENCE_BACKPRESSURE_THRESHOLD: u64 = 164;
 
 /// How close to the canonical head we persist blocks.
-pub const DEFAULT_MEMORY_BLOCK_BUFFER_TARGET: u64 = 10;
+pub const DEFAULT_MEMORY_BLOCK_BUFFER_TARGET: u64 = 40;
 
 /// The size of proof targets chunk to spawn in one multiproof calculation.
 pub const DEFAULT_MULTIPROOF_TASK_CHUNK_SIZE: usize = 5;
