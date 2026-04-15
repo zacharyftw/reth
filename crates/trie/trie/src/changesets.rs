@@ -33,6 +33,53 @@ use crate::trie_cursor::{TrieCursor, TrieCursorFactory, TrieStorageCursor};
 /// Result type for changeset operations.
 pub type ChangesetResult<T> = Result<T, DatabaseError>;
 
+/// Reuses a trie cursor across sorted exact-lookups by keeping the first entry at or after the
+/// last probed path.
+#[derive(Debug)]
+struct SortedExactLookupCursor<C> {
+    cursor: C,
+    current: Option<(Nibbles, BranchNodeCompact)>,
+    seeked: bool,
+}
+
+impl<C: TrieCursor> SortedExactLookupCursor<C> {
+    const fn new(cursor: C) -> Self {
+        Self { cursor, current: None, seeked: false }
+    }
+
+    fn reset(&mut self) {
+        self.cursor.reset();
+        self.current = None;
+        self.seeked = false;
+    }
+
+    fn seek_exact_sorted(
+        &mut self,
+        key: Nibbles,
+    ) -> Result<Option<BranchNodeCompact>, DatabaseError> {
+        debug_assert!(
+            self.current.as_ref().is_none_or(|(current, _)| *current <= key),
+            "sorted exact lookup requires monotonically increasing paths"
+        );
+
+        let should_seek = match self.current.as_ref() {
+            Some((current, _)) => *current < key,
+            None => !self.seeked,
+        };
+
+        if should_seek {
+            self.current = self.cursor.seek(key)?;
+        }
+
+        self.seeked = true;
+
+        Ok(self
+            .current
+            .as_ref()
+            .and_then(|(current, node)| (*current == key).then(|| node.clone())))
+    }
+}
+
 /// Computes trie changesets by looking up current node values from the trie.
 ///
 /// Takes the new trie updates and queries the trie for the old values of
@@ -60,18 +107,20 @@ where
     // Compute storage trie changesets
     let mut storage_tries = B256Map::default();
 
-    // Create storage cursor once and reuse it for all addresses
-    let mut storage_cursor = factory.storage_trie_cursor(B256::default())?;
+    // Create storage cursor once and reuse it for all addresses.
+    let mut storage_cursor =
+        SortedExactLookupCursor::new(factory.storage_trie_cursor(B256::default())?);
 
     for (hashed_address, storage_updates) in trie_updates.storage_tries_ref() {
-        storage_cursor.set_hashed_address(*hashed_address);
+        storage_cursor.cursor.set_hashed_address(*hashed_address);
+        storage_cursor.reset();
 
         let storage_changesets = if storage_updates.is_deleted() {
             // Handle wiped storage
-            compute_wiped_storage_changesets(&mut storage_cursor, storage_updates)?
+            compute_wiped_storage_changesets(&mut storage_cursor.cursor, storage_updates)?
         } else {
             // Handle normal storage updates
-            compute_storage_changesets(&mut storage_cursor, storage_updates)?
+            compute_storage_changesets(&mut storage_cursor.cursor, storage_updates)?
         };
 
         if !storage_changesets.is_empty() {
@@ -101,13 +150,13 @@ fn compute_account_changesets<Factory>(
 where
     Factory: TrieCursorFactory,
 {
-    let mut cursor = factory.account_trie_cursor()?;
+    let mut cursor = SortedExactLookupCursor::new(factory.account_trie_cursor()?);
     let mut account_changesets = Vec::with_capacity(trie_updates.account_nodes_ref().len());
 
     // For each changed account node, look up its current value
     // The input is already sorted, so the output will be sorted
     for (path, _new_node) in trie_updates.account_nodes_ref() {
-        let old_node = cursor.seek_exact(*path)?.map(|(_path, node)| node);
+        let old_node = cursor.seek_exact_sorted(*path)?;
         account_changesets.push((*path, old_node));
     }
 
@@ -126,15 +175,16 @@ where
 /// * `hashed_address` - The hashed address of the account
 /// * `storage_updates` - Storage trie updates for this account
 fn compute_storage_changesets(
-    cursor: &mut impl TrieStorageCursor,
+    cursor: &mut impl TrieCursor,
     storage_updates: &StorageTrieUpdatesSorted,
 ) -> ChangesetResult<Vec<(Nibbles, Option<BranchNodeCompact>)>> {
+    let mut cursor = SortedExactLookupCursor::new(cursor);
     let mut storage_changesets = Vec::with_capacity(storage_updates.storage_nodes.len());
 
     // For each changed storage node, look up its current value
     // The input is already sorted, so the output will be sorted
     for (path, _new_node) in &storage_updates.storage_nodes {
-        let old_node = cursor.seek_exact(*path)?.map(|(_path, node)| node);
+        let old_node = cursor.seek_exact_sorted(*path)?;
         storage_changesets.push((*path, old_node));
     }
 
@@ -237,7 +287,7 @@ pub fn storage_trie_wiped_changeset_iter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trie_cursor::mock::MockTrieCursorFactory;
+    use crate::{mock::KeyVisitType, trie_cursor::mock::MockTrieCursorFactory};
     use alloy_primitives::map::B256Map;
     use reth_trie_common::updates::StorageTrieUpdatesSorted;
     use std::collections::BTreeMap;
@@ -303,6 +353,38 @@ mod tests {
         // path3 should have None (it didn't exist before)
         assert_eq!(changesets.account_nodes_ref()[1].0, path3);
         assert_eq!(changesets.account_nodes_ref()[1].1, None);
+    }
+
+    #[test]
+    fn test_account_changesets_reuse_cursor_after_missing_path() {
+        let path1 = Nibbles::from_nibbles([0x1, 0x2, 0x3]);
+        let missing = Nibbles::from_nibbles([0x4, 0x5, 0x6]);
+        let path3 = Nibbles::from_nibbles([0x7, 0x8, 0x9]);
+        let node1 = BranchNodeCompact::new(0b1111, 0b1010, 0, vec![], None);
+        let node3 = BranchNodeCompact::new(0b1111, 0b1100, 0, vec![], None);
+
+        let mut account_nodes = BTreeMap::new();
+        account_nodes.insert(path1, node1.clone());
+        account_nodes.insert(path3, node3.clone());
+
+        let mut storage_tries = B256Map::default();
+        storage_tries.insert(B256::default(), BTreeMap::new());
+        let factory = MockTrieCursorFactory::new(account_nodes, storage_tries);
+
+        let updates = TrieUpdatesSorted::new(
+            vec![(path1, Some(node1.clone())), (missing, None), (path3, Some(node3.clone()))],
+            B256Map::default(),
+        );
+
+        let changesets = compute_trie_changesets(&factory, &updates).unwrap();
+        assert_eq!(changesets.account_nodes_ref()[0].1, Some(node1));
+        assert_eq!(changesets.account_nodes_ref()[1].1, None);
+        assert_eq!(changesets.account_nodes_ref()[2].1, Some(node3));
+
+        let visits = factory.visited_account_keys();
+        assert_eq!(visits.len(), 2, "the final exact hit should reuse the previous seek result");
+        assert_eq!(visits[0].visit_type, KeyVisitType::SeekNonExact(path1));
+        assert_eq!(visits[1].visit_type, KeyVisitType::SeekNonExact(missing));
     }
 
     #[test]
