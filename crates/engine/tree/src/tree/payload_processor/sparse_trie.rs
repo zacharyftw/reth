@@ -9,7 +9,7 @@ use crate::tree::{
     },
     payload_processor::multiproof::MultiProofTaskMetrics,
 };
-use alloy_primitives::B256;
+use alloy_primitives::{map::B256Set, B256};
 use alloy_rlp::{Decodable, Encodable};
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -100,6 +100,8 @@ pub(super) struct SparseTrieCacheTask<A = ConfigurableSparseTrie, S = Configurab
     storage_cache_misses: u64,
     /// Pending proof targets queued for dispatch to proof workers.
     pending_targets: PendingTargets,
+    /// Storage tries whose pending updates were fully drained since the last root computation.
+    drained_storage_tries: B256Set,
     /// Number of pending execution/prewarming updates received but not yet passed to
     /// `update_leaves`.
     pending_updates: usize,
@@ -154,6 +156,7 @@ where
             storage_cache_hits: 0,
             storage_cache_misses: 0,
             pending_targets: Default::default(),
+            drained_storage_tries: Default::default(),
             pending_updates: Default::default(),
             metrics,
         }
@@ -579,6 +582,10 @@ where
             self.storage_cache_hits += (updates_len_before - updates_len_after) as u64;
             self.storage_cache_misses += updates_len_after as u64;
 
+            if !new && updates_len_before > 0 && updates_len_after == 0 {
+                self.drained_storage_tries.insert(*address);
+            }
+
             if !targets.is_empty() {
                 self.pending_targets.extend_storage_targets(address, targets);
             }
@@ -639,11 +646,7 @@ where
     ///
     /// we trigger state root computation on a rayon pool.
     fn compute_drained_storage_roots(&mut self) {
-        let addresses_to_compute_roots: Vec<_> = self
-            .storage_updates
-            .iter()
-            .filter_map(|(address, updates)| updates.is_empty().then_some(*address))
-            .collect();
+        let addresses_to_compute_roots = std::mem::take(&mut self.drained_storage_tries);
 
         struct SendStorageTriePtr<S>(*mut RevealableSparseTrie<S>);
         // SAFETY: this wrapper only forwards the pointer across rayon; deref invariants are
@@ -653,6 +656,10 @@ where
         let mut tries_to_compute_roots: Vec<(B256, SendStorageTriePtr<S>)> =
             Vec::with_capacity(addresses_to_compute_roots.len());
         for address in addresses_to_compute_roots {
+            if self.storage_updates.get(&address).is_none_or(|updates| !updates.is_empty()) {
+                continue;
+            }
+
             if let Some(trie) = self.trie.storage_tries_mut().get_mut(&address) &&
                 !trie.is_root_cached()
             {
