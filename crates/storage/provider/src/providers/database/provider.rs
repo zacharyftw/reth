@@ -67,7 +67,7 @@ use reth_storage_api::{
 use reth_storage_errors::provider::{ProviderResult, StaticFileWriterError};
 use reth_trie::{
     updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
-    HashedPostStateSorted,
+    BranchNodeCompact, HashedPostStateSorted, Nibbles,
 };
 use reth_trie_db::{ChangesetCache, DatabaseStorageTrieCursor, TrieTableAdapter};
 use revm_database::states::{
@@ -721,10 +721,11 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 timings.write_hashed_state += start.elapsed();
 
                 let start = Instant::now();
-                let merged_trie =
-                    TrieUpdatesSorted::merge_batch(blocks.iter().rev().map(|b| b.trie_updates()));
+                let trie_updates =
+                    blocks.iter().rev().map(|b| b.trie_updates()).collect::<Vec<_>>();
+                let merged_trie = TrieUpdatesSorted::merge_slice(&trie_updates);
                 if !merged_trie.is_empty() {
-                    self.write_trie_updates_sorted(&merged_trie)?;
+                    self.write_trie_updates_sorted_owned(merged_trie)?;
                 }
                 timings.write_trie_updates += start.elapsed();
             }
@@ -3073,6 +3074,35 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
         Ok(())
     }
 
+    fn write_account_trie_updates_owned<A: TrieTableAdapter>(
+        tx: &TX,
+        account_nodes: Vec<(Nibbles, Option<BranchNodeCompact>)>,
+        num_entries: &mut usize,
+    ) -> ProviderResult<()>
+    where
+        TX: DbTxMut,
+    {
+        let mut account_trie_cursor = tx.cursor_write::<A::AccountTrieTable>()?;
+        for (key, updated_node) in account_nodes {
+            match updated_node {
+                Some(node) => {
+                    if !key.is_empty() {
+                        *num_entries += 1;
+                        account_trie_cursor.upsert(A::AccountKey::from(key), &node)?;
+                    }
+                }
+                None => {
+                    *num_entries += 1;
+                    let key = A::AccountKey::from(key);
+                    if account_trie_cursor.seek_exact(key)?.is_some() {
+                        account_trie_cursor.delete_current()?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn write_storage_tries<A: TrieTableAdapter>(
         tx: &TX,
         storage_tries: Vec<(&B256, &StorageTrieUpdatesSorted)>,
@@ -3090,6 +3120,58 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
             cursor = db_storage_trie_cursor.cursor;
         }
         Ok(())
+    }
+
+    fn write_storage_tries_owned<A: TrieTableAdapter>(
+        tx: &TX,
+        mut storage_tries: Vec<(B256, StorageTrieUpdatesSorted)>,
+        num_entries: &mut usize,
+    ) -> ProviderResult<()>
+    where
+        TX: DbTxMut,
+    {
+        storage_tries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let mut cursor = tx.cursor_dup_write::<A::StorageTrieTable>()?;
+        for (hashed_address, storage_trie_updates) in storage_tries {
+            let mut db_storage_trie_cursor: DatabaseStorageTrieCursor<_, A> =
+                DatabaseStorageTrieCursor::new(cursor, hashed_address);
+            *num_entries += db_storage_trie_cursor
+                .write_storage_trie_updates_sorted_owned(storage_trie_updates)?;
+            cursor = db_storage_trie_cursor.cursor;
+        }
+        Ok(())
+    }
+
+    #[instrument(level = "debug", target = "providers::db", skip_all)]
+    fn write_trie_updates_sorted_owned(
+        &self,
+        trie_updates: TrieUpdatesSorted,
+    ) -> ProviderResult<usize> {
+        if trie_updates.is_empty() {
+            return Ok(0)
+        }
+
+        let (account_nodes, storage_tries) = trie_updates.into_parts();
+        let mut account_nodes = Some(account_nodes);
+        let mut storage_tries = Some(storage_tries.into_iter().collect::<Vec<_>>());
+        let mut num_entries = 0;
+
+        reth_trie_db::with_adapter!(self, |A| {
+            Self::write_account_trie_updates_owned::<A>(
+                self.tx_ref(),
+                account_nodes.take().expect("with_adapter executes once"),
+                &mut num_entries,
+            )?;
+            Self::write_storage_tries_owned::<A>(
+                self.tx_ref(),
+                storage_tries.take().expect("with_adapter executes once"),
+                &mut num_entries,
+            )?;
+            Ok::<_, ProviderError>(())
+        })?;
+
+        Ok(num_entries)
     }
 }
 

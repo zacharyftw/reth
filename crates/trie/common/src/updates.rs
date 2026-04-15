@@ -594,6 +594,13 @@ impl TrieUpdatesSorted {
         &self.storage_tries
     }
 
+    /// Splits the sorted updates into owned account-node and storage-trie collections.
+    pub fn into_parts(
+        self,
+    ) -> (Vec<(Nibbles, Option<BranchNodeCompact>)>, B256Map<StorageTrieUpdatesSorted>) {
+        (self.account_nodes, self.storage_tries)
+    }
+
     /// Returns the total number of updates including account nodes and all storage updates.
     pub fn total_len(&self) -> usize {
         self.account_nodes.len() +
@@ -783,6 +790,11 @@ impl StorageTrieUpdatesSorted {
     /// Returns `true` if there are no storage node updates.
     pub const fn is_empty(&self) -> bool {
         self.storage_nodes.is_empty()
+    }
+
+    /// Splits the sorted storage updates into the wipe flag and owned node list.
+    pub fn into_parts(self) -> (bool, Vec<(Nibbles, Option<BranchNodeCompact>)>) {
+        (self.is_deleted, self.storage_nodes)
     }
 
     /// Extends the storage trie updates with another set of sorted updates.

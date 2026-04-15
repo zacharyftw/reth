@@ -281,8 +281,9 @@ where
         &mut self,
         updates: &StorageTrieUpdatesSorted,
     ) -> Result<usize, DatabaseError> {
-        // The storage trie for this account has to be deleted.
-        if updates.is_deleted() && self.cursor.seek_exact(self.hashed_address)?.is_some() {
+        let trie_was_wiped =
+            updates.is_deleted() && self.cursor.seek_exact(self.hashed_address)?.is_some();
+        if trie_was_wiped {
             self.cursor.delete_current_duplicates()?;
         }
 
@@ -292,11 +293,11 @@ where
             num_entries += 1;
             let nibbles = A::StorageSubKey::from(*nibbles);
             // Delete the old entry if it exists.
-            if self
-                .cursor
-                .seek_by_key_subkey(self.hashed_address, nibbles.clone())?
-                .as_ref()
-                .is_some_and(|e| *e.nibbles() == nibbles)
+            if !trie_was_wiped &&
+                self.cursor
+                    .seek_by_key_subkey(self.hashed_address, nibbles.clone())?
+                    .as_ref()
+                    .is_some_and(|e| *e.nibbles() == nibbles)
             {
                 self.cursor.delete_current()?;
             }
@@ -305,6 +306,39 @@ where
             if let Some(node) = maybe_updated {
                 self.cursor
                     .upsert(self.hashed_address, &A::StorageValue::new(nibbles, node.clone()))?;
+            }
+        }
+
+        Ok(num_entries)
+    }
+
+    /// Writes storage updates by value so callers can reuse merged trie nodes without cloning.
+    pub fn write_storage_trie_updates_sorted_owned(
+        &mut self,
+        updates: StorageTrieUpdatesSorted,
+    ) -> Result<usize, DatabaseError> {
+        let (is_deleted, storage_nodes) = updates.into_parts();
+        let trie_was_wiped = is_deleted && self.cursor.seek_exact(self.hashed_address)?.is_some();
+        if trie_was_wiped {
+            self.cursor.delete_current_duplicates()?;
+        }
+
+        let mut num_entries = 0;
+        for (nibbles, maybe_updated) in storage_nodes.into_iter().filter(|(n, _)| !n.is_empty()) {
+            num_entries += 1;
+            let nibbles = A::StorageSubKey::from(nibbles);
+            if !trie_was_wiped &&
+                self.cursor
+                    .seek_by_key_subkey(self.hashed_address, nibbles.clone())?
+                    .as_ref()
+                    .is_some_and(|e| *e.nibbles() == nibbles)
+            {
+                self.cursor.delete_current()?;
+            }
+
+            if let Some(node) = maybe_updated {
+                let value = A::StorageValue::new(nibbles, node);
+                self.cursor.upsert(self.hashed_address, &value)?;
             }
         }
 
