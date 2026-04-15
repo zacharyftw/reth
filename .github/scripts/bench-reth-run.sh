@@ -99,11 +99,15 @@ free -h
 grep Cached /proc/meminfo
 
 # Start reth
-# CPU layout: last core = OS/IRQs/reth-bench/aux, lower cores = reth node.
+# CPU layout: last online core = OS/IRQs/reth-bench/aux, lower cores = reth node.
 # On AMD EPYC (Zen 5) with asymmetric L3 (96 MiB on CCD 0 vs 32 MiB on CCD 1),
 # this gives reth all of the big-cache chiplet (cores 0-7).
+#
+# Count only online CPUs so we skip offlined SMT siblings, but read from
+# /sys instead of nproc because this script may itself be pinned to a single
+# core via taskset (nproc would then return 1).
 RETH_BENCH="$(which reth-bench)"
-ONLINE=$(nproc)
+ONLINE=$(grep -c '^processor' /proc/cpuinfo)
 MAX_RETH=$(( ONLINE - 1 ))
 if [ "${BENCH_CORES:-0}" -gt 0 ] && [ "$BENCH_CORES" -lt "$MAX_RETH" ]; then
   MAX_RETH=$BENCH_CORES
