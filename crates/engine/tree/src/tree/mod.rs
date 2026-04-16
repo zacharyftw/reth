@@ -405,9 +405,6 @@ where
     ///
     /// Returns the sender through which incoming requests can be sent to the task and the receiver
     /// end of a [`EngineApiEvent`] unbounded channel to receive events from the engine.
-    ///
-    /// Persistence can be suppressed at runtime via
-    /// [`PersistenceHandle::set_persistence_enabled`].
     #[expect(clippy::complexity)]
     pub fn spawn_new(
         provider: P,
