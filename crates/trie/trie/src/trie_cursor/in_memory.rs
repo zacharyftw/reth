@@ -62,6 +62,7 @@ pub struct InMemoryTrieCursor<'a, C> {
     in_memory_cursor: ForwardInMemoryCursor<'a, Nibbles, Option<BranchNodeCompact>>,
     /// The key most recently returned from the Cursor.
     last_key: Option<Nibbles>,
+    #[cfg(debug_assertions)]
     /// Whether an initial seek was called.
     seeked: bool,
     /// Reference to the full trie updates.
@@ -109,6 +110,7 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
             db_cursor_state: DbCursorState::NeedsPosition,
             in_memory_cursor,
             last_key: None,
+            #[cfg(debug_assertions)]
             seeked: false,
             trie_updates,
         }
@@ -128,6 +130,7 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
             db_cursor_state: DbCursorState::new(cursor_wiped),
             in_memory_cursor,
             last_key: None,
+            #[cfg(debug_assertions)]
             seeked: false,
             trie_updates,
         }
@@ -184,8 +187,11 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
 
     /// Advances the DB cursor state to the subsequent entry using the underlying cursor.
     fn cursor_next(&mut self) -> Result<(), DatabaseError> {
-        debug_assert!(self.seeked);
-        debug_assert!(!matches!(self.db_cursor_state, DbCursorState::NeedsPosition));
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(self.seeked);
+            debug_assert!(!matches!(self.db_cursor_state, DbCursorState::NeedsPosition));
+        }
 
         // Exhausted and wiped states are stable; only advance if the DB cursor currently points to
         // an entry.
@@ -249,7 +255,10 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
         if let Some((mem_key, entry_inner)) = mem_entry &&
             *mem_key == key
         {
-            self.seeked = true;
+            #[cfg(debug_assertions)]
+            {
+                self.seeked = true;
+            }
 
             // An exact overlay hit can move the logical cursor ahead without touching the DB. If
             // the DB cursor was still behind this key, force a re-seek before the next DB-backed
@@ -266,7 +275,10 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
 
         self.cursor_seek(key)?;
 
-        self.seeked = true;
+        #[cfg(debug_assertions)]
+        {
+            self.seeked = true;
+        }
 
         let entry = match self.db_cursor_state.entry() {
             Some((db_key, node)) if db_key == &key => Some((key, node.clone())),
@@ -284,7 +296,10 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
         self.cursor_seek(key)?;
         self.in_memory_cursor.seek(&key);
 
-        self.seeked = true;
+        #[cfg(debug_assertions)]
+        {
+            self.seeked = true;
+        }
 
         let entry = self.choose_next_entry()?;
         self.set_last_key(&entry);
@@ -292,7 +307,10 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
     }
 
     fn next(&mut self) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
-        debug_assert!(self.seeked, "Cursor must be seek'd before next is called");
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(self.seeked, "Cursor must be seek'd before next is called");
+        }
 
         // A `last_key` of `None` indicates that the cursor is exhausted.
         let Some(last_key) = self.last_key else {
@@ -330,15 +348,15 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
     }
 
     fn reset(&mut self) {
-        let Self { cursor, db_cursor_state, in_memory_cursor, last_key, seeked, trie_updates: _ } =
-            self;
+        self.cursor.reset();
+        self.in_memory_cursor.reset();
 
-        cursor.reset();
-        in_memory_cursor.reset();
-
-        *db_cursor_state = DbCursorState::NeedsPosition;
-        *last_key = None;
-        *seeked = false;
+        self.db_cursor_state = DbCursorState::NeedsPosition;
+        self.last_key = None;
+        #[cfg(debug_assertions)]
+        {
+            self.seeked = false;
+        }
     }
 }
 
