@@ -30,15 +30,14 @@ use std::sync::Arc;
 /// This spawns and wires together the following components:
 ///
 /// - **[`BasicBlockDownloader`]** — downloads blocks on demand from the network during live sync.
+/// - **[`PersistenceHandle`]** — handle to the persistence service for writing blocks and
+///   performing pruning outside the critical consensus path.
 /// - **[`EngineApiTreeHandler`]** — spawns the tree handler that processes engine API requests
 ///   (`newPayload`, `forkchoiceUpdated`) and maintains the in-memory chain state.
 /// - **[`EngineApiRequestHandler`]** + **[`EngineHandler`]** — glue that routes incoming CL
 ///   messages to the tree handler and manages download requests.
 /// - **[`PipelineSync`]** — wraps the staged sync [`Pipeline`] for backfill sync when the node
 ///   needs to catch up over large block ranges.
-///
-/// The caller is responsible for spawning the [`PersistenceHandle`] via
-/// [`PersistenceHandle::spawn_service`] and passing it in.
 ///
 /// The returned orchestrator implements [`Stream`] and yields
 /// [`ChainEvent`]s.
