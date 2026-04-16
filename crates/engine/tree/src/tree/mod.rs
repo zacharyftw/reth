@@ -405,6 +405,9 @@ where
     ///
     /// Returns the sender through which incoming requests can be sent to the task and the receiver
     /// end of a [`EngineApiEvent`] unbounded channel to receive events from the engine.
+    ///
+    /// Persistence can be suppressed at runtime via
+    /// [`PersistenceHandle::set_persistence_enabled`].
     #[expect(clippy::complexity)]
     pub fn spawn_new(
         provider: P,
@@ -2010,9 +2013,13 @@ where
     }
 
     /// Returns true if the canonical chain length minus the last persisted
-    /// block is greater than or equal to the persistence threshold and
-    /// backfill is not running.
-    pub const fn should_persist(&self) -> bool {
+    /// block is greater than or equal to the persistence threshold,
+    /// backfill is not running, and the external persistence gate is open.
+    pub fn should_persist(&self) -> bool {
+        if !self.persistence.is_persistence_enabled() {
+            return false
+        }
+
         if !self.backfill_sync_state.is_idle() {
             // can't persist if backfill is running
             return false

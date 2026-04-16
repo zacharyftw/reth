@@ -14,6 +14,7 @@ use reth_stages_api::{MetricEvent, MetricEventsSender};
 use reth_tasks::spawn_os_thread;
 use std::{
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, SendError, Sender},
         Arc,
     },
@@ -247,6 +248,11 @@ pub struct PersistenceHandle<N: NodePrimitives = EthPrimitives> {
     /// Guard that joins the service thread when all handles are dropped.
     /// Uses `Arc` so the handle remains `Clone`.
     _service_guard: Arc<ServiceGuard>,
+    /// External gate to suppress persistence. When `false`,
+    /// [`EngineApiTreeHandler::should_persist`](crate::tree::EngineApiTreeHandler::should_persist)
+    /// returns `false`, preventing new persistence cycles from starting. An in-flight persistence
+    /// task is unaffected.
+    persistence_enabled: Arc<AtomicBool>,
 }
 
 impl<T: NodePrimitives> PersistenceHandle<T> {
@@ -255,7 +261,11 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
     /// This is intended for testing purposes where you want to mock the persistence service.
     /// For production use, prefer [`spawn_service`](Self::spawn_service).
     pub fn new(sender: Sender<PersistenceAction<T>>) -> Self {
-        Self { sender, _service_guard: Arc::new(ServiceGuard(None)) }
+        Self {
+            sender,
+            _service_guard: Arc::new(ServiceGuard(None)),
+            persistence_enabled: Arc::new(AtomicBool::new(true)),
+        }
     }
 
     /// Create a new [`PersistenceHandle`], and spawn the persistence service.
@@ -286,6 +296,7 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
         PersistenceHandle {
             sender: db_service_tx,
             _service_guard: Arc::new(ServiceGuard(Some(join_handle))),
+            persistence_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -296,6 +307,24 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
         action: PersistenceAction<T>,
     ) -> Result<(), SendError<PersistenceAction<T>>> {
         self.sender.send(action)
+    }
+
+    /// Returns `true` if persistence is enabled.
+    ///
+    /// When `false`, the tree handler will not start new persistence cycles.
+    pub fn is_persistence_enabled(&self) -> bool {
+        self.persistence_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Sets the persistence gate.
+    ///
+    /// When set to `false`, no new persistence cycles will be started by the tree handler.
+    /// An in-flight persistence task is unaffected.
+    ///
+    /// When set back to `true`, the tree handler will resume starting persistence cycles
+    /// on its next loop iteration.
+    pub fn set_persistence_enabled(&self, enabled: bool) {
+        self.persistence_enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// Tells the persistence service to save a certain list of finalized blocks. The blocks are
