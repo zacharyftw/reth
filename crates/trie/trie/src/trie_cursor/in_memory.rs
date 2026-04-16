@@ -168,9 +168,10 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
         // Only seek if:
         // 1. We have a cursor entry and need to seek forward (entry.0 < key), OR
         // 2. The DB cursor needs to be positioned.
-        let should_seek = match self.db_cursor_state.entry() {
-            Some(entry) => entry.0 < key,
-            None => matches!(self.db_cursor_state, DbCursorState::NeedsPosition),
+        let should_seek = match &self.db_cursor_state {
+            DbCursorState::NeedsPosition => true,
+            DbCursorState::Positioned((entry_key, _)) => entry_key < &key,
+            DbCursorState::Exhausted | DbCursorState::Wiped => false,
         };
 
         if should_seek {
@@ -184,9 +185,10 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
     /// Advances the DB cursor state to the subsequent entry using the underlying cursor.
     fn cursor_next(&mut self) -> Result<(), DatabaseError> {
         debug_assert!(self.seeked);
+        debug_assert!(!matches!(self.db_cursor_state, DbCursorState::NeedsPosition));
 
-        // If the previous entry is `None`, and we've done a seek previously, then the cursor is
-        // exhausted and we shouldn't call `next` again.
+        // Exhausted and wiped states are stable; only advance if the DB cursor currently points to
+        // an entry.
         if matches!(self.db_cursor_state, DbCursorState::Positioned(_)) {
             let entry = self.get_cursor_mut().map(|c| c.next()).transpose()?.flatten();
             self.db_cursor_state.set_entry(entry);
@@ -202,9 +204,12 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
     /// node.
     fn choose_next_entry(&mut self) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
         loop {
-            match (self.in_memory_cursor.current().cloned(), self.db_cursor_state.entry()) {
+            let mem_entry = self.in_memory_cursor.current().cloned();
+            let db_entry = self.db_cursor_state.entry().cloned();
+
+            match (mem_entry, db_entry.as_ref()) {
                 (Some((mem_key, None)), _)
-                    if self.db_cursor_state.entry().is_none_or(|(db_key, _)| &mem_key < db_key) =>
+                    if db_entry.as_ref().is_none_or(|(db_key, _)| &mem_key < db_key) =>
                 {
                     // If overlay has a removed node but DB cursor is exhausted or ahead of the
                     // in-memory cursor then move ahead in-memory, as there might be further
@@ -218,10 +223,7 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
                     self.cursor_next()?;
                 }
                 (Some((mem_key, Some(node))), _)
-                    if self
-                        .db_cursor_state
-                        .entry()
-                        .is_none_or(|(db_key, _)| &mem_key <= db_key) =>
+                    if db_entry.as_ref().is_none_or(|(db_key, _)| &mem_key <= db_key) =>
                 {
                     // If overlay returns a node prior to the DB's node, or the DB is exhausted,
                     // then we return the overlay's node.
@@ -231,7 +233,7 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
                 // - mem_key > db_key
                 // - overlay is exhausted
                 // Return the db_entry. If DB is also exhausted then this returns None.
-                _ => return Ok(self.db_cursor_state.entry().cloned()),
+                _ => return Ok(db_entry),
             }
         }
     }
@@ -249,8 +251,10 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
         {
             self.seeked = true;
 
-            if self.db_cursor_state.entry().is_some_and(|(db_key, _)| db_key < &key) ||
-                matches!(self.db_cursor_state, DbCursorState::NeedsPosition)
+            // An exact overlay hit can move the logical cursor ahead without touching the DB. If
+            // the DB cursor was still behind this key, force a re-seek before the next DB-backed
+            // operation so `next()` cannot return a stale earlier entry.
+            if matches!(&self.db_cursor_state, DbCursorState::Positioned((db_key, _)) if db_key < &key)
             {
                 self.db_cursor_state = DbCursorState::NeedsPosition;
             }
