@@ -398,19 +398,6 @@ impl<Node: FullNodeComponents, EthApi: EthApiTypes> RpcHandle<Node, EthApi> {
         &self.beacon_engine_handle
     }
 
-    /// Returns `true` if engine persistence cycles are enabled.
-    pub fn is_persistence_enabled(&self) -> bool {
-        self.persistence_gate.is_enabled()
-    }
-
-    /// Sets the engine persistence gate.
-    ///
-    /// When set to `false`, no new persistence cycles will be started by the tree handler.
-    /// An in-flight persistence task is unaffected. Set back to `true` to resume.
-    pub fn set_persistence_enabled(&self, enabled: bool) {
-        self.persistence_gate.set_enabled(enabled);
-    }
-
     /// Returns the consensus engine events sender.
     pub const fn consensus_engine_events(
         &self,

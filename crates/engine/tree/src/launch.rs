@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 /// Builds the engine [`ChainOrchestrator`] that drives the chain forward.
 ///
-/// This wires together the following components:
+/// This spawns and wires together the following components:
 ///
 /// - **[`BasicBlockDownloader`]** — downloads blocks on demand from the network during live sync.
 /// - **[`EngineApiTreeHandler`]** — spawns the tree handler that processes engine API requests
