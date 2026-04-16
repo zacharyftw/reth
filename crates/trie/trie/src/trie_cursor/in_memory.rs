@@ -56,12 +56,8 @@ where
 pub struct InMemoryTrieCursor<'a, C> {
     /// The underlying cursor.
     cursor: C,
-    /// Whether the underlying cursor should be ignored (when storage trie was wiped).
-    cursor_wiped: bool,
-    /// Entry that `cursor` is currently pointing to.
-    cursor_entry: Option<(Nibbles, BranchNodeCompact)>,
-    /// Whether the DB cursor has been positioned at least once.
-    cursor_seeked: bool,
+    /// Tracks whether the DB cursor is available, positioned, or exhausted.
+    db_cursor_state: DbCursorState,
     /// Forward-only in-memory cursor over storage trie nodes.
     in_memory_cursor: ForwardInMemoryCursor<'a, Nibbles, Option<BranchNodeCompact>>,
     /// The key most recently returned from the Cursor.
@@ -72,15 +68,45 @@ pub struct InMemoryTrieCursor<'a, C> {
     trie_updates: &'a TrieUpdatesSorted,
 }
 
+#[derive(Debug)]
+enum DbCursorState {
+    NeedsPosition,
+    Positioned((Nibbles, BranchNodeCompact)),
+    Exhausted,
+    Wiped,
+}
+
+impl DbCursorState {
+    const fn new(cursor_wiped: bool) -> Self {
+        if cursor_wiped {
+            Self::Wiped
+        } else {
+            Self::NeedsPosition
+        }
+    }
+
+    const fn entry(&self) -> Option<&(Nibbles, BranchNodeCompact)> {
+        match self {
+            Self::Positioned(entry) => Some(entry),
+            Self::NeedsPosition | Self::Exhausted | Self::Wiped => None,
+        }
+    }
+
+    fn set_entry(&mut self, entry: Option<(Nibbles, BranchNodeCompact)>) {
+        *self = match entry {
+            Some(entry) => Self::Positioned(entry),
+            None => Self::Exhausted,
+        };
+    }
+}
+
 impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
     /// Create new account trie cursor which combines a DB cursor and the trie updates.
     pub fn new_account(cursor: C, trie_updates: &'a TrieUpdatesSorted) -> Self {
         let in_memory_cursor = ForwardInMemoryCursor::new(trie_updates.account_nodes_ref());
         Self {
             cursor,
-            cursor_wiped: false,
-            cursor_entry: None,
-            cursor_seeked: false,
+            db_cursor_state: DbCursorState::NeedsPosition,
             in_memory_cursor,
             last_key: None,
             seeked: false,
@@ -99,9 +125,7 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
             Self::get_storage_overlay(trie_updates, hashed_address);
         Self {
             cursor,
-            cursor_wiped,
-            cursor_entry: None,
-            cursor_seeked: false,
+            db_cursor_state: DbCursorState::new(cursor_wiped),
             in_memory_cursor,
             last_key: None,
             seeked: false,
@@ -123,7 +147,7 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
 
     /// Returns a mutable reference to the underlying cursor if it's not wiped, None otherwise.
     fn get_cursor_mut(&mut self) -> Option<&mut C> {
-        (!self.cursor_wiped).then_some(&mut self.cursor)
+        (!matches!(self.db_cursor_state, DbCursorState::Wiped)).then_some(&mut self.cursor)
     }
 
     /// Asserts that the next entry to be returned from the cursor is not previous to the last entry
@@ -139,32 +163,33 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
         self.last_key = next_key;
     }
 
-    /// Seeks the `cursor_entry` field of the struct using the cursor.
+    /// Positions the DB cursor state using the underlying cursor when needed.
     fn cursor_seek(&mut self, key: Nibbles) -> Result<(), DatabaseError> {
         // Only seek if:
         // 1. We have a cursor entry and need to seek forward (entry.0 < key), OR
-        // 2. We have no cursor entry and haven't positioned the DB cursor yet.
-        let should_seek = match self.cursor_entry.as_ref() {
+        // 2. The DB cursor needs to be positioned.
+        let should_seek = match self.db_cursor_state.entry() {
             Some(entry) => entry.0 < key,
-            None => !self.cursor_seeked,
+            None => matches!(self.db_cursor_state, DbCursorState::NeedsPosition),
         };
 
         if should_seek {
-            self.cursor_entry = self.get_cursor_mut().map(|c| c.seek(key)).transpose()?.flatten();
-            self.cursor_seeked = true;
+            let entry = self.get_cursor_mut().map(|c| c.seek(key)).transpose()?.flatten();
+            self.db_cursor_state.set_entry(entry);
         }
 
         Ok(())
     }
 
-    /// Seeks the `cursor_entry` field of the struct to the subsequent entry using the cursor.
+    /// Advances the DB cursor state to the subsequent entry using the underlying cursor.
     fn cursor_next(&mut self) -> Result<(), DatabaseError> {
         debug_assert!(self.seeked);
 
         // If the previous entry is `None`, and we've done a seek previously, then the cursor is
         // exhausted and we shouldn't call `next` again.
-        if self.cursor_entry.is_some() {
-            self.cursor_entry = self.get_cursor_mut().map(|c| c.next()).transpose()?.flatten();
+        if matches!(self.db_cursor_state, DbCursorState::Positioned(_)) {
+            let entry = self.get_cursor_mut().map(|c| c.next()).transpose()?.flatten();
+            self.db_cursor_state.set_entry(entry);
         }
 
         Ok(())
@@ -177,9 +202,9 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
     /// node.
     fn choose_next_entry(&mut self) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
         loop {
-            match (self.in_memory_cursor.current().cloned(), &self.cursor_entry) {
+            match (self.in_memory_cursor.current().cloned(), self.db_cursor_state.entry()) {
                 (Some((mem_key, None)), _)
-                    if self.cursor_entry.as_ref().is_none_or(|(db_key, _)| &mem_key < db_key) =>
+                    if self.db_cursor_state.entry().is_none_or(|(db_key, _)| &mem_key < db_key) =>
                 {
                     // If overlay has a removed node but DB cursor is exhausted or ahead of the
                     // in-memory cursor then move ahead in-memory, as there might be further
@@ -193,7 +218,10 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
                     self.cursor_next()?;
                 }
                 (Some((mem_key, Some(node))), _)
-                    if self.cursor_entry.as_ref().is_none_or(|(db_key, _)| &mem_key <= db_key) =>
+                    if self
+                        .db_cursor_state
+                        .entry()
+                        .is_none_or(|(db_key, _)| &mem_key <= db_key) =>
                 {
                     // If overlay returns a node prior to the DB's node, or the DB is exhausted,
                     // then we return the overlay's node.
@@ -203,7 +231,7 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
                 // - mem_key > db_key
                 // - overlay is exhausted
                 // Return the db_entry. If DB is also exhausted then this returns None.
-                _ => return Ok(self.cursor_entry.clone()),
+                _ => return Ok(self.db_cursor_state.entry().cloned()),
             }
         }
     }
@@ -221,6 +249,12 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
         {
             self.seeked = true;
 
+            if self.db_cursor_state.entry().is_some_and(|(db_key, _)| db_key < &key) ||
+                matches!(self.db_cursor_state, DbCursorState::NeedsPosition)
+            {
+                self.db_cursor_state = DbCursorState::NeedsPosition;
+            }
+
             let entry = entry_inner.clone().map(|node| (key, node));
             self.set_last_key(&entry);
             return Ok(entry)
@@ -230,7 +264,7 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
 
         self.seeked = true;
 
-        let entry = match &self.cursor_entry {
+        let entry = match self.db_cursor_state.entry() {
             Some((db_key, node)) if db_key == &key => Some((key, node.clone())),
             _ => None,
         };
@@ -269,7 +303,11 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
             self.in_memory_cursor.first_after(&last_key);
         }
 
-        if let Some((key, _)) = &self.cursor_entry &&
+        if matches!(self.db_cursor_state, DbCursorState::NeedsPosition) {
+            self.cursor_seek(last_key)?;
+        }
+
+        if let Some((key, _)) = self.db_cursor_state.entry() &&
             key == &last_key
         {
             self.cursor_next()?;
@@ -288,23 +326,13 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
     }
 
     fn reset(&mut self) {
-        let Self {
-            cursor,
-            cursor_wiped,
-            cursor_entry,
-            cursor_seeked,
-            in_memory_cursor,
-            last_key,
-            seeked,
-            trie_updates: _,
-        } = self;
+        let Self { cursor, db_cursor_state, in_memory_cursor, last_key, seeked, trie_updates: _ } =
+            self;
 
         cursor.reset();
         in_memory_cursor.reset();
 
-        *cursor_wiped = false;
-        *cursor_entry = None;
-        *cursor_seeked = false;
+        *db_cursor_state = DbCursorState::NeedsPosition;
         *last_key = None;
         *seeked = false;
     }
@@ -314,8 +342,10 @@ impl<C: TrieStorageCursor> TrieStorageCursor for InMemoryTrieCursor<'_, C> {
     fn set_hashed_address(&mut self, hashed_address: B256) {
         self.reset();
         self.cursor.set_hashed_address(hashed_address);
-        (self.in_memory_cursor, self.cursor_wiped) =
+        let (in_memory_cursor, cursor_wiped) =
             Self::get_storage_overlay(self.trie_updates, hashed_address);
+        self.in_memory_cursor = in_memory_cursor;
+        self.db_cursor_state = DbCursorState::new(cursor_wiped);
     }
 }
 
