@@ -162,7 +162,7 @@ where
 
         if let Some(last) = last_block {
             let provider_rw = self.provider.database_provider_rw()?;
-            provider_rw.save_blocks(blocks, SaveBlocksMode::Full)?;
+            provider_rw.save_blocks(&blocks, 0..0, SaveBlocksMode::Full)?;
 
             if let Some(finalized) = pending_finalized {
                 provider_rw.save_finalized_block_number(finalized.min(last.number))?;
@@ -555,7 +555,7 @@ mod tests {
 
         {
             let provider_rw = provider_factory.database_provider_rw().unwrap();
-            provider_rw.save_blocks(blocks_a, SaveBlocksMode::Full).unwrap();
+            provider_rw.save_blocks(&blocks_a, 0..0, SaveBlocksMode::Full).unwrap();
             provider_rw.commit().unwrap();
         }
 
@@ -612,7 +612,9 @@ mod tests {
             provider_rw.commit().unwrap();
 
             let provider_rw = pf.database_provider_rw().unwrap();
-            provider_rw.save_blocks(vec![block_b2], SaveBlocksMode::Full).unwrap();
+            provider_rw
+                .save_blocks(std::slice::from_ref(&block_b2), 0..0, SaveBlocksMode::Full)
+                .unwrap();
             provider_rw.commit().unwrap();
         });
 
