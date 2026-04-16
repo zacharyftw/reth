@@ -60,8 +60,6 @@ pub struct InMemoryTrieCursor<'a, C> {
     cursor_wiped: bool,
     /// Entry that `cursor` is currently pointing to.
     cursor_entry: Option<(Nibbles, BranchNodeCompact)>,
-    /// Whether the DB cursor has been positioned at least once.
-    cursor_seeked: bool,
     /// Forward-only in-memory cursor over storage trie nodes.
     in_memory_cursor: ForwardInMemoryCursor<'a, Nibbles, Option<BranchNodeCompact>>,
     /// The key most recently returned from the Cursor.
@@ -80,7 +78,6 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
             cursor,
             cursor_wiped: false,
             cursor_entry: None,
-            cursor_seeked: false,
             in_memory_cursor,
             last_key: None,
             seeked: false,
@@ -101,7 +98,6 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
             cursor,
             cursor_wiped,
             cursor_entry: None,
-            cursor_seeked: false,
             in_memory_cursor,
             last_key: None,
             seeked: false,
@@ -143,15 +139,14 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
     fn cursor_seek(&mut self, key: Nibbles) -> Result<(), DatabaseError> {
         // Only seek if:
         // 1. We have a cursor entry and need to seek forward (entry.0 < key), OR
-        // 2. We have no cursor entry and haven't positioned the DB cursor yet.
+        // 2. We have no cursor entry and haven't seeked yet (!self.seeked)
         let should_seek = match self.cursor_entry.as_ref() {
             Some(entry) => entry.0 < key,
-            None => !self.cursor_seeked,
+            None => !self.seeked,
         };
 
         if should_seek {
             self.cursor_entry = self.get_cursor_mut().map(|c| c.seek(key)).transpose()?.flatten();
-            self.cursor_seeked = true;
         }
 
         Ok(())
@@ -216,18 +211,20 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
     ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
         let mem_entry = self.in_memory_cursor.seek(&key);
 
+        // Short-circuit on exact overlay hit. Skip the DB seek when the cursor has never
+        // been positioned; otherwise advance it so subsequent next() calls are consistent.
         if let Some((mem_key, entry_inner)) = mem_entry &&
             *mem_key == key
         {
-            self.seeked = true;
-
             let entry = entry_inner.clone().map(|node| (key, node));
+            if self.seeked {
+                self.cursor_seek(key)?;
+            }
             self.set_last_key(&entry);
-            return Ok(entry)
+            return Ok(entry);
         }
 
         self.cursor_seek(key)?;
-
         self.seeked = true;
 
         let entry = match &self.cursor_entry {
@@ -254,12 +251,22 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
     }
 
     fn next(&mut self) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
-        debug_assert!(self.seeked, "Cursor must be seek'd before next is called");
+        debug_assert!(
+            self.seeked || self.last_key.is_some(),
+            "Cursor must be seek'd before next is called"
+        );
 
         // A `last_key` of `None` indicates that the cursor is exhausted.
         let Some(last_key) = self.last_key else {
             return Ok(None);
         };
+
+        // Lazily position the DB cursor if it hasn't been seeked yet (e.g. after an
+        // overlay-only seek_exact that skipped the DB).
+        if !self.seeked {
+            self.cursor_seek(last_key)?;
+            self.seeked = true;
+        }
 
         // If either cursor is currently pointing to the last entry which was returned then consume
         // that entry so that `choose_next_entry` is looking at the subsequent one.
@@ -269,10 +276,16 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
             self.in_memory_cursor.first_after(&last_key);
         }
 
-        if let Some((key, _)) = &self.cursor_entry &&
-            key == &last_key
-        {
-            self.cursor_next()?;
+        match self.cursor_entry.as_ref().map(|(key, _)| key.cmp(&last_key)) {
+            Some(std::cmp::Ordering::Less) => {
+                // DB cursor is behind last_key (can happen after an overlay-hit seek_exact
+                // that skipped the DB seek). Re-seek to catch up.
+                self.cursor_seek(last_key)?;
+            }
+            Some(std::cmp::Ordering::Equal) => {
+                self.cursor_next()?;
+            }
+            _ => {}
         }
 
         let entry = self.choose_next_entry()?;
@@ -292,7 +305,6 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
             cursor,
             cursor_wiped,
             cursor_entry,
-            cursor_seeked,
             in_memory_cursor,
             last_key,
             seeked,
@@ -304,7 +316,6 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
 
         *cursor_wiped = false;
         *cursor_entry = None;
-        *cursor_seeked = false;
         *last_key = None;
         *seeked = false;
     }
