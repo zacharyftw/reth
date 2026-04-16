@@ -4,8 +4,8 @@ pub use jsonrpsee::{
     core::middleware::layer::Either,
     server::middleware::rpc::{RpcService, RpcServiceBuilder},
 };
-use reth_engine_tree::tree::WaitForCaches;
 pub use reth_engine_tree::tree::{BasicEngineValidator, EngineValidator};
+use reth_engine_tree::{persistence::PersistenceGate, tree::WaitForCaches};
 pub use reth_rpc_builder::{
     middleware::{RethAuthHttpMiddleware, RethRpcMiddleware},
     Identity, Stack,
@@ -345,6 +345,8 @@ pub struct RpcHandle<Node: FullNodeComponents, EthApi: EthApiTypes> {
     pub beacon_engine_handle: ConsensusEngineHandle<<Node::Types as NodeTypes>::Payload>,
     /// Handle to trigger engine shutdown.
     pub engine_shutdown: EngineShutdown,
+    /// Gate to suppress engine persistence cycles.
+    pub persistence_gate: PersistenceGate,
 }
 
 impl<Node: FullNodeComponents, EthApi: EthApiTypes> Clone for RpcHandle<Node, EthApi> {
@@ -355,6 +357,7 @@ impl<Node: FullNodeComponents, EthApi: EthApiTypes> Clone for RpcHandle<Node, Et
             engine_events: self.engine_events.clone(),
             beacon_engine_handle: self.beacon_engine_handle.clone(),
             engine_shutdown: self.engine_shutdown.clone(),
+            persistence_gate: self.persistence_gate.clone(),
         }
     }
 }
@@ -393,6 +396,19 @@ impl<Node: FullNodeComponents, EthApi: EthApiTypes> RpcHandle<Node, EthApi> {
         &self,
     ) -> &ConsensusEngineHandle<<Node::Types as NodeTypes>::Payload> {
         &self.beacon_engine_handle
+    }
+
+    /// Returns `true` if engine persistence cycles are enabled.
+    pub fn is_persistence_enabled(&self) -> bool {
+        self.persistence_gate.is_enabled()
+    }
+
+    /// Sets the engine persistence gate.
+    ///
+    /// When set to `false`, no new persistence cycles will be started by the tree handler.
+    /// An in-flight persistence task is unaffected. Set back to `true` to resume.
+    pub fn set_persistence_enabled(&self, enabled: bool) {
+        self.persistence_gate.set_enabled(enabled);
     }
 
     /// Returns the consensus engine events sender.
@@ -1084,6 +1100,7 @@ where
             engine_events,
             beacon_engine_handle: engine_handle,
             engine_shutdown: EngineShutdown::default(),
+            persistence_gate: PersistenceGate::default(),
         })
     }
 

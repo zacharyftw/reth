@@ -19,29 +19,26 @@ use reth_evm::ConfigureEvm;
 use reth_network_p2p::BlockClient;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_primitives_traits::NodePrimitives;
-use reth_provider::{
-    providers::{BlockchainProvider, ProviderNodeTypes},
-    ProviderFactory,
-};
-use reth_prune::PrunerWithFactory;
-use reth_stages_api::{MetricEventsSender, Pipeline};
+use reth_provider::providers::{BlockchainProvider, ProviderNodeTypes};
+use reth_stages_api::Pipeline;
 use reth_tasks::Runtime;
 use reth_trie_db::ChangesetCache;
 use std::sync::Arc;
 
 /// Builds the engine [`ChainOrchestrator`] that drives the chain forward.
 ///
-/// This spawns and wires together the following components:
+/// This wires together the following components:
 ///
 /// - **[`BasicBlockDownloader`]** — downloads blocks on demand from the network during live sync.
-/// - **[`PersistenceHandle`]** — spawns the persistence service on a background thread for writing
-///   blocks and performing pruning outside the critical consensus path.
 /// - **[`EngineApiTreeHandler`]** — spawns the tree handler that processes engine API requests
 ///   (`newPayload`, `forkchoiceUpdated`) and maintains the in-memory chain state.
 /// - **[`EngineApiRequestHandler`]** + **[`EngineHandler`]** — glue that routes incoming CL
 ///   messages to the tree handler and manages download requests.
 /// - **[`PipelineSync`]** — wraps the staged sync [`Pipeline`] for backfill sync when the node
 ///   needs to catch up over large block ranges.
+///
+/// The caller is responsible for spawning the [`PersistenceHandle`] via
+/// [`PersistenceHandle::spawn_service`] and passing it in.
 ///
 /// The returned orchestrator implements [`Stream`] and yields
 /// [`ChainEvent`]s.
@@ -55,13 +52,11 @@ pub fn build_engine_orchestrator<N, Client, S, V, C>(
     incoming_requests: S,
     pipeline: Pipeline<N>,
     pipeline_task_spawner: Runtime,
-    provider: ProviderFactory<N>,
     blockchain_db: BlockchainProvider<N>,
-    pruner: PrunerWithFactory<ProviderFactory<N>>,
+    persistence_handle: PersistenceHandle<N::Primitives>,
     payload_builder: PayloadBuilderHandle<N::Payload>,
     payload_validator: V,
     tree_config: TreeConfig,
-    sync_metrics_tx: MetricEventsSender,
     evm_config: C,
     changeset_cache: ChangesetCache,
     runtime: Runtime,
@@ -81,9 +76,6 @@ where
     C: ConfigureEvm<Primitives = N::Primitives> + 'static,
 {
     let downloader = BasicBlockDownloader::new(client, consensus.clone());
-
-    let persistence_handle =
-        PersistenceHandle::<N::Primitives>::spawn_service(provider, pruner, sync_metrics_tx);
 
     let canonical_in_memory_state = blockchain_db.canonical_in_memory_state();
 

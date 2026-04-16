@@ -248,11 +248,8 @@ pub struct PersistenceHandle<N: NodePrimitives = EthPrimitives> {
     /// Guard that joins the service thread when all handles are dropped.
     /// Uses `Arc` so the handle remains `Clone`.
     _service_guard: Arc<ServiceGuard>,
-    /// External gate to suppress persistence. When `false`,
-    /// [`EngineApiTreeHandler::should_persist`](crate::tree::EngineApiTreeHandler::should_persist)
-    /// returns `false`, preventing new persistence cycles from starting. An in-flight persistence
-    /// task is unaffected.
-    persistence_enabled: Arc<AtomicBool>,
+    /// External gate to suppress persistence.
+    persistence_gate: PersistenceGate,
 }
 
 impl<T: NodePrimitives> PersistenceHandle<T> {
@@ -264,7 +261,7 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
         Self {
             sender,
             _service_guard: Arc::new(ServiceGuard(None)),
-            persistence_enabled: Arc::new(AtomicBool::new(true)),
+            persistence_gate: PersistenceGate::new(),
         }
     }
 
@@ -296,7 +293,7 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
         PersistenceHandle {
             sender: db_service_tx,
             _service_guard: Arc::new(ServiceGuard(Some(join_handle))),
-            persistence_enabled: Arc::new(AtomicBool::new(true)),
+            persistence_gate: PersistenceGate::new(),
         }
     }
 
@@ -309,22 +306,9 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
         self.sender.send(action)
     }
 
-    /// Returns `true` if persistence is enabled.
-    ///
-    /// When `false`, the tree handler will not start new persistence cycles.
-    pub fn is_persistence_enabled(&self) -> bool {
-        self.persistence_enabled.load(Ordering::Relaxed)
-    }
-
-    /// Sets the persistence gate.
-    ///
-    /// When set to `false`, no new persistence cycles will be started by the tree handler.
-    /// An in-flight persistence task is unaffected.
-    ///
-    /// When set back to `true`, the tree handler will resume starting persistence cycles
-    /// on its next loop iteration.
-    pub fn set_persistence_enabled(&self, enabled: bool) {
-        self.persistence_enabled.store(enabled, Ordering::Relaxed);
+    /// Returns a clone of the [`PersistenceGate`].
+    pub fn persistence_gate(&self) -> PersistenceGate {
+        self.persistence_gate.clone()
     }
 
     /// Tells the persistence service to save a certain list of finalized blocks. The blocks are
@@ -397,6 +381,41 @@ impl Drop for ServiceGuard {
         if let Some(join_handle) = self.0.take() {
             let _ = join_handle.join();
         }
+    }
+}
+
+/// Shared gate that controls whether the engine tree handler starts new persistence cycles.
+///
+/// When disabled,
+/// [`EngineApiTreeHandler::should_persist`](crate::tree::EngineApiTreeHandler::should_persist)
+/// returns `false`, preventing new persistence cycles from starting. An in-flight persistence
+/// task is unaffected.
+#[derive(Clone, Debug)]
+pub struct PersistenceGate(Arc<AtomicBool>);
+
+impl PersistenceGate {
+    /// Creates a new gate that is enabled by default.
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+
+    /// Returns `true` if persistence cycles are enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Sets the persistence gate.
+    ///
+    /// When set to `false`, no new persistence cycles will be started by the tree handler.
+    /// An in-flight persistence task is unaffected. Set back to `true` to resume.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.0.store(enabled, Ordering::Relaxed);
+    }
+}
+
+impl Default for PersistenceGate {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

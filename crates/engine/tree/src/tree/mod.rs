@@ -2013,7 +2013,7 @@ where
     /// block is greater than or equal to the persistence threshold,
     /// backfill is not running, and the external persistence gate is open.
     pub fn should_persist(&self) -> bool {
-        if !self.persistence.is_persistence_enabled() {
+        if !self.persistence.persistence_gate().is_enabled() {
             return false
         }
 

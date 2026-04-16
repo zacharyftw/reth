@@ -15,6 +15,7 @@ use reth_engine_tree::{
     chain::{ChainEvent, FromOrchestrator},
     engine::{EngineApiKind, EngineApiRequest, EngineRequestHandler},
     launch::build_engine_orchestrator,
+    persistence::PersistenceHandle,
     tree::TreeConfig,
 };
 use reth_engine_util::EngineMessageStreamExt;
@@ -226,6 +227,14 @@ impl EngineNodeLauncher {
             EngineApiKind::Ethereum
         };
 
+        let persistence_handle =
+            PersistenceHandle::<<T::Types as NodeTypes>::Primitives>::spawn_service(
+                ctx.provider_factory().clone(),
+                pruner,
+                ctx.sync_metrics_tx(),
+            );
+        let persistence_gate = persistence_handle.persistence_gate();
+
         let mut orchestrator = build_engine_orchestrator(
             engine_kind,
             consensus.clone(),
@@ -233,13 +242,11 @@ impl EngineNodeLauncher {
             Box::pin(consensus_engine_stream),
             pipeline,
             ctx.task_executor().clone(),
-            ctx.provider_factory().clone(),
             ctx.blockchain_db().clone(),
-            pruner,
+            persistence_handle,
             ctx.components().payload_builder_handle().clone(),
             engine_validator,
             engine_tree_config,
-            ctx.sync_metrics_tx(),
             ctx.components().evm_config().clone(),
             changeset_cache,
             ctx.task_executor().clone(),
@@ -271,6 +278,7 @@ impl EngineNodeLauncher {
             engine_events,
             beacon_engine_handle,
             engine_shutdown: _,
+            persistence_gate: _,
         } = add_ons.launch_add_ons(add_ons_ctx).await?;
 
         // Create engine shutdown handle
@@ -409,6 +417,7 @@ impl EngineNodeLauncher {
                 engine_events,
                 beacon_engine_handle,
                 engine_shutdown,
+                persistence_gate,
             },
         };
         // Notify on node started
