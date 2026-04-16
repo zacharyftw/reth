@@ -60,6 +60,8 @@ pub struct InMemoryTrieCursor<'a, C> {
     cursor_wiped: bool,
     /// Entry that `cursor` is currently pointing to.
     cursor_entry: Option<(Nibbles, BranchNodeCompact)>,
+    /// Whether the DB cursor has been positioned at least once.
+    cursor_seeked: bool,
     /// Forward-only in-memory cursor over storage trie nodes.
     in_memory_cursor: ForwardInMemoryCursor<'a, Nibbles, Option<BranchNodeCompact>>,
     /// The key most recently returned from the Cursor.
@@ -78,6 +80,7 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
             cursor,
             cursor_wiped: false,
             cursor_entry: None,
+            cursor_seeked: false,
             in_memory_cursor,
             last_key: None,
             seeked: false,
@@ -98,6 +101,7 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
             cursor,
             cursor_wiped,
             cursor_entry: None,
+            cursor_seeked: false,
             in_memory_cursor,
             last_key: None,
             seeked: false,
@@ -139,14 +143,15 @@ impl<'a, C: TrieCursor> InMemoryTrieCursor<'a, C> {
     fn cursor_seek(&mut self, key: Nibbles) -> Result<(), DatabaseError> {
         // Only seek if:
         // 1. We have a cursor entry and need to seek forward (entry.0 < key), OR
-        // 2. We have no cursor entry and haven't seeked yet (!self.seeked)
+        // 2. We have no cursor entry and haven't positioned the DB cursor yet.
         let should_seek = match self.cursor_entry.as_ref() {
             Some(entry) => entry.0 < key,
-            None => !self.seeked,
+            None => !self.cursor_seeked,
         };
 
         if should_seek {
             self.cursor_entry = self.get_cursor_mut().map(|c| c.seek(key)).transpose()?.flatten();
+            self.cursor_seeked = true;
         }
 
         Ok(())
@@ -209,16 +214,24 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
         &mut self,
         key: Nibbles,
     ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
-        self.cursor_seek(key)?;
         let mem_entry = self.in_memory_cursor.seek(&key);
+
+        if let Some((mem_key, entry_inner)) = mem_entry &&
+            *mem_key == key
+        {
+            self.seeked = true;
+
+            let entry = entry_inner.clone().map(|node| (key, node));
+            self.set_last_key(&entry);
+            return Ok(entry)
+        }
+
+        self.cursor_seek(key)?;
 
         self.seeked = true;
 
-        let entry = match (mem_entry, &self.cursor_entry) {
-            (Some((mem_key, entry_inner)), _) if *mem_key == key => {
-                entry_inner.clone().map(|node| (key, node))
-            }
-            (_, Some((db_key, node))) if db_key == &key => Some((key, node.clone())),
+        let entry = match &self.cursor_entry {
+            Some((db_key, node)) if db_key == &key => Some((key, node.clone())),
             _ => None,
         };
 
@@ -279,6 +292,7 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
             cursor,
             cursor_wiped,
             cursor_entry,
+            cursor_seeked,
             in_memory_cursor,
             last_key,
             seeked,
@@ -290,6 +304,7 @@ impl<C: TrieCursor> TrieCursor for InMemoryTrieCursor<'_, C> {
 
         *cursor_wiped = false;
         *cursor_entry = None;
+        *cursor_seeked = false;
         *last_key = None;
         *seeked = false;
     }
@@ -323,7 +338,7 @@ mod tests {
             test_case.db_nodes.into_iter().collect();
         let db_nodes_arc = Arc::new(db_nodes_map);
         let visited_keys = Arc::new(Mutex::new(Vec::new()));
-        let mock_cursor = MockTrieCursor::new(db_nodes_arc, visited_keys);
+        let mock_cursor = MockTrieCursor::new(db_nodes_arc, visited_keys.clone());
 
         let trie_updates = TrieUpdatesSorted::new(test_case.in_memory_nodes, Default::default());
         let mut cursor = InMemoryTrieCursor::new_account(mock_cursor, &trie_updates);
@@ -507,7 +522,7 @@ mod tests {
         let db_nodes_map: BTreeMap<Nibbles, BranchNodeCompact> = db_nodes.into_iter().collect();
         let db_nodes_arc = Arc::new(db_nodes_map);
         let visited_keys = Arc::new(Mutex::new(Vec::new()));
-        let mock_cursor = MockTrieCursor::new(db_nodes_arc, visited_keys);
+        let mock_cursor = MockTrieCursor::new(db_nodes_arc, visited_keys.clone());
 
         let trie_updates = TrieUpdatesSorted::new(in_memory_nodes, Default::default());
         let mut cursor = InMemoryTrieCursor::new_account(mock_cursor, &trie_updates);
@@ -520,6 +535,7 @@ mod tests {
                 BranchNodeCompact::new(0b0010, 0b0010, 0, vec![], None)
             ))
         );
+        assert!(visited_keys.lock().is_empty(), "exact overlay hit should not touch the DB cursor");
 
         let result = cursor.seek_exact(Nibbles::from_nibbles([0x3])).unwrap();
         assert_eq!(
