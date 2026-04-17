@@ -7,10 +7,10 @@ use reth_ethereum_primitives::EthPrimitives;
 use reth_primitives_traits::{FastInstant as Instant, NodePrimitives};
 use reth_provider::{
     providers::ProviderNodeTypes, BlockExecutionWriter, BlockHashReader, ChainStateBlockWriter,
-    DBProvider, DatabaseProviderFactory, ProviderFactory, SaveBlocksMode,
+    DBProvider, DatabaseProviderFactory, ProviderFactory, SaveBlocksMode, StageCheckpointReader,
 };
 use reth_prune::{PrunerError, PrunerWithFactory};
-use reth_stages_api::{MetricEvent, MetricEventsSender};
+use reth_stages_api::{MetricEvent, MetricEventsSender, StageId};
 use reth_tasks::spawn_os_thread;
 use std::{
     sync::{
@@ -28,6 +28,11 @@ use tracing::{debug, error, instrument};
 pub struct PersistenceResult {
     /// The last block that was persisted, if any.
     pub last_block: Option<BlockNumHash>,
+    /// The highest block whose trie data is fully persisted, if known.
+    ///
+    /// When this lags behind [`Self::last_block`], callers must retain the suffix above it in
+    /// memory so trie-backed operations can still unwind from that point.
+    pub partial_state_trie: Option<u64>,
     /// The commit duration, only available for save-blocks operations.
     pub commit_duration: Option<Duration>,
 }
@@ -100,7 +105,11 @@ where
                     // send new sync metrics based on removed blocks
                     let _ =
                         self.sync_metrics_tx.send(MetricEvent::SyncHeight { height: new_tip_num });
-                    let _ = sender.send(PersistenceResult { last_block, commit_duration: None });
+                    let _ = sender.send(PersistenceResult {
+                        last_block,
+                        partial_state_trie: None,
+                        commit_duration: None,
+                    });
                 }
                 PersistenceAction::SaveBlocks(blocks, sender) => {
                     let result = self.on_save_blocks(blocks)?;
@@ -152,6 +161,7 @@ where
         let first_block = blocks.first().map(|b| b.recovered_block.num_hash());
         let last_block = blocks.last().map(|b| b.recovered_block.num_hash());
         let block_count = blocks.len();
+        let mut partial_state_trie = None;
 
         let pending_finalized = self.pending_finalized_block.take();
         let pending_safe = self.pending_safe_block.take();
@@ -163,6 +173,14 @@ where
         if let Some(last) = last_block {
             let provider_rw = self.provider.database_provider_rw()?;
             provider_rw.save_blocks(&blocks, blocks.len(), SaveBlocksMode::Full)?;
+            partial_state_trie = provider_rw
+                .get_stage_checkpoint(StageId::Finish)?
+                .and_then(|checkpoint| {
+                    checkpoint
+                        .finish_stage_checkpoint()
+                        .and_then(|finish| finish.partial_state_trie)
+                })
+                .or(Some(last.number));
 
             if let Some(finalized) = pending_finalized {
                 provider_rw.save_finalized_block_number(finalized.min(last.number))?;
@@ -200,7 +218,7 @@ where
         self.metrics.save_blocks_batch_size.record(block_count as f64);
         self.metrics.save_blocks_duration_seconds.record(elapsed);
 
-        Ok(PersistenceResult { last_block, commit_duration: Some(elapsed) })
+        Ok(PersistenceResult { last_block, partial_state_trie, commit_duration: Some(elapsed) })
     }
 }
 
@@ -411,6 +429,7 @@ mod tests {
 
         let result = rx.recv().unwrap();
         assert!(result.last_block.is_none());
+        assert!(result.partial_state_trie.is_none());
     }
 
     #[test]
@@ -430,7 +449,9 @@ mod tests {
 
         let result = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("test timed out");
 
-        assert_eq!(block_hash, result.last_block.unwrap().hash);
+        let last_block = result.last_block.unwrap();
+        assert_eq!(block_hash, last_block.hash);
+        assert_eq!(result.partial_state_trie, Some(last_block.number));
     }
 
     #[test]
@@ -445,7 +466,9 @@ mod tests {
 
         handle.save_blocks(blocks, tx).unwrap();
         let result = rx.recv().unwrap();
-        assert_eq!(last_hash, result.last_block.unwrap().hash);
+        let last_block = result.last_block.unwrap();
+        assert_eq!(last_hash, last_block.hash);
+        assert_eq!(result.partial_state_trie, Some(last_block.number));
     }
 
     #[test]
@@ -463,7 +486,9 @@ mod tests {
             handle.save_blocks(blocks, tx).unwrap();
 
             let result = rx.recv().unwrap();
-            assert_eq!(last_hash, result.last_block.unwrap().hash);
+            let last_block = result.last_block.unwrap();
+            assert_eq!(last_hash, last_block.hash);
+            assert_eq!(result.partial_state_trie, Some(last_block.number));
         }
     }
 
