@@ -326,6 +326,22 @@ pub(crate) struct NewPayloadTimingBreakdown {
     pub(crate) sparse_trie_wait: Duration,
 }
 
+impl NewPayloadTimingBreakdown {
+    /// Returns the latency that benchmarks should report for `newPayload`.
+    ///
+    /// Unpaced runs subtract persistence backpressure so the reported latency tracks
+    /// block execution rather than queueing behind earlier blocks. Paced runs keep the
+    /// raw server timing because the fixed inter-block delay is intentionally part of
+    /// the measured cadence.
+    pub(crate) const fn benchmark_latency(&self, wait_time: Option<Duration>) -> Duration {
+        if wait_time.is_some() {
+            self.latency
+        } else {
+            self.latency.saturating_sub(self.persistence_wait)
+        }
+    }
+}
+
 /// Calls either `engine_newPayload*` or `reth_newPayload` depending on whether
 /// `version` is provided.
 ///
@@ -442,5 +458,47 @@ pub(crate) async fn call_forkchoice_updated_with_reth<
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NewPayloadTimingBreakdown;
+    use std::time::Duration;
+
+    #[test]
+    fn benchmark_latency_keeps_raw_latency_when_wait_time_is_configured() {
+        let timings = NewPayloadTimingBreakdown {
+            latency: Duration::from_millis(12),
+            persistence_wait: Duration::from_millis(5),
+            execution_cache_wait: Duration::ZERO,
+            sparse_trie_wait: Duration::ZERO,
+        };
+
+        assert_eq!(timings.benchmark_latency(Some(Duration::from_millis(250))), timings.latency);
+    }
+
+    #[test]
+    fn benchmark_latency_subtracts_persistence_wait_without_wait_time() {
+        let timings = NewPayloadTimingBreakdown {
+            latency: Duration::from_millis(12),
+            persistence_wait: Duration::from_millis(5),
+            execution_cache_wait: Duration::ZERO,
+            sparse_trie_wait: Duration::ZERO,
+        };
+
+        assert_eq!(timings.benchmark_latency(None), Duration::from_millis(7));
+    }
+
+    #[test]
+    fn benchmark_latency_saturates_when_persistence_wait_exceeds_latency() {
+        let timings = NewPayloadTimingBreakdown {
+            latency: Duration::from_millis(5),
+            persistence_wait: Duration::from_millis(12),
+            execution_cache_wait: Duration::ZERO,
+            sparse_trie_wait: Duration::ZERO,
+        };
+
+        assert_eq!(timings.benchmark_latency(None), Duration::ZERO);
     }
 }

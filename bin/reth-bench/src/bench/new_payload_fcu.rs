@@ -209,8 +209,10 @@ impl Command {
             let server_timings =
                 call_new_payload_with_reth(&auth_provider, version, params).await?;
 
-            let np_latency =
-                server_timings.as_ref().map(|t| t.latency).unwrap_or_else(|| start.elapsed());
+            let np_latency = server_timings
+                .as_ref()
+                .map(|t| t.benchmark_latency(self.wait_time))
+                .unwrap_or_else(|| start.elapsed());
             let new_payload_result = NewPayloadResult {
                 gas_used,
                 latency: np_latency,
