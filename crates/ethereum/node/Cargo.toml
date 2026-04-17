@@ -38,7 +38,6 @@ reth-engine-local.workspace = true
 reth-engine-primitives = { workspace = true, features = ["std"] }
 reth-node-core.workspace = true
 reth-payload-primitives.workspace = true
-
 # ethereum
 alloy-eips.workspace = true
 alloy-network.workspace = true
