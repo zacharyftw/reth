@@ -671,6 +671,7 @@ mod tests {
             state_root_task_timeout: Some(Duration::from_secs(2)),
             share_execution_cache_with_payload_builder: false,
             share_sparse_trie_with_payload_builder: false,
+            suppress_persistence_during_build: false,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         };
