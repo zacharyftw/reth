@@ -42,8 +42,8 @@ pub struct Command {
     /// Engine persistence threshold used for deciding when to wait for persistence.
     ///
     /// The benchmark waits after every `(threshold + 1)` blocks. By default this
-    /// matches the engine's `DEFAULT_PERSISTENCE_THRESHOLD` (2), so waits occur
-    /// at blocks 3, 6, 9, etc.
+    /// matches the engine's `DEFAULT_PERSISTENCE_THRESHOLD`, so waits occur at
+    /// blocks 11, 22, 33, etc.
     #[arg(
         long = "persistence-threshold",
         value_name = "PERSISTENCE_THRESHOLD",

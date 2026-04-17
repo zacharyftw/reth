@@ -4,7 +4,7 @@ use clap::{builder::Resettable, Args};
 use eyre::ensure;
 use reth_cli_util::{parse_duration_from_secs_or_ms, parsers::format_duration_as_secs_or_ms};
 use reth_engine_primitives::{
-    TreeConfig, DEFAULT_MULTIPROOF_TASK_CHUNK_SIZE, DEFAULT_PERSISTENCE_BACKPRESSURE_THRESHOLD,
+    default_persistence_backpressure_threshold, TreeConfig, DEFAULT_MULTIPROOF_TASK_CHUNK_SIZE,
     DEFAULT_SPARSE_TRIE_MAX_HOT_ACCOUNTS, DEFAULT_SPARSE_TRIE_MAX_HOT_SLOTS,
 };
 use std::{sync::OnceLock, time::Duration};
@@ -23,7 +23,7 @@ static ENGINE_DEFAULTS: OnceLock<DefaultEngineValues> = OnceLock::new();
 #[derive(Debug, Clone)]
 pub struct DefaultEngineValues {
     persistence_threshold: u64,
-    persistence_backpressure_threshold: u64,
+    persistence_backpressure_threshold: Option<u64>,
     memory_block_buffer_target: u64,
     legacy_state_root_task_enabled: bool,
     state_cache_disabled: bool,
@@ -68,9 +68,20 @@ impl DefaultEngineValues {
         self
     }
 
+    /// Get the default persistence backpressure threshold.
+    pub const fn persistence_backpressure_threshold(&self) -> u64 {
+        match self.persistence_backpressure_threshold {
+            Some(v) => v,
+            None => default_persistence_backpressure_threshold(
+                self.persistence_threshold,
+                self.memory_block_buffer_target,
+            ),
+        }
+    }
+
     /// Set the default persistence backpressure threshold
     pub const fn with_persistence_backpressure_threshold(mut self, v: u64) -> Self {
-        self.persistence_backpressure_threshold = v;
+        self.persistence_backpressure_threshold = Some(v);
         self
     }
 
@@ -232,7 +243,7 @@ impl Default for DefaultEngineValues {
     fn default() -> Self {
         Self {
             persistence_threshold: DEFAULT_PERSISTENCE_THRESHOLD,
-            persistence_backpressure_threshold: DEFAULT_PERSISTENCE_BACKPRESSURE_THRESHOLD,
+            persistence_backpressure_threshold: None,
             memory_block_buffer_target: DEFAULT_MEMORY_BLOCK_BUFFER_TARGET,
             legacy_state_root_task_enabled: false,
             state_cache_disabled: false,
@@ -278,7 +289,7 @@ pub struct EngineArgs {
     /// Configure the maximum canonical-minus-persisted gap before engine API processing stalls.
     ///
     /// This value must be greater than `--engine.persistence-threshold`.
-    #[arg(long = "engine.persistence-backpressure-threshold", default_value_t = DefaultEngineValues::get_global().persistence_backpressure_threshold)]
+    #[arg(long = "engine.persistence-backpressure-threshold", default_value_t = DefaultEngineValues::get_global().persistence_backpressure_threshold())]
     pub persistence_backpressure_threshold: u64,
 
     /// Configure the target number of blocks to keep in memory.
@@ -476,69 +487,44 @@ pub struct EngineArgs {
 #[allow(deprecated)]
 impl Default for EngineArgs {
     fn default() -> Self {
-        let DefaultEngineValues {
-            persistence_threshold,
-            persistence_backpressure_threshold,
-            memory_block_buffer_target,
-            legacy_state_root_task_enabled,
-            state_cache_disabled,
-            prewarming_disabled,
-            state_provider_metrics,
-            cross_block_cache_size,
-            state_root_task_compare_updates,
-            accept_execution_requests_hash,
-            multiproof_chunk_size,
-            reserved_cpu_cores,
-            precompile_cache_disabled,
-            state_root_fallback,
-            always_process_payload_attributes_on_canonical_head,
-            allow_unwind_canonical_header,
-            storage_worker_count,
-            account_worker_count,
-            prewarming_threads,
-            cache_metrics_disabled,
-            sparse_trie_max_hot_slots,
-            sparse_trie_max_hot_accounts,
-            slow_block_threshold,
-            disable_sparse_trie_cache_pruning,
-            state_root_task_timeout,
-            share_execution_cache_with_payload_builder,
-            share_sparse_trie_with_payload_builder,
-        } = DefaultEngineValues::get_global().clone();
+        let defaults = DefaultEngineValues::get_global();
         Self {
-            persistence_threshold,
-            persistence_backpressure_threshold,
-            memory_block_buffer_target,
-            legacy_state_root_task_enabled,
-            state_root_task_compare_updates,
+            persistence_threshold: defaults.persistence_threshold,
+            persistence_backpressure_threshold: defaults.persistence_backpressure_threshold(),
+            memory_block_buffer_target: defaults.memory_block_buffer_target,
+            legacy_state_root_task_enabled: defaults.legacy_state_root_task_enabled,
+            state_root_task_compare_updates: defaults.state_root_task_compare_updates,
             caching_and_prewarming_enabled: true,
-            state_cache_disabled,
-            prewarming_disabled,
+            state_cache_disabled: defaults.state_cache_disabled,
+            prewarming_disabled: defaults.prewarming_disabled,
             parallel_sparse_trie_enabled: true,
             parallel_sparse_trie_disabled: false,
-            state_provider_metrics,
-            cross_block_cache_size,
-            accept_execution_requests_hash,
-            multiproof_chunk_size,
-            reserved_cpu_cores,
+            state_provider_metrics: defaults.state_provider_metrics,
+            cross_block_cache_size: defaults.cross_block_cache_size,
+            accept_execution_requests_hash: defaults.accept_execution_requests_hash,
+            multiproof_chunk_size: defaults.multiproof_chunk_size,
+            reserved_cpu_cores: defaults.reserved_cpu_cores,
             precompile_cache_enabled: true,
-            precompile_cache_disabled,
-            state_root_fallback,
-            always_process_payload_attributes_on_canonical_head,
-            allow_unwind_canonical_header,
-            storage_worker_count,
-            account_worker_count,
-            prewarming_threads,
-            cache_metrics_disabled,
-            sparse_trie_max_hot_slots,
-            sparse_trie_max_hot_accounts,
-            slow_block_threshold,
-            disable_sparse_trie_cache_pruning,
-            state_root_task_timeout: state_root_task_timeout
+            precompile_cache_disabled: defaults.precompile_cache_disabled,
+            state_root_fallback: defaults.state_root_fallback,
+            always_process_payload_attributes_on_canonical_head: defaults
+                .always_process_payload_attributes_on_canonical_head,
+            allow_unwind_canonical_header: defaults.allow_unwind_canonical_header,
+            storage_worker_count: defaults.storage_worker_count,
+            account_worker_count: defaults.account_worker_count,
+            prewarming_threads: defaults.prewarming_threads,
+            cache_metrics_disabled: defaults.cache_metrics_disabled,
+            sparse_trie_max_hot_slots: defaults.sparse_trie_max_hot_slots,
+            sparse_trie_max_hot_accounts: defaults.sparse_trie_max_hot_accounts,
+            slow_block_threshold: defaults.slow_block_threshold,
+            disable_sparse_trie_cache_pruning: defaults.disable_sparse_trie_cache_pruning,
+            state_root_task_timeout: defaults
+                .state_root_task_timeout
                 .as_deref()
                 .map(|s| humantime::parse_duration(s).expect("valid default duration")),
-            share_execution_cache_with_payload_builder,
-            share_sparse_trie_with_payload_builder,
+            share_execution_cache_with_payload_builder: defaults
+                .share_execution_cache_with_payload_builder,
+            share_sparse_trie_with_payload_builder: defaults.share_sparse_trie_with_payload_builder,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         }
@@ -612,6 +598,40 @@ mod tests {
         let default_args = EngineArgs::default();
         let args = CommandParser::<EngineArgs>::parse_from(["reth"]).args;
         assert_eq!(args, default_args);
+    }
+
+    #[test]
+    fn default_engine_values_derive_backpressure_threshold() {
+        let defaults = DefaultEngineValues::default()
+            .with_persistence_threshold(10)
+            .with_memory_block_buffer_target(3);
+
+        assert_eq!(defaults.persistence_backpressure_threshold(), 26);
+    }
+
+    #[test]
+    fn explicit_backpressure_default_override_is_preserved() {
+        let defaults = DefaultEngineValues::default()
+            .with_persistence_backpressure_threshold(99)
+            .with_persistence_threshold(10)
+            .with_memory_block_buffer_target(3);
+
+        assert_eq!(defaults.persistence_backpressure_threshold(), 99);
+    }
+
+    #[test]
+    fn engine_args_default_thresholds_match_expected_defaults() {
+        let args = EngineArgs::default();
+
+        assert_eq!(args.persistence_threshold, DEFAULT_PERSISTENCE_THRESHOLD);
+        assert_eq!(args.memory_block_buffer_target, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET);
+        assert_eq!(
+            args.persistence_backpressure_threshold,
+            default_persistence_backpressure_threshold(
+                args.persistence_threshold,
+                args.memory_block_buffer_target,
+            )
+        );
     }
 
     #[test]
