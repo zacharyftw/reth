@@ -312,9 +312,9 @@ dependencies = [
 
 [[package]]
 name = "alloy-evm"
-version = "0.33.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97d2fbe78c24532b837539b941e3f81ba023c27cfa7793245fbc95ce70cd25b6"
+checksum = "bd3e12b99b0c8f7298ffd3604c58310cba310203c5f6cd5e024f3b2bd9c3b09c"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.0",
@@ -2429,7 +2429,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
 dependencies = [
  "lazy_static",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3434,7 +3434,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4198,8 +4198,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -4723,7 +4723,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -5083,7 +5083,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10737,7 +10737,7 @@ dependencies = [
 [[package]]
 name = "revmc"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?branch=dani%2Fruntime#1f5fb697431c10c5b8b357d5760586a8111318fe"
+source = "git+https://github.com/paradigmxyz/revmc?branch=dani%2Fruntime#9d2692bf469066f55010db79c7a4df0bf99fed4e"
 dependencies = [
  "alloy-evm",
  "alloy-primitives",
@@ -10773,7 +10773,7 @@ dependencies = [
 [[package]]
 name = "revmc-backend"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?branch=dani%2Fruntime#1f5fb697431c10c5b8b357d5760586a8111318fe"
+source = "git+https://github.com/paradigmxyz/revmc?branch=dani%2Fruntime#9d2692bf469066f55010db79c7a4df0bf99fed4e"
 dependencies = [
  "eyre",
  "ruint",
@@ -10782,12 +10782,12 @@ dependencies = [
 [[package]]
 name = "revmc-build"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?branch=dani%2Fruntime#1f5fb697431c10c5b8b357d5760586a8111318fe"
+source = "git+https://github.com/paradigmxyz/revmc?branch=dani%2Fruntime#9d2692bf469066f55010db79c7a4df0bf99fed4e"
 
 [[package]]
 name = "revmc-builtins"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?branch=dani%2Fruntime#1f5fb697431c10c5b8b357d5760586a8111318fe"
+source = "git+https://github.com/paradigmxyz/revmc?branch=dani%2Fruntime#9d2692bf469066f55010db79c7a4df0bf99fed4e"
 dependencies = [
  "paste",
  "revm-bytecode",
@@ -10802,7 +10802,7 @@ dependencies = [
 [[package]]
 name = "revmc-context"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?branch=dani%2Fruntime#1f5fb697431c10c5b8b357d5760586a8111318fe"
+source = "git+https://github.com/paradigmxyz/revmc?branch=dani%2Fruntime#9d2692bf469066f55010db79c7a4df0bf99fed4e"
 dependencies = [
  "revm-interpreter",
  "revm-primitives",
@@ -10812,7 +10812,7 @@ dependencies = [
 [[package]]
 name = "revmc-llvm"
 version = "0.1.0"
-source = "git+https://github.com/paradigmxyz/revmc?branch=dani%2Fruntime#1f5fb697431c10c5b8b357d5760586a8111318fe"
+source = "git+https://github.com/paradigmxyz/revmc?branch=dani%2Fruntime#9d2692bf469066f55010db79c7a4df0bf99fed4e"
 dependencies = [
  "alloy-primitives",
  "cc",
@@ -11027,7 +11027,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11086,7 +11086,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 0.26.11",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11107,7 +11107,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 1.0.6",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11887,7 +11887,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -13146,7 +13146,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
