@@ -47,6 +47,9 @@ pub struct PendingPool<T: TransactionOrdering> {
     ///
     /// See also [`reth_primitives_traits::InMemorySize::size`].
     size_of: SizeTracker,
+    /// Per-sender transaction chains. Each chain is wrapped in `Arc` so that
+    /// [`BestTransactions`] iterators can snapshot them without cloning entries.
+    by_sender: FxHashMap<SenderId, Arc<SenderTransactions<T>>>,
     /// Used to broadcast new transactions that have been added to the `PendingPool` to existing
     /// `static_files` of this pool.
     new_transaction_notifier: broadcast::Sender<PendingTransaction<T>>,
@@ -70,6 +73,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
             independent_transactions: Default::default(),
             highest_nonces: Default::default(),
             size_of: Default::default(),
+            by_sender: Default::default(),
             new_transaction_notifier,
         }
     }
@@ -84,6 +88,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
         self.independent_transactions.clear();
         self.highest_nonces.clear();
         self.size_of.reset();
+        self.by_sender.clear();
         std::mem::take(&mut self.by_id)
     }
 
@@ -107,7 +112,9 @@ impl<T: TransactionOrdering> PendingPool<T> {
     /// Invalid transactions are skipped.
     pub fn best(&self) -> BestTransactions<T> {
         BestTransactions {
-            all: self.by_id.clone(),
+            by_sender: self.by_sender.clone(),
+            new_transaction_buffer: Default::default(),
+            yielded_nonce: Default::default(),
             independent: self.independent_transactions.values().cloned().collect(),
             invalid: Default::default(),
             new_transaction_receiver: Some(self.new_transaction_notifier.subscribe()),
@@ -143,14 +150,14 @@ impl<T: TransactionOrdering> PendingPool<T> {
     ) -> BestTransactionsWithFees<T> {
         let mut best = self.best();
         for (submission_id, tx) in (self.submission_id + 1..).zip(unlocked) {
-            debug_assert!(!best.all.contains_key(tx.id()), "transaction already included");
+            debug_assert!(best.get(tx.id()).is_none(), "transaction already included");
             let priority = self.ordering.priority(&tx.transaction, base_fee);
             let tx_id = *tx.id();
             let transaction = PendingTransaction { submission_id, transaction: tx, priority };
             if best.ancestor(&tx_id).is_none() {
                 best.independent.insert(transaction.clone());
             }
-            best.all.insert(tx_id, transaction);
+            best.new_transaction_buffer.entry(tx_id.sender).or_default().push(transaction);
         }
 
         BestTransactionsWithFees { best, base_fee, base_fee_per_blob_gas }
@@ -199,6 +206,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
             } else {
                 self.size_of += tx.transaction.size();
                 self.update_independents_and_highest_nonces(&tx);
+                self.update_sender_chain(id.sender, id.nonce, tx.clone());
                 self.by_id.insert(id, tx);
             }
         }
@@ -244,6 +252,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
 
                 self.size_of += tx.transaction.size();
                 self.update_independents_and_highest_nonces(&tx);
+                self.update_sender_chain(id.sender, id.nonce, tx.clone());
                 self.by_id.insert(id, tx);
             }
         }
@@ -276,6 +285,41 @@ impl<T: TransactionOrdering> PendingPool<T> {
         }
     }
 
+    /// Updates the sender chain for the given sender/nonce with a new transaction.
+    fn update_sender_chain(&mut self, sender: SenderId, nonce: u64, tx: PendingTransaction<T>) {
+        match self.by_sender.entry(sender) {
+            Entry::Occupied(mut entry) => {
+                let chain = Arc::make_mut(entry.get_mut());
+                let idx = (nonce - chain.base_nonce) as usize;
+                if idx >= chain.txs.len() {
+                    chain.txs.push(tx);
+                } else {
+                    chain.txs.insert(idx, tx);
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(Arc::new(SenderTransactions { base_nonce: nonce, txs: vec![tx] }));
+            }
+        }
+    }
+
+    /// Removes a transaction from its sender chain.
+    fn remove_from_sender_chain(&mut self, id: &TransactionId) {
+        if let Entry::Occupied(mut entry) = self.by_sender.entry(id.sender) {
+            let chain = Arc::make_mut(entry.get_mut());
+            if let Some(idx) = id.nonce.checked_sub(chain.base_nonce).map(|i| i as usize) {
+                if idx < chain.txs.len() {
+                    chain.txs.remove(idx);
+                }
+            }
+            if chain.txs.is_empty() {
+                entry.remove();
+            } else {
+                chain.base_nonce = chain.txs[0].transaction.nonce();
+            }
+        }
+    }
+
     /// Adds a new transactions to the pending queue.
     ///
     /// # Panics
@@ -302,6 +346,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
         let tx = PendingTransaction { submission_id, transaction: tx, priority };
 
         self.update_independents_and_highest_nonces(&tx);
+        self.update_sender_chain(tx_id.sender, tx_id.nonce, tx.clone());
 
         // send the new transaction to any existing pendingpool static file iterators
         if self.new_transaction_notifier.receiver_count() > 0 {
@@ -331,6 +376,7 @@ impl<T: TransactionOrdering> PendingPool<T> {
 
         let tx = self.by_id.remove(id)?;
         self.size_of -= tx.transaction.size();
+        self.remove_from_sender_chain(id);
 
         match self.highest_nonces.entry(id.sender) {
             Entry::Occupied(mut entry) => {
@@ -605,6 +651,29 @@ impl<T: TransactionOrdering> PendingPool<T> {
             self.independent_transactions.len(),
             "highest_nonces.len() != independent_transactions.len()"
         );
+    }
+}
+
+/// Nonce-sorted transactions for a single sender, wrapped in `Arc` for cheap snapshot sharing
+/// with [`BestTransactions`] iterators.
+#[derive(Debug)]
+pub(crate) struct SenderTransactions<T: TransactionOrdering> {
+    /// The lowest nonce in this chain.
+    pub(crate) base_nonce: u64,
+    /// Transactions sorted ascending by nonce. `txs[0]` has nonce `base_nonce`.
+    pub(crate) txs: Vec<PendingTransaction<T>>,
+}
+
+impl<T: TransactionOrdering> SenderTransactions<T> {
+    pub(crate) fn get_by_nonce(&self, nonce: u64) -> Option<&PendingTransaction<T>> {
+        let idx = nonce.checked_sub(self.base_nonce)? as usize;
+        self.txs.get(idx)
+    }
+}
+
+impl<T: TransactionOrdering> Clone for SenderTransactions<T> {
+    fn clone(&self) -> Self {
+        Self { base_nonce: self.base_nonce, txs: self.txs.clone() }
     }
 }
 

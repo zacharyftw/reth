@@ -1,15 +1,16 @@
 use crate::{
     error::{Eip4844PoolTransactionError, InvalidPoolTransactionError},
     identifier::{SenderId, TransactionId},
-    pool::pending::PendingTransaction,
+    pool::pending::{PendingTransaction, SenderTransactions},
     PoolTransaction, Priority, TransactionOrdering, ValidPoolTransaction,
 };
 use alloy_consensus::Transaction;
 use alloy_primitives::map::AddressSet;
 use core::fmt;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
+use rustc_hash::FxHashMap;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    collections::{BTreeSet, HashSet, VecDeque},
     sync::Arc,
 };
 use tokio::sync::broadcast::{error::TryRecvError, Receiver};
@@ -82,9 +83,13 @@ impl<T: TransactionOrdering> Iterator for BestTransactionsWithFees<T> {
 /// transaction with the current on chain nonce.
 #[derive(Debug)]
 pub struct BestTransactions<T: TransactionOrdering> {
-    /// Contains a copy of _all_ transactions of the pending pool at the point in time this
-    /// iterator was created.
-    pub(crate) all: BTreeMap<TransactionId, PendingTransaction<T>>,
+    /// Per-sender transaction chain snapshots. Each `Arc` is shared with the pool; only touched
+    /// senders pay any clone cost.
+    pub(crate) by_sender: FxHashMap<SenderId, Arc<SenderTransactions<T>>>,
+    /// Transactions received via broadcast channel after this iterator was created.
+    pub(crate) new_transaction_buffer: FxHashMap<SenderId, Vec<PendingTransaction<T>>>,
+    /// Tracks the last yielded nonce per sender so ancestor lookups skip consumed transactions.
+    pub(crate) yielded_nonce: FxHashMap<SenderId, u64>,
     /// Transactions that can be executed right away: these have the expected nonce.
     ///
     /// Once an `independent` transaction with the nonce `N` is returned, it unlocks `N+1`, which
@@ -116,12 +121,27 @@ impl<T: TransactionOrdering> BestTransactions<T> {
         self.invalid.insert(tx.sender_id());
     }
 
+    /// Looks up a transaction by sender and nonce across snapshot and broadcast buffer.
+    pub(crate) fn get(&self, id: &TransactionId) -> Option<&PendingTransaction<T>> {
+        if let Some(&last_nonce) = self.yielded_nonce.get(&id.sender) {
+            if id.nonce <= last_nonce {
+                return None;
+            }
+        }
+        if let Some(txs) = self.new_transaction_buffer.get(&id.sender) {
+            if let Some(tx) = txs.iter().find(|tx| tx.transaction.nonce() == id.nonce) {
+                return Some(tx);
+            }
+        }
+        self.by_sender.get(&id.sender)?.get_by_nonce(id.nonce)
+    }
+
     /// Returns the ancestor the given transaction, the transaction with `nonce - 1`.
     ///
     /// Note: for a transaction with nonce higher than the current on chain nonce this will always
     /// return an ancestor since all transactions in this pool are gapless.
     pub(crate) fn ancestor(&self, id: &TransactionId) -> Option<&PendingTransaction<T>> {
-        self.all.get(&id.unchecked_ancestor()?)
+        self.get(&id.unchecked_ancestor()?)
     }
 
     /// Non-blocking read on the new pending transactions subscription channel
@@ -159,7 +179,7 @@ impl<T: TransactionOrdering> BestTransactions<T> {
     /// set.
     fn pop_best(&mut self) -> Option<PendingTransaction<T>> {
         self.independent.pop_last().inspect(|best| {
-            self.all.remove(best.transaction.id());
+            self.yielded_nonce.insert(best.transaction.sender_id(), best.transaction.nonce());
         })
     }
 
@@ -168,19 +188,17 @@ impl<T: TransactionOrdering> BestTransactions<T> {
     fn add_new_transactions(&mut self) {
         for _ in 0..MAX_NEW_TRANSACTIONS_PER_BATCH {
             if let Some(pending_tx) = self.try_recv() {
-                //  same logic as PendingPool::add_transaction/PendingPool::best_with_unlocked
-
                 match pending_tx {
                     IncomingTransaction::Process(tx) => {
                         let tx_id = *tx.transaction.id();
                         if self.ancestor(&tx_id).is_none() {
                             self.independent.insert(tx.clone());
                         }
-                        self.all.insert(tx_id, tx);
+                        self.new_transaction_buffer.entry(tx_id.sender).or_default().push(tx);
                     }
                     IncomingTransaction::Stash(tx) => {
                         let tx_id = *tx.transaction.id();
-                        self.all.insert(tx_id, tx);
+                        self.new_transaction_buffer.entry(tx_id.sender).or_default().push(tx);
                     }
                 }
             } else {
@@ -211,7 +229,7 @@ impl<T: TransactionOrdering> BestTransactions<T> {
             }
 
             // Insert transactions that just got unlocked.
-            if let Some(unlocked) = self.all.get(&best.unlocks()) {
+            if let Some(unlocked) = self.get(&best.unlocks()) {
                 self.independent.insert(unlocked.clone());
             }
 
@@ -462,7 +480,7 @@ mod tests {
         }
 
         let mut best = pool.best();
-        assert_eq!(best.all.len(), num_tx as usize);
+        assert_eq!(best.by_sender.values().map(|c| c.txs.len()).sum::<usize>(), num_tx as usize);
         assert_eq!(best.independent.len(), 1);
 
         // check tx are returned in order
@@ -723,9 +741,8 @@ mod tests {
         // Add new transactions to the iterator
         best.add_new_transactions();
 
-        // Verify that the new transaction has been added to the 'all' map
-        assert_eq!(best.all.len(), 6);
-        assert!(best.all.contains_key(valid_new_tx.id()));
+        // Verify that the new transaction has been added to the buffer
+        assert!(best.get(valid_new_tx.id()).is_some());
 
         // Verify that the new transaction has been added to the 'independent' set
         assert_eq!(best.independent.len(), 2);
@@ -770,9 +787,8 @@ mod tests {
         // Add new transactions to the iterator
         best.add_new_transactions();
 
-        // Verify that the new transaction has been added to the 'all' map
-        assert_eq!(best.all.len(), 6);
-        assert!(best.all.contains_key(valid_new_tx1.id()));
+        // Verify that the new transaction has been added to the buffer
+        assert!(best.get(valid_new_tx1.id()).is_some());
 
         // Verify that the new transaction has been added to the 'independent' set
         assert_eq!(best.independent.len(), 2);
@@ -793,9 +809,8 @@ mod tests {
         // Add new transactions to the iterator
         best.add_new_transactions();
 
-        // Verify that the new transaction has been added to 'all'
-        assert_eq!(best.all.len(), 7);
-        assert!(best.all.contains_key(valid_new_tx2.id()));
+        // Verify that the new transaction has been added to the buffer
+        assert!(best.get(valid_new_tx2.id()).is_some());
 
         // Verify that the new transaction has not been added to the 'independent' set
         assert_eq!(best.independent.len(), 2);
