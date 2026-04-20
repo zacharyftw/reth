@@ -17,6 +17,9 @@ pub use in_memory::*;
 mod deferred_trie;
 pub use deferred_trie::*;
 
+mod deferred_bundle;
+pub use deferred_bundle::*;
+
 mod lazy_overlay;
 pub use lazy_overlay::*;
 

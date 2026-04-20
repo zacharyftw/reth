@@ -57,7 +57,8 @@ use reth_trie_sparse::debug_recorder::TrieDebugRecorder;
 
 use crate::tree::payload_processor::receipt_root_task::{IndexedReceipt, ReceiptRootTaskHandle};
 use reth_chain_state::{
-    CanonicalInMemoryState, DeferredTrieData, ExecutedBlock, ExecutionTimingStats, LazyOverlay,
+    CanonicalInMemoryState, DeferredBundleState, DeferredTrieData, ExecutedBlock,
+    ExecutionTimingStats, LazyOverlay,
 };
 use reth_consensus::{ConsensusError, FullConsensus, ReceiptRootBloom};
 use reth_engine_primitives::{
@@ -1634,6 +1635,11 @@ where
         let ancestors: Vec<DeferredTrieData> =
             overlay_blocks.iter().rev().map(|b| b.trie_data_handle()).collect();
 
+        // Grab the direct parent's deferred bundle handle so the flatten task
+        // can reuse the parent's cumulative overlay (Arc::make_mut + extend)
+        // instead of rebuilding from scratch.
+        let parent_bundle_handle = overlay_blocks.first().map(|b| b.flattened_state_handle());
+
         // Create deferred handle with fallback inputs in case the background task hasn't completed.
         // Resolve the lazy handle into Arc<HashedPostState>. By this point the hashed state has
         // already been computed and used for state root verification, so .get() returns instantly.
@@ -1644,6 +1650,16 @@ where
         let deferred_trie_data =
             DeferredTrieData::pending(hashed_state, trie_output, anchor_hash, ancestors);
         let deferred_handle_task = deferred_trie_data.clone();
+
+        // Construct the deferred flattened bundle handle for O(1)
+        // in-memory state reads via `MemoryOverlayStateProvider`. The
+        // flattening itself is performed by the same background task below
+        // by calling `wait_cloned()` on this handle, so the validation hot
+        // path doesn't pay the extend cost.
+        let this_block_bundle = Arc::new(execution_outcome.state.clone());
+        let deferred_bundle_state =
+            DeferredBundleState::pending(this_block_bundle, anchor_hash, parent_bundle_handle);
+        let deferred_bundle_task = deferred_bundle_state.clone();
         let block_validation_metrics = self.metrics.block_validation.clone();
 
         // Capture block info and cache handle for changeset computation
@@ -1671,6 +1687,13 @@ where
                 block_validation_metrics
                     .deferred_trie_compute_duration
                     .record(compute_start.elapsed().as_secs_f64());
+
+                // Pre-compute the flattened bundle overlay in the same task so
+                // that subsequent state reads on descendants observe an O(1)
+                // fast path. Panics here are isolated by the surrounding
+                // `catch_unwind`; consumers will fall back to synchronous
+                // computation via `wait_cloned` if the task panicked.
+                let _ = deferred_bundle_task.wait_cloned();
 
                 // Record sizes of the computed trie data
                 block_validation_metrics
@@ -1731,10 +1754,11 @@ where
             .executor()
             .spawn_blocking_named("trie-input", compute_trie_input_task);
 
-        ExecutedBlock::with_deferred_trie_data(
+        ExecutedBlock::with_deferred_bundle_state(
             Arc::new(block),
             execution_outcome,
             deferred_trie_data,
+            deferred_bundle_state,
         )
     }
 

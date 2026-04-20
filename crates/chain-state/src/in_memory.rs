@@ -2,7 +2,8 @@
 
 use crate::{
     CanonStateNotification, CanonStateNotificationSender, CanonStateNotifications,
-    ChainInfoTracker, ComputedTrieData, DeferredTrieData, MemoryOverlayStateProvider,
+    ChainInfoTracker, ComputedTrieData, DeferredBundleState, DeferredTrieData,
+    MemoryOverlayStateProvider,
 };
 use alloy_consensus::{transaction::TransactionMeta, BlockHeader};
 use alloy_eips::{BlockHashOrNumber, BlockNumHash};
@@ -760,6 +761,18 @@ pub struct ExecutedBlock<N: NodePrimitives = EthPrimitives> {
     /// This allows deferring the computation of the trie data which can be expensive.
     /// The data can be populated asynchronously after the block was validated.
     pub trie_data: DeferredTrieData,
+    /// Deferred cumulative flattened bundle state covering all in-memory
+    /// ancestors + this block.
+    ///
+    /// When populated (see [`DeferredBundleState::pending`]),
+    /// [`MemoryOverlayStateProvider`] reads for any in-memory block become
+    /// O(1) probes against the flattened overlay rather than O(N) iteration
+    /// across every in-memory block.
+    ///
+    /// Defaults to an empty, ready handle anchored to `B256::ZERO`. Consumers
+    /// treat this as "no overlay available" and fall back to the legacy
+    /// iteration path, preserving correctness.
+    pub flattened_state: DeferredBundleState,
 }
 
 impl<N: NodePrimitives> Default for ExecutedBlock<N> {
@@ -776,13 +789,15 @@ impl<N: NodePrimitives> Default for ExecutedBlock<N> {
                 state: Default::default(),
             }),
             trie_data: DeferredTrieData::ready(ComputedTrieData::default()),
+            flattened_state: DeferredBundleState::default(),
         }
     }
 }
 
 impl<N: NodePrimitives> PartialEq for ExecutedBlock<N> {
     fn eq(&self, other: &Self) -> bool {
-        // Trie data is computed asynchronously and doesn't define block identity.
+        // Deferred data (trie + flattened bundle) is computed asynchronously and
+        // doesn't define block identity.
         self.recovered_block == other.recovered_block &&
             self.execution_output == other.execution_output
     }
@@ -798,7 +813,12 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
         execution_output: Arc<BlockExecutionOutput<N::Receipt>>,
         trie_data: ComputedTrieData,
     ) -> Self {
-        Self { recovered_block, execution_output, trie_data: DeferredTrieData::ready(trie_data) }
+        Self {
+            recovered_block,
+            execution_output,
+            trie_data: DeferredTrieData::ready(trie_data),
+            flattened_state: DeferredBundleState::default(),
+        }
     }
 
     /// Create a new [`ExecutedBlock`] with deferred trie data.
@@ -815,12 +835,33 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
     /// occurs synchronously from stored inputs, so there is no blocking or deadlock risk.
     ///
     /// Use [`Self::new()`] instead when trie data is already computed and available immediately.
-    pub const fn with_deferred_trie_data(
+    pub fn with_deferred_trie_data(
         recovered_block: Arc<RecoveredBlock<N::Block>>,
         execution_output: Arc<BlockExecutionOutput<N::Receipt>>,
         trie_data: DeferredTrieData,
     ) -> Self {
-        Self { recovered_block, execution_output, trie_data }
+        Self {
+            recovered_block,
+            execution_output,
+            trie_data,
+            flattened_state: DeferredBundleState::default(),
+        }
+    }
+
+    /// Create a new [`ExecutedBlock`] with both deferred trie data and a
+    /// deferred flattened bundle state.
+    ///
+    /// Use this constructor from the validation hot path (see
+    /// `spawn_deferred_trie_task` in the engine tree) to enable O(1) in-memory
+    /// state lookups. The flattened bundle is cumulative over all in-memory
+    /// ancestors + this block and is computed asynchronously in the background.
+    pub const fn with_deferred_bundle_state(
+        recovered_block: Arc<RecoveredBlock<N::Block>>,
+        execution_output: Arc<BlockExecutionOutput<N::Receipt>>,
+        trie_data: DeferredTrieData,
+        flattened_state: DeferredBundleState,
+    ) -> Self {
+        Self { recovered_block, execution_output, trie_data, flattened_state }
     }
 
     /// Returns a reference to an inner [`SealedBlock`]
@@ -860,6 +901,17 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
     #[inline]
     pub fn trie_data_handle(&self) -> DeferredTrieData {
         self.trie_data.clone()
+    }
+
+    /// Returns a clone of the deferred flattened bundle state handle.
+    ///
+    /// A handle is a lightweight reference that can be passed to descendants
+    /// without forcing flattening to happen immediately. The actual work runs
+    /// when [`DeferredBundleState::wait_cloned`] is called by a consumer
+    /// (typically [`MemoryOverlayStateProvider`] during state reads).
+    #[inline]
+    pub fn flattened_state_handle(&self) -> DeferredBundleState {
+        self.flattened_state.clone()
     }
 
     /// Returns the hashed state result of the execution outcome.
